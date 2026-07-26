@@ -39,7 +39,7 @@ A local-first Windows and Android anime schedule, release notification, and epis
 - Windows 安装包尚未进行商业代码签名，可能显示“未知发布者”提示
 - Windows 更新安装会保留安装目录下的 `data` 文件夹
 
-Android 版使用项目发布密钥签名。后续 Android 更新必须继续使用同一密钥，公开下载包及其 SHA-256 校验值以 GitHub Releases 页面为准。Android 目前只提供标准版。
+Android 版使用项目发布密钥签名。公开下载包及其 SHA-256 校验值以 GitHub Releases 页面为准。Android 目前只提供标准版。
 
 Windows 版将追番记录、观看任务、缓存和设置保存在 `<安装目录>\data`；Android 版保存在系统分配的应用数据目录。手机和电脑的数据彼此独立，不会自动同步。卸载 Windows 版或移动安装目录前，请备份对应的 `data` 文件夹；卸载 Android 应用会清除手机端本地记录。
 
