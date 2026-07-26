@@ -2,8 +2,9 @@ import type { Anime, AppState, BangumiTitleMatch, DesktopApi, Season, Settings }
 import { IS_ORIGINAL_EDITION, normalizeTitlePreference, titleForPreference } from './edition';
 import { reminderTitleOf } from './utils';
 import { removeOrphanedPendingTasks, removePendingTasksForAnime } from '../electron/task-retention.cjs';
+import { IS_ANDROID_APP, mobilePlugin, type MobileStatus } from './mobile';
 
-const STORAGE_KEY = IS_ORIGINAL_EDITION ? 'anilog-original-browser-state' : 'anilog-browser-state';
+const STORAGE_KEY = IS_ANDROID_APP ? 'anilog-android-state' : IS_ORIGINAL_EDITION ? 'anilog-original-browser-state' : 'anilog-browser-state';
 const BANGUMI_RESOLVER_VERSION = 4;
 const initialState = (): AppState => ({
   version: 2,
@@ -15,11 +16,18 @@ const initialState = (): AppState => ({
     launchAtLogin: false,
     minimizeToTray: true,
     notifyWhenAired: true,
+    createWatchTasks: true,
     bangumiApiBaseUrl: IS_ORIGINAL_EDITION ? '' : 'https://bgmapi.anibt.net/v0',
     titlePreference: 'auto',
   },
   lastSyncAt: Math.floor(Date.now() / 1000),
-  runtime: { isDesktop: false, notificationsSupported: 'Notification' in window, platform: 'browser', edition: IS_ORIGINAL_EDITION ? 'original' : 'standard' },
+  runtime: {
+    isDesktop: false,
+    notificationsSupported: IS_ANDROID_APP || 'Notification' in window,
+    notificationPermissionGranted: IS_ANDROID_APP ? undefined : 'Notification' in window,
+    platform: IS_ANDROID_APP ? 'android' : 'browser',
+    edition: IS_ORIGINAL_EDITION ? 'original' : 'standard',
+  },
 });
 
 let browserState: AppState;
@@ -32,6 +40,7 @@ browserState.bangumiTitles = IS_ORIGINAL_EDITION ? {} : Object.fromEntries(
   Object.entries(browserState.bangumiTitles || {}).filter(([, match]) => match.status === 'matched' || match.resolverVersion === BANGUMI_RESOLVER_VERSION),
 );
 browserState.version = 2;
+browserState.runtime = initialState().runtime;
 browserState.settings = { ...initialState().settings, ...(browserState.settings || {}) };
 browserState.settings.titlePreference = normalizeTitlePreference(browserState.settings.titlePreference);
 browserState.following = (browserState.following || []).map((item) => {
@@ -56,7 +65,82 @@ browserState.tasks = removeOrphanedPendingTasks(browserState.tasks, browserFollo
 const listeners = new Set<(state: AppState) => void>();
 const seasonListeners = new Set<(update: { season: Season; year: number; anime: Anime[]; fetchedAt: number }) => void>();
 
-function saveBrowserState() {
+function mobileFollowing() {
+  return browserState.following.map((item) => ({
+    id: item.id,
+    displayTitle: item.displayTitle,
+    coverImage: item.coverImage,
+    ...(item.nextAiringEpisode ? {
+      nextEpisode: item.nextAiringEpisode.episode,
+      nextAiringAt: item.nextAiringEpisode.airingAt,
+    } : {}),
+  }));
+}
+
+let mobileConfigureChain: Promise<unknown> = Promise.resolve();
+function configureMobileBackground(): Promise<unknown> {
+  if (!IS_ANDROID_APP) return Promise.resolve();
+  mobileConfigureChain = mobileConfigureChain
+    .catch(() => undefined)
+    .then(() => mobilePlugin.configure({
+      following: mobileFollowing(),
+      notificationsEnabled: browserState.settings.notifyWhenAired,
+      createTasksEnabled: browserState.settings.createWatchTasks,
+    }));
+  return mobileConfigureChain;
+}
+
+function mergeMobileStatus(status: MobileStatus): number {
+  if (!IS_ANDROID_APP) return 0;
+  const nativeSchedules = new Map(status.following.map((item) => [item.id, item]));
+  browserState.following.forEach((item) => {
+    const schedule = nativeSchedules.get(item.id);
+    if (!schedule) return;
+    item.nextAiringEpisode = schedule.nextEpisode && schedule.nextAiringAt
+      ? { episode: schedule.nextEpisode, airingAt: schedule.nextAiringAt }
+      : null;
+  });
+
+  const followedById = new Map(browserState.following.map((item) => [item.id, item]));
+  const known = new Set(browserState.tasks.map((task) => task.id));
+  let created = 0;
+  if (browserState.settings.createWatchTasks) status.events.forEach((event) => {
+    const followed = followedById.get(event.animeId);
+    if (!followed || known.has(event.id)) return;
+    browserState.tasks.push({
+      id: event.id,
+      animeId: event.animeId,
+      animeTitle: followed.displayTitle || event.animeTitle,
+      coverImage: followed.coverImage || event.coverImage,
+      episode: event.episode,
+      airingAt: event.airingAt,
+      status: 'pending',
+      createdAt: event.createdAt || Math.floor(Date.now() / 1000),
+      completedAt: null,
+    });
+    known.add(event.id);
+    created += 1;
+  });
+  browserState.tasks.sort((a, b) => b.airingAt - a.airingAt);
+  if (status.syncedAt) browserState.lastSyncAt = Math.max(browserState.lastSyncAt || 0, status.syncedAt);
+  if (browserState.runtime) {
+    browserState.runtime.notificationPermissionGranted = status.granted;
+    browserState.runtime.exactSchedulingGranted = status.exactSchedulingGranted;
+  }
+  if (status.openTasks) window.dispatchEvent(new CustomEvent('anilog:open-tasks'));
+  return created;
+}
+
+async function refreshMobileState(): Promise<number> {
+  if (!IS_ANDROID_APP) return 0;
+  const status = await mobilePlugin.consumeEvents();
+  const created = mergeMobileStatus(status);
+  saveBrowserState(false);
+  await configureMobileBackground();
+  return created;
+}
+
+function saveBrowserState(configureMobile = true) {
   browserState = {
     ...browserState,
     following: [...browserState.following],
@@ -66,6 +150,7 @@ function saveBrowserState() {
   };
   localStorage.setItem(STORAGE_KEY, JSON.stringify(browserState));
   listeners.forEach((listener) => listener(browserState));
+  if (configureMobile) void configureMobileBackground().catch(() => {});
 }
 
 const query = `
@@ -118,10 +203,39 @@ async function browserFetchSeasonFromNetwork(params: { season: Season; year: num
 }
 
 type BrowserSeasonCacheEntry = { anime: Anime[]; fetchedAt: number };
-const browserSeasonCache = new Map<string, BrowserSeasonCacheEntry>();
+const MOBILE_SEASON_CACHE_KEY = 'anilog-android-season-cache-v1';
+
+function loadBrowserSeasonCache(): Map<string, BrowserSeasonCacheEntry> {
+  if (!IS_ANDROID_APP) return new Map();
+  try {
+    const stored = JSON.parse(localStorage.getItem(MOBILE_SEASON_CACHE_KEY) || '{}') as Record<string, BrowserSeasonCacheEntry>;
+    return new Map(Object.entries(stored).filter(([, entry]) => Number.isFinite(entry?.fetchedAt) && Array.isArray(entry?.anime)));
+  } catch {
+    return new Map();
+  }
+}
+
+const browserSeasonCache = loadBrowserSeasonCache();
 const browserSeasonPending = new Map<string, Promise<Anime[]>>();
 const browserSeasonFailures = new Map<string, number>();
 let browserSeasonChain: Promise<unknown> = Promise.resolve();
+
+function persistBrowserSeasonCache() {
+  if (!IS_ANDROID_APP) return;
+  const recent = [...browserSeasonCache.entries()]
+    .sort(([, first], [, second]) => second.fetchedAt - first.fetchedAt)
+    .slice(0, 8);
+  try {
+    localStorage.setItem(MOBILE_SEASON_CACHE_KEY, JSON.stringify(Object.fromEntries(recent)));
+  } catch {
+    try {
+      const compact = recent.slice(0, 3);
+      localStorage.setItem(MOBILE_SEASON_CACHE_KEY, JSON.stringify(Object.fromEntries(compact)));
+    } catch {
+      // The list still remains available in memory when WebView storage is full.
+    }
+  }
+}
 
 function browserSeasonKey({ season, year }: { season: Season; year: number }): string {
   return `${year}-${season}`;
@@ -148,6 +262,7 @@ function refreshBrowserSeason(params: { season: Season; year: number }): Promise
       const fetchedAt = Date.now();
       browserSeasonFailures.delete(key);
       browserSeasonCache.set(key, { anime, fetchedAt });
+      persistBrowserSeasonCache();
       seasonListeners.forEach((listener) => listener({ ...params, anime, fetchedAt }));
       return anime;
     })
@@ -446,10 +561,14 @@ function resolveBrowserBangumiTitle(anime: Anime): Promise<BangumiTitleMatch> {
 }
 
 const browserApi: DesktopApi = {
-  async getState() { return browserState; },
+  async getState() {
+    if (IS_ANDROID_APP) await refreshMobileState();
+    return browserState;
+  },
   fetchSeason: browserFetchSeason,
   async toggleFollow(anime) {
     const existing = browserState.following.findIndex((item) => item.id === anime.id);
+    const isAdding = existing < 0;
     if (existing >= 0) {
       browserState.following.splice(existing, 1);
       browserState.tasks = removePendingTasksForAnime(browserState.tasks, anime.id);
@@ -472,6 +591,11 @@ const browserApi: DesktopApi = {
       });
     }
     saveBrowserState();
+    if (IS_ANDROID_APP && isAdding && browserState.settings.notifyWhenAired) {
+      const permission = await mobilePlugin.requestNotificationPermission();
+      if (browserState.runtime) browserState.runtime.notificationPermissionGranted = permission.granted;
+      saveBrowserState();
+    }
     return browserState;
   },
   async updateFollowTitle(animeId, displayTitle) {
@@ -535,15 +659,34 @@ const browserApi: DesktopApi = {
       });
     }
     saveBrowserState();
+    if (IS_ANDROID_APP && settings.notifyWhenAired === true) {
+      const permission = await mobilePlugin.requestNotificationPermission();
+      if (browserState.runtime) browserState.runtime.notificationPermissionGranted = permission.granted;
+      saveBrowserState();
+    }
     return browserState;
   },
   async syncNow() {
+    if (IS_ANDROID_APP) {
+      const before = new Set(browserState.tasks.map((task) => task.id));
+      const status = await mobilePlugin.syncNow();
+      mergeMobileStatus(status);
+      await refreshMobileState();
+      const created = browserState.tasks.filter((task) => !before.has(task.id)).length;
+      saveBrowserState();
+      return { created, syncedAt: browserState.lastSyncAt };
+    }
     browserState.lastSyncAt = Math.floor(Date.now() / 1000);
     saveBrowserState();
     return { created: 0, syncedAt: browserState.lastSyncAt };
   },
   async getCacheInfo() { return { bytes: 0, sessionBytes: 0, legacyBytes: 0, supported: false }; },
   async clearCache() { return { bytes: 0, sessionBytes: 0, legacyBytes: 0, supported: false }; },
+  ...(IS_ANDROID_APP ? {
+    async requestExactScheduling() {
+      await mobilePlugin.requestExactScheduling();
+    },
+  } : {}),
   async openExternal(url) { window.open(url, '_blank', 'noopener,noreferrer'); },
   onStateChanged(callback) {
     listeners.add(callback);

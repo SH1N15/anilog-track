@@ -19,7 +19,10 @@
     "dev:original": "set \"ANILOG_EDITION=original\"&& set \"VITE_ANILOG_EDITION=original\"&& concurrently -k \"vite --host 127.0.0.1\" \"node electron/start-dev.cjs\"",
     "build": "node scripts/build-renderer.cjs standard",
     "build:original": "node scripts/build-renderer.cjs original",
+    "build:android": "node scripts/build-renderer.cjs android",
     "build:all": "npm run build && npm run build:original",
+    "android:sync": "npm run build:android && cap sync android",
+    "android:apk": "npm run android:sync && cd android && gradlew.bat assembleDebug",
     "test:bangumi": "node scripts/test-bangumi.cjs",
     "test:data": "node scripts/test-data-path.cjs",
     "test:season-cache": "node scripts/test-season-cache.cjs",
@@ -37,9 +40,12 @@
     "dist:all": "npm run build:all && electron-builder --win nsis && electron-builder --win nsis --config electron-builder.original.yml"
   },
   "dependencies": {
+    "@capacitor/android": "8.4.2",
+    "@capacitor/core": "8.4.2",
     "bangumi-data": "0.3.215"
   },
   "devDependencies": {
+    "@capacitor/cli": "8.4.2",
     "@types/node": "26.1.1",
     "@types/react": "19.2.17",
     "@types/react-dom": "19.2.3",
@@ -82,6 +88,7 @@
     }
   },
   "allowScripts": {
-    "electron@43.2.0": true
+    "electron@43.2.0": true,
+    "esbuild@0.25.12": true
   }
 }

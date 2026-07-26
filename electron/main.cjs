@@ -38,6 +38,7 @@ const DEFAULT_STATE = {
     launchAtLogin: false,
     minimizeToTray: true,
     notifyWhenAired: true,
+    createWatchTasks: true,
     bangumiApiBaseUrl: EDITION.usesBangumi ? DEFAULT_BANGUMI_PROXY : '',
     titlePreference: 'auto',
   },

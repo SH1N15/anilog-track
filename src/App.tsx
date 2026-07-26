@@ -50,7 +50,7 @@ const EMPTY_STATE: AppState = {
   following: [],
   tasks: [],
   bangumiTitles: {},
-  settings: { pollIntervalMinutes: 5, launchAtLogin: false, minimizeToTray: true, notifyWhenAired: true, bangumiApiBaseUrl: IS_ORIGINAL_EDITION ? '' : 'https://bgmapi.anibt.net/v0', titlePreference: 'auto' },
+  settings: { pollIntervalMinutes: 5, launchAtLogin: false, minimizeToTray: true, notifyWhenAired: true, createWatchTasks: true, bangumiApiBaseUrl: IS_ORIGINAL_EDITION ? '' : 'https://bgmapi.anibt.net/v0', titlePreference: 'auto' },
   lastSyncAt: 0,
 };
 
@@ -93,6 +93,12 @@ function App() {
 
   useEffect(() => {
     document.title = PRODUCT_NAME;
+  }, []);
+
+  useEffect(() => {
+    const openTasks = () => setView('tasks');
+    window.addEventListener('anilog:open-tasks', openTasks);
+    return () => window.removeEventListener('anilog:open-tasks', openTasks);
   }, []);
 
   useEffect(() => {
@@ -165,9 +171,10 @@ function App() {
   };
 
   const pendingCount = state.tasks.filter((task) => task.status === 'pending').length;
+  const isAndroid = state.runtime?.platform === 'android';
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${isAndroid ? 'android-app' : ''}`}>
       <aside className="sidebar">
         <button className="brand" onClick={() => setView('season')} aria-label="返回季度新番">
           <span className="brand-mark">A</span>
@@ -197,9 +204,9 @@ function App() {
         </nav>
 
         <div className="sidebar-status">
-          <span className={`status-dot ${state.runtime?.isDesktop ? 'online' : ''}`} />
+          <span className={`status-dot ${state.runtime?.isDesktop || isAndroid ? 'online' : ''}`} />
           <div>
-            <strong>{state.runtime?.isDesktop ? '后台提醒已就绪' : '浏览器预览模式'}</strong>
+            <strong>{state.runtime?.isDesktop ? '后台提醒已就绪' : isAndroid ? 'Android 后台同步已就绪' : '浏览器预览模式'}</strong>
             <small>{state.following.length} 部追番 · {pendingCount} 项待看</small>
           </div>
         </div>
@@ -642,6 +649,7 @@ function FollowingView({
 }
 
 function SettingsView({ state, onChange }: { state: AppState; onChange: (patch: Partial<AppSettings>) => Promise<void> }) {
+  const isAndroid = state.runtime?.platform === 'android';
   const [proxyUrl, setProxyUrl] = useState(state.settings.bangumiApiBaseUrl);
   const [proxyStatus, setProxyStatus] = useState('');
   const [testingProxy, setTestingProxy] = useState(false);
@@ -705,13 +713,21 @@ function SettingsView({ state, onChange }: { state: AppState; onChange: (patch: 
   return (
     <div className="settings-layout">
       <section className="settings-section">
-        <div className="settings-title"><BellRing size={20} /><div><h2>更新提醒</h2><p>新一集播出并加入任务时发送系统通知。</p></div></div>
-        <SettingRow title="播出通知" description={state.runtime?.notificationsSupported === false ? '当前系统不支持通知' : '使用 Windows 通知中心显示更新'}>
+        <div className="settings-title"><BellRing size={20} /><div><h2>更新提醒</h2><p>新一集播出时发送系统通知。</p></div></div>
+        <SettingRow title="播出通知" description={state.runtime?.notificationsSupported === false ? '当前系统不支持通知' : isAndroid ? state.runtime?.notificationPermissionGranted === false ? '需要在系统设置中允许 AniLog 通知' : '使用 Android 系统通知显示更新' : '使用 Windows 通知中心显示更新'}>
           <Toggle checked={state.settings.notifyWhenAired} disabled={state.runtime?.notificationsSupported === false} onChange={(value) => onChange({ notifyWhenAired: value })} />
         </SettingRow>
+        {isAndroid && <SettingRow title="自动创建待看任务" description="关闭后只发送通知，不再新增手机端任务">
+          <Toggle checked={state.settings.createWatchTasks} onChange={(value) => onChange({ createWatchTasks: value })} />
+        </SettingRow>}
         <SettingRow title="同步间隔" description="AniList 数据的后台检查频率">
-          <label className="number-select"><select value={state.settings.pollIntervalMinutes} onChange={(event) => onChange({ pollIntervalMinutes: Number(event.target.value) })}><option value={1}>每 1 分钟</option><option value={5}>每 5 分钟</option><option value={10}>每 10 分钟</option><option value={15}>每 15 分钟</option></select></label>
+          {isAndroid ? <span className="fixed-setting-value">约每 6 小时</span> : <label className="number-select"><select value={state.settings.pollIntervalMinutes} onChange={(event) => onChange({ pollIntervalMinutes: Number(event.target.value) })}><option value={1}>每 1 分钟</option><option value={5}>每 5 分钟</option><option value={10}>每 10 分钟</option><option value={15}>每 15 分钟</option></select></label>}
         </SettingRow>
+        {isAndroid && <SettingRow title="准时通知" description={state.runtime?.exactSchedulingGranted ? '已允许按播出时间准时发送通知' : '未授权时，系统可能延迟发送通知'}>
+          {state.runtime?.exactSchedulingGranted
+            ? <span className="fixed-setting-value">已授权</span>
+            : <button className="secondary-button" onClick={() => void api.requestExactScheduling?.()}>去授权</button>}
+        </SettingRow>}
       </section>
       {IS_ORIGINAL_EDITION ? (
         <section className="settings-section">
@@ -740,16 +756,25 @@ function SettingsView({ state, onChange }: { state: AppState; onChange: (patch: 
           </div>
         </section>
       )}
-      <section className="settings-section">
-        <div className="settings-title"><MonitorDot size={20} /><div><h2>桌面行为</h2><p>控制应用启动与后台驻留方式。</p></div></div>
-        <SettingRow title="开机后启动" description={state.runtime?.isDesktop ? '登录 Windows 后自动运行 AniLog' : '仅桌面应用支持此设置'}>
-          <Toggle checked={state.settings.launchAtLogin} disabled={!state.runtime?.isDesktop} onChange={(value) => onChange({ launchAtLogin: value })} />
-        </SettingRow>
-        <SettingRow title="关闭时驻留托盘" description="继续在后台同步并发送更新提醒">
-          <Toggle checked={state.settings.minimizeToTray} disabled={!state.runtime?.isDesktop} onChange={(value) => onChange({ minimizeToTray: value })} />
-        </SettingRow>
-      </section>
-      <section className="settings-section">
+      {isAndroid ? (
+        <section className="settings-section">
+          <div className="settings-title"><MonitorDot size={20} /><div><h2>Android 后台</h2><p>系统定期校正日程，播出时发送普通通知。</p></div></div>
+          <SettingRow title="后台方式" description="不常驻进程，不创建系统闹钟条目">
+            <span className="fixed-setting-value">系统调度</span>
+          </SettingRow>
+        </section>
+      ) : (
+        <section className="settings-section">
+          <div className="settings-title"><MonitorDot size={20} /><div><h2>桌面行为</h2><p>控制应用启动与后台驻留方式。</p></div></div>
+          <SettingRow title="开机后启动" description={state.runtime?.isDesktop ? '登录 Windows 后自动运行 AniLog' : '仅桌面应用支持此设置'}>
+            <Toggle checked={state.settings.launchAtLogin} disabled={!state.runtime?.isDesktop} onChange={(value) => onChange({ launchAtLogin: value })} />
+          </SettingRow>
+          <SettingRow title="关闭时驻留托盘" description="继续在后台同步并发送更新提醒">
+            <Toggle checked={state.settings.minimizeToTray} disabled={!state.runtime?.isDesktop} onChange={(value) => onChange({ minimizeToTray: value })} />
+          </SettingRow>
+        </section>
+      )}
+      {!isAndroid && <section className="settings-section">
         <div className="settings-title"><HardDrive size={20} /><div><h2>缓存空间</h2><p>封面与网络数据可按需重新下载，不包含追番记录和观看任务。</p></div></div>
         <SettingRow title="图片与网络缓存" description={cacheStatus || (IS_ORIGINAL_EDITION ? '季度列表和本地记录会保留' : '季度列表、中文标题和本地记录会保留')}>
           <div className="cache-actions">
@@ -760,7 +785,7 @@ function SettingsView({ state, onChange }: { state: AppState; onChange: (patch: 
             </button>
           </div>
         </SettingRow>
-      </section>
+      </section>}
       <section className="settings-section source-note">
         <SlidersHorizontal size={20} />
         <div><h2>数据与隐私</h2><p>{IS_ORIGINAL_EDITION ? '番剧、标题与播出日程均来自 AniList，不连接 Bangumi 或第三方 Bangumi 反代。追番清单、观看任务和设置仅保存在本机应用数据目录中，不上传个人数据。' : '番剧与播出日程来自 AniList，中文标题来自 Bangumi。追番清单、观看任务和设置仅保存在本机应用数据目录中，不上传个人数据。'}</p><small>上次同步：{state.lastSyncAt ? formatAiring(state.lastSyncAt) : '尚未同步'}</small></div>

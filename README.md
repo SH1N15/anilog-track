@@ -1,7 +1,7 @@
 # AniLog
 
-基于 AniList 的本地桌面追番日程与观看任务应用。
-A local-first Windows anime schedule, release notification, and episode task tracker.
+基于 AniList 的本地追番日程与观看任务应用，支持 Windows 和 Android。
+A local-first Windows and Android anime schedule, release notification, and episode task tracker.
 
 [![CI](https://github.com/SH1N15/anilog-track/actions/workflows/ci.yml/badge.svg)](https://github.com/SH1N15/anilog-track/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -30,6 +30,8 @@ A local-first Windows anime schedule, release notification, and episode task tra
 - 当前安装包尚未进行商业代码签名，Windows 可能显示“未知发布者”提示
 - 更新安装会保留安装目录下的 `data` 文件夹
 
+Android 版源码已经包含在仓库中，目前尚未提供正式签名 APK。仓库内生成的 Debug APK 只适合本机开发测试，不建议作为正式版本分发。
+
 应用默认将追番记录、观看任务、缓存和设置保存在 `<安装目录>\data`。两个版本使用不同的应用 ID 和默认安装目录，可以同时安装，数据互不共享。卸载或移动安装目录前，请先备份对应的 `data` 文件夹。
 
 ## 功能
@@ -38,6 +40,7 @@ A local-first Windows anime schedule, release notification, and episode task tra
 - 自主添加或取消追番，按本机时区显示下一集播出时间
 - 应用驻留系统托盘，定时检查 AniList 播出日程
 - 新一集播出后发送 Windows 通知，并自动创建待看任务
+- Android 使用系统后台调度校正日程，无需常驻进程；可关闭手机端的自动待看任务，仅保留通知
 - 新番列表优先显示 Bangumi 中文标题，匹配不到时回退到英文
 - 中文标题会用于搜索、通知和观看任务，也可在“我的追番”中自定义
 - 原名版完全不连接 Bangumi，可在“偏好设置 → 番名显示”中选择英文、罗马字或日文标题
@@ -87,6 +90,24 @@ npx electron-builder --win nsis --config.electronDist=node_modules/electron/dist
 ```
 
 两个安装包都会生成在 `release` 目录中。
+
+### Android 构建
+
+Android 版需要 JDK 21、Android SDK 36.1 和对应 Build Tools。首次构建建议先用 Android Studio 安装 SDK，然后在项目根目录运行：
+
+```powershell
+npm ci
+npm run android:sync
+.\android\gradlew.bat -p android assembleDebug
+```
+
+Debug APK 生成在：
+
+```text
+android/app/build/outputs/apk/debug/app-debug.apk
+```
+
+`android/local.properties`、APK、Gradle 缓存、构建目录和签名密钥均被 Git 忽略，不会上传到仓库。正式发布 Android 版前需要生成并妥善保管自己的签名密钥，再构建签名 APK 或 AAB。
 
 ## 测试
 

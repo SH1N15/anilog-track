@@ -30,6 +30,9 @@ jobs:
       - name: Build application
         run: npm run build:all
 
+      - name: Build Android web assets
+        run: npm run build:android
+
       - name: Test edition separation
         run: npm run test:editions
 

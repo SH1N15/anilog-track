@@ -67,6 +67,7 @@ export interface Settings {
   launchAtLogin: boolean;
   minimizeToTray: boolean;
   notifyWhenAired: boolean;
+  createWatchTasks: boolean;
   bangumiApiBaseUrl: string;
   titlePreference: TitlePreference;
 }
@@ -117,6 +118,8 @@ export interface AppState {
   runtime?: {
     isDesktop: boolean;
     notificationsSupported: boolean;
+    notificationPermissionGranted?: boolean;
+    exactSchedulingGranted?: boolean;
     platform: string;
     edition: 'standard' | 'original';
   };
@@ -134,6 +137,7 @@ export interface DesktopApi {
   syncNow(): Promise<{ created: number; syncedAt: number }>;
   getCacheInfo(): Promise<CacheInfo>;
   clearCache(): Promise<CacheInfo>;
+  requestExactScheduling?(): Promise<void>;
   openExternal(url: string): Promise<void>;
   onStateChanged(callback: (state: AppState) => void): () => void;
   onSeasonUpdated(callback: (update: { season: Season; year: number; anime: Anime[]; fetchedAt: number }) => void): () => void;

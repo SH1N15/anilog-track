@@ -1,11 +1,13 @@
 const { spawnSync } = require('node:child_process');
 const path = require('node:path');
 
-const edition = process.argv[2] === 'original' ? 'original' : 'standard';
+const target = process.argv[2] || 'standard';
+const edition = target === 'original' ? 'original' : 'standard';
 const environment = {
   ...process.env,
   ANILOG_EDITION: edition,
   VITE_ANILOG_EDITION: edition,
+  VITE_ANILOG_PLATFORM: target === 'android' ? 'android' : 'desktop',
 };
 
 function run(modulePath, args) {

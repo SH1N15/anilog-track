@@ -194,6 +194,7 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
 .toggle.on > span { transform: translateX(18px); }
 .toggle:disabled { opacity: .45; cursor: not-allowed; }
 .number-select { padding: 7px 9px; border: 1px solid var(--line); border-radius: 5px; }
+.fixed-setting-value { flex: 0 0 auto; color: var(--ink) !important; font-size: 11px !important; font-weight: 700; }
 .cache-actions { display: flex; align-items: center; gap: 12px; flex: 0 0 auto; }
 .cache-actions > strong { min-width: 68px; margin: 0; color: var(--ink); text-align: right; font-size: 11px; }
 .cache-actions button { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
@@ -288,6 +289,9 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
   .following-row > img { width: 47px; height: 66px; }
   .following-next { grid-column: 2 / 4; padding: 9px 0 0; border-top: 1px solid var(--line); border-left: 0; }
   .setting-row { padding: 12px 14px; }
+  .android-app .sidebar { height: calc(62px + env(safe-area-inset-bottom)); padding-bottom: calc(7px + env(safe-area-inset-bottom)); }
+  .android-app .main-content { padding-bottom: calc(62px + env(safe-area-inset-bottom)); }
+  .android-app .topbar { height: calc(68px + env(safe-area-inset-top)); padding-top: calc(13px + env(safe-area-inset-top)); }
 }
 
 @media (prefers-reduced-motion: reduce) {
