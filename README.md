@@ -75,7 +75,7 @@ npm audit --omit=dev --audit-level=high
 1. 在“季度新番”中选择要追的番剧。
 2. 保持 AniLog 运行或最小化到系统托盘。
 3. 番剧播出后，AniLog 会发送系统通知并添加一条观看任务。
-4. 看完后在“观看任务”中勾选对应集数。
+4. 看完后在“观看任务”中勾选对应集数，完成观看任务。
 
 AniLog 使用 AniList GraphQL API 获取公开番剧与播出日程，并使用 Bangumi 数据补充中文标题，不需要 AniList 或 Bangumi 账号。
 
