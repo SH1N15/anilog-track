@@ -1,10 +1,23 @@
 # AniLog
 
 基于 AniList 的本地桌面追番日程与观看任务应用。
+A local-first Windows anime schedule, release notification, and episode task tracker.
 
 [![CI](https://github.com/SH1N15/anilog-track/actions/workflows/ci.yml/badge.svg)](https://github.com/SH1N15/anilog-track/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
+## 界面预览
+
+![AniLog 季度新番列表](docs/images/season.png)
+
+![AniLog 观看任务](docs/images/tasks.png)
+
+## 为什么使用 AniLog
+
+- 自动整理每季度新番及下一集播出时间
+- 新一集播出后发送 Windows 通知并创建待看任务
+- 无需注册账号，追番记录和观看任务仅保存在本机
+  
 ## 下载与安装
 
 前往 [GitHub Releases](https://github.com/SH1N15/anilog-track/releases) 下载需要的版本：
