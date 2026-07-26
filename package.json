@@ -2,7 +2,7 @@
   "name": "anilog",
   "version": "0.3.1",
   "private": true,
-  "description": "A local-first Windows anime schedule, notification, and episode task tracker powered by AniList.",
+  "description": "A local-first Windows and Android anime schedule, notification, and episode task tracker powered by AniList.",
   "author": "SH1N15",
   "license": "MIT",
   "homepage": "https://github.com/SH1N15/anilog-track#readme",

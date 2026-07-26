@@ -8,14 +8,22 @@ A local-first Windows and Android anime schedule, release notification, and epis
 
 ## 界面预览
 
+### Windows
+
 ![AniLog 季度新番列表](docs/images/season.png)
 
 ![AniLog 观看任务](docs/images/tasks.png)
 
+### Android
+
+<p align="center">
+  <img src="docs/images/android-season.png" alt="AniLog Android 季度新番列表" width="360">
+</p>
+
 ## 为什么使用 AniLog
 
 - 自动整理每季度新番及下一集播出时间
-- 新一集播出后发送 Windows 通知并创建待看任务
+- 新一集播出后在 Windows 或 Android 发送通知，并可创建待看任务
 - 无需注册账号，追番记录和观看任务仅保存在本机
   
 ## 下载与安装
@@ -24,22 +32,23 @@ A local-first Windows and Android anime schedule, release notification, and epis
 
 - `AniLog Setup x.y.z.exe`：标准版，使用 Bangumi 中文标题
 - `AniLog-Original-Setup-x.y.z.exe`：原名版，界面仍为中文，只使用 AniList 的英文、罗马字或日文标题
+- [`AniLog-Android-v0.3.1.apk`](https://github.com/SH1N15/anilog-track/releases/download/v0.3.1/AniLog-Android-v0.3.1.apk)：Android 标准版，使用 Bangumi 中文标题
 
-- 支持 Windows 10/11 x64
+- 支持 Windows 10/11 x64，以及 Android 7.0 或更高版本
 - 番剧日程需要网络连接；标准版的在线中文标题查询还会访问 Bangumi API 或配置的反代
-- 当前安装包尚未进行商业代码签名，Windows 可能显示“未知发布者”提示
-- 更新安装会保留安装目录下的 `data` 文件夹
+- Windows 安装包尚未进行商业代码签名，可能显示“未知发布者”提示
+- Windows 更新安装会保留安装目录下的 `data` 文件夹
 
-Android 版源码已经包含在仓库中，目前尚未提供正式签名 APK。仓库内生成的 Debug APK 只适合本机开发测试，不建议作为正式版本分发。
+Android 版使用项目发布密钥签名。后续 Android 更新必须继续使用同一密钥，公开下载包及其 SHA-256 校验值以 GitHub Releases 页面为准。Android 目前只提供标准版。
 
-应用默认将追番记录、观看任务、缓存和设置保存在 `<安装目录>\data`。两个版本使用不同的应用 ID 和默认安装目录，可以同时安装，数据互不共享。卸载或移动安装目录前，请先备份对应的 `data` 文件夹。
+Windows 版将追番记录、观看任务、缓存和设置保存在 `<安装目录>\data`；Android 版保存在系统分配的应用数据目录。手机和电脑的数据彼此独立，不会自动同步。卸载 Windows 版或移动安装目录前，请备份对应的 `data` 文件夹；卸载 Android 应用会清除手机端本地记录。
 
 ## 功能
 
 - 自动打开当前季度的新番列表，并可切换年份、季度、类型与搜索条件
 - 自主添加或取消追番，按本机时区显示下一集播出时间
-- 应用驻留系统托盘，定时检查 AniList 播出日程
-- 新一集播出后发送 Windows 通知，并自动创建待看任务
+- Windows 应用可驻留系统托盘，定时检查 AniList 播出日程
+- 新一集播出后发送系统通知，并自动创建待看任务
 - Android 使用系统后台调度校正日程，无需常驻进程；可关闭手机端的自动待看任务，仅保留通知
 - 新番列表优先显示 Bangumi 中文标题，匹配不到时回退到英文
 - 中文标题会用于搜索、通知和观看任务，也可在“我的追番”中自定义
@@ -107,12 +116,13 @@ Debug APK 生成在：
 android/app/build/outputs/apk/debug/app-debug.apk
 ```
 
-`android/local.properties`、APK、Gradle 缓存、构建目录和签名密钥均被 Git 忽略，不会上传到仓库。正式发布 Android 版前需要生成并妥善保管自己的签名密钥，再构建签名 APK 或 AAB。
+`android/local.properties`、APK、Gradle 缓存、构建目录和签名密钥均被 Git 忽略，不会上传到仓库。发布者必须妥善备份签名密钥；后续更新需要使用相同密钥，并增加 `versionCode` 后重新构建签名 APK 或 AAB。
 
 ## 测试
 
 ```powershell
 npm run build:all
+npm run build:android
 npm run test:editions
 npm run test:window-lifecycle
 npm run test:cache-storage
@@ -125,9 +135,11 @@ npm audit --omit=dev --audit-level=high
 ## 使用说明
 
 1. 在“季度新番”中选择要追的番剧。
-2. 保持 AniLog 运行或最小化到系统托盘。
-3. 番剧播出后，AniLog 会发送系统通知并添加一条观看任务。
+2. Windows 版可保持运行或最小化到系统托盘；Android 版无需常驻后台。
+3. 番剧播出后，AniLog 会发送系统通知；启用自动任务时还会添加一条观看任务。
 4. 看完后在“观看任务”中勾选对应集数，完成观看任务。
+
+Android 首次追番时需要允许通知。未授予“准时通知”权限时系统仍会发送通知，但可能略有延迟；部分设备还需要将 AniLog 的电池策略设为“不限制”。在系统设置中“强行停止”应用会暂停后台调度，重新打开一次即可恢复。
 
 AniLog 使用 AniList GraphQL API 获取公开番剧与播出日程，并使用 Bangumi 数据补充中文标题，不需要 AniList 或 Bangumi 账号。
 
