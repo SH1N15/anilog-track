@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build application
+        run: npm run build
+
+      - name: Test window lifecycle
+        run: npm run test:window-lifecycle
+
+      - name: Test cache storage
+        run: npm run test:cache-storage
+
+      - name: Test season cache
+        run: npm run test:season-cache
+
+      - name: Test data migration
+        run: npm run test:data
+
+      - name: Test Bangumi matching
+        run: npm run test:bangumi
+
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high

@@ -1,0 +1,733 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  Bell,
+  BellRing,
+  CalendarDays,
+  Check,
+  CheckCircle2,
+  ChevronLeft,
+  ChevronRight,
+  Circle,
+  Clock3,
+  ExternalLink,
+  Filter,
+  HardDrive,
+  Inbox,
+  ListChecks,
+  LoaderCircle,
+  Minus,
+  MonitorDot,
+  Network,
+  RefreshCw,
+  Pencil,
+  Search,
+  Settings,
+  SlidersHorizontal,
+  Sparkles,
+  Trash2,
+  X,
+} from 'lucide-react';
+import { api } from './api';
+import type { Anime, AppState, BangumiTitleMatch, Season, Settings as AppSettings, ViewId, WatchTask } from './types';
+import {
+  currentSeason,
+  formatAiring,
+  formatLabel,
+  relativeTime,
+  reminderTitleOf,
+  SEASONS,
+  seasonLabel,
+  secondaryTitle,
+  stripDescription,
+  titleOf,
+} from './utils';
+
+const EMPTY_STATE: AppState = {
+  version: 2,
+  following: [],
+  tasks: [],
+  bangumiTitles: {},
+  settings: { pollIntervalMinutes: 5, launchAtLogin: false, minimizeToTray: true, notifyWhenAired: true, bangumiApiBaseUrl: 'https://bgmapi.anibt.net/v0' },
+  lastSyncAt: 0,
+};
+
+const NAV_ITEMS: Array<{ id: ViewId; label: string; icon: typeof CalendarDays }> = [
+  { id: 'season', label: '季度新番', icon: CalendarDays },
+  { id: 'tasks', label: '观看任务', icon: ListChecks },
+  { id: 'following', label: '我的追番', icon: Bell },
+  { id: 'settings', label: '偏好设置', icon: Settings },
+];
+
+const UI_STATE_KEY = 'anilog-ui-state';
+
+function loadUiState(fallback: { season: Season; year: number }): { view: ViewId; season: Season; year: number } {
+  try {
+    const saved = JSON.parse(localStorage.getItem(UI_STATE_KEY) || '{}');
+    const views: ViewId[] = ['season', 'tasks', 'following', 'settings'];
+    return {
+      view: views.includes(saved.view) ? saved.view : 'season',
+      season: SEASONS.includes(saved.season) ? saved.season : fallback.season,
+      year: Number.isInteger(saved.year) && saved.year >= 2000 && saved.year <= 2100 ? saved.year : fallback.year,
+    };
+  } catch {
+    return { view: 'season', ...fallback };
+  }
+}
+
+function App() {
+  const nowSeason = currentSeason();
+  const initialUi = useMemo(() => loadUiState(nowSeason), [nowSeason.season, nowSeason.year]);
+  const [view, setView] = useState<ViewId>(initialUi.view);
+  const [state, setState] = useState<AppState>(EMPTY_STATE);
+  const [season, setSeason] = useState<Season>(initialUi.season);
+  const [year, setYear] = useState(initialUi.year);
+  const [anime, setAnime] = useState<Anime[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [syncing, setSyncing] = useState(false);
+  const [error, setError] = useState('');
+  const [lastSyncMessage, setLastSyncMessage] = useState('');
+  const seasonRequest = useRef(0);
+
+  useEffect(() => {
+    api.getState().then(setState).catch((reason) => setError(reason.message));
+    return api.onStateChanged(setState);
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem(UI_STATE_KEY, JSON.stringify({ view, season, year }));
+  }, [view, season, year]);
+
+  const loadSeason = useCallback(async () => {
+    const requestId = ++seasonRequest.current;
+    setLoading(true);
+    setError('');
+    try {
+      const nextAnime = await api.fetchSeason({ season, year });
+      if (requestId === seasonRequest.current) setAnime(nextAnime);
+    } catch (reason) {
+      if (requestId === seasonRequest.current) setError(reason instanceof Error ? reason.message : '无法读取本季番剧');
+    } finally {
+      if (requestId === seasonRequest.current) setLoading(false);
+    }
+  }, [season, year]);
+
+  useEffect(() => {
+    void loadSeason();
+  }, [loadSeason]);
+
+  useEffect(() => api.onSeasonUpdated((update) => {
+    if (update.season === season && update.year === year) {
+      setAnime(update.anime);
+      setError('');
+      setLoading(false);
+    }
+  }), [season, year]);
+
+  const syncNow = async () => {
+    setSyncing(true);
+    setLastSyncMessage('');
+    try {
+      const result = await api.syncNow();
+      setState(await api.getState());
+      setLastSyncMessage(result.created ? `新增 ${result.created} 个观看任务` : '已是最新状态');
+    } catch (reason) {
+      setLastSyncMessage(reason instanceof Error ? reason.message : '同步失败');
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  const pendingCount = state.tasks.filter((task) => task.status === 'pending').length;
+
+  return (
+    <div className="app-shell">
+      <aside className="sidebar">
+        <button className="brand" onClick={() => setView('season')} aria-label="返回季度新番">
+          <span className="brand-mark">A</span>
+          <span>
+            <strong>AniLog</strong>
+            <small>追番日程</small>
+          </span>
+        </button>
+
+        <nav className="main-nav" aria-label="主导航">
+          {NAV_ITEMS.map((item) => {
+            const Icon = item.icon;
+            return (
+              <button
+                key={item.id}
+                className={view === item.id ? 'active' : ''}
+                onClick={() => setView(item.id)}
+                aria-label={item.label}
+                title={item.label}
+              >
+                <Icon size={19} strokeWidth={1.8} />
+                <span>{item.label}</span>
+                {item.id === 'tasks' && pendingCount > 0 && <span className="nav-count">{pendingCount}</span>}
+              </button>
+            );
+          })}
+        </nav>
+
+        <div className="sidebar-status">
+          <span className={`status-dot ${state.runtime?.isDesktop ? 'online' : ''}`} />
+          <div>
+            <strong>{state.runtime?.isDesktop ? '后台提醒已就绪' : '浏览器预览模式'}</strong>
+            <small>{state.following.length} 部追番 · {pendingCount} 项待看</small>
+          </div>
+        </div>
+      </aside>
+
+      <main className="main-content">
+        <header className="topbar">
+          <div>
+            <p>{view === 'season' ? '发现与安排' : view === 'tasks' ? '本地观看清单' : view === 'following' ? '追番管理' : '应用设置'}</p>
+            <h1>{NAV_ITEMS.find((item) => item.id === view)?.label}</h1>
+          </div>
+          <div className="topbar-actions">
+            {lastSyncMessage && <span className="sync-message">{lastSyncMessage}</span>}
+            <button className="icon-button" title="立即同步更新" onClick={syncNow} disabled={syncing}>
+              <RefreshCw size={18} className={syncing ? 'spin' : ''} />
+            </button>
+            <button className="inbox-button" onClick={() => setView('tasks')} aria-label={`${pendingCount} 项待看`}>
+              <Inbox size={18} />
+              <span>{pendingCount} 项待看</span>
+            </button>
+          </div>
+        </header>
+
+        <div className="view-container">
+          {view === 'season' && (
+            <SeasonView
+              anime={anime}
+              loading={loading}
+              error={error}
+              season={season}
+              year={year}
+              followedIds={new Set(state.following.map((item) => item.id))}
+              titleMatches={state.bangumiTitles}
+              onSeasonChange={setSeason}
+              onYearChange={setYear}
+              onRetry={loadSeason}
+              onToggleFollow={async (item) => setState(await api.toggleFollow(item))}
+            />
+          )}
+          {view === 'tasks' && <TasksView tasks={state.tasks} onToggle={async (id) => setState(await api.toggleTask(id))} />}
+          {view === 'following' && (
+            <FollowingView
+              items={state.following}
+              onOpenTasks={() => setView('tasks')}
+              onRename={async (id, displayTitle) => setState(await api.updateFollowTitle(id, displayTitle))}
+              onUnfollow={async (id) => {
+                const source = anime.find((item) => item.id === id);
+                const followed = state.following.find((item) => item.id === id);
+                if (source) setState(await api.toggleFollow(source));
+                else if (followed) setState(await api.toggleFollow({ ...followed, coverImage: { medium: followed.coverImage } }));
+              }}
+            />
+          )}
+          {view === 'settings' && (
+            <SettingsView state={state} onChange={async (patch) => setState(await api.updateSettings(patch))} />
+          )}
+        </div>
+      </main>
+    </div>
+  );
+}
+
+function SeasonView({
+  anime,
+  loading,
+  error,
+  season,
+  year,
+  followedIds,
+  titleMatches,
+  onSeasonChange,
+  onYearChange,
+  onRetry,
+  onToggleFollow,
+}: {
+  anime: Anime[];
+  loading: boolean;
+  error: string;
+  season: Season;
+  year: number;
+  followedIds: Set<number>;
+  titleMatches: Record<string, BangumiTitleMatch>;
+  onSeasonChange: (season: Season) => void;
+  onYearChange: (year: number) => void;
+  onRetry: () => void;
+  onToggleFollow: (anime: Anime) => Promise<void>;
+}) {
+  const [query, setQuery] = useState('');
+  const [format, setFormat] = useState('ALL');
+  const [onlyFollowing, setOnlyFollowing] = useState(false);
+  const [selected, setSelected] = useState<Anime | null>(null);
+  const requestedTitles = useRef(new Set<number>());
+
+  useEffect(() => {
+    requestedTitles.current.clear();
+  }, [season, year]);
+
+  const requestChineseTitle = useCallback((item: Anime) => {
+    if (requestedTitles.current.has(item.id)) return;
+    requestedTitles.current.add(item.id);
+    void api.resolveBangumiTitle(item).catch(() => {});
+  }, []);
+
+  const visible = useMemo(() => {
+    const normalized = query.trim().toLowerCase();
+    return anime.filter((item) => {
+      const matchesQuery = !normalized || [titleMatches[String(item.id)]?.nameCn, item.title.native, item.title.english, item.title.romaji, item.studios?.nodes[0]?.name]
+        .some((value) => value?.toLowerCase().includes(normalized));
+      const matchesFormat = format === 'ALL' || item.format === format;
+      const matchesFollowing = !onlyFollowing || followedIds.has(item.id);
+      return matchesQuery && matchesFormat && matchesFollowing;
+    });
+  }, [anime, query, format, onlyFollowing, followedIds, titleMatches]);
+
+  const shiftYear = (delta: number) => onYearChange(Math.max(2000, Math.min(2100, year + delta)));
+
+  return (
+    <>
+      <section className="season-toolbar" aria-label="季度选择">
+        <div className="year-stepper">
+          <button title="上一年" onClick={() => shiftYear(-1)}><ChevronLeft size={18} /></button>
+          <strong>{year}</strong>
+          <button title="下一年" onClick={() => shiftYear(1)}><ChevronRight size={18} /></button>
+        </div>
+        <div className="segmented-control">
+          {SEASONS.map((item) => (
+            <button key={item.value} className={season === item.value ? 'selected' : ''} onClick={() => onSeasonChange(item.value)}>
+              {item.label}季 <small>{item.months}</small>
+            </button>
+          ))}
+        </div>
+      </section>
+
+      <section className="section-heading">
+        <div>
+          <div className="eyebrow"><Sparkles size={14} /> {seasonLabel(season, year)}</div>
+          <h2>新番更新时间表</h2>
+          <p>{loading ? '正在读取 AniList…' : `${anime.length} 部作品 · 时间按本机时区显示`}</p>
+        </div>
+        <div className="filter-row">
+          <label className="search-field">
+            <Search size={17} />
+            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索番剧或制作公司" />
+            {query && <button title="清空搜索" onClick={() => setQuery('')}><X size={15} /></button>}
+          </label>
+          <label className="select-field">
+            <Filter size={16} />
+            <select value={format} onChange={(event) => setFormat(event.target.value)}>
+              <option value="ALL">全部类型</option>
+              <option value="TV">TV 动画</option>
+              <option value="ONA">网络动画</option>
+              <option value="MOVIE">电影</option>
+              <option value="OVA">OVA</option>
+              <option value="SPECIAL">特别篇</option>
+            </select>
+          </label>
+          <label className="check-filter">
+            <input type="checkbox" checked={onlyFollowing} onChange={(event) => setOnlyFollowing(event.target.checked)} />
+            只看已追
+          </label>
+        </div>
+      </section>
+
+      {error ? (
+        <EmptyState icon={MonitorDot} title="暂时无法读取新番" body={error} action="重新载入" onAction={onRetry} />
+      ) : loading ? (
+        <div className="anime-grid" aria-label="正在载入">
+          {Array.from({ length: 10 }, (_, index) => <div className="anime-skeleton" key={index}><span /><i /><i /></div>)}
+        </div>
+      ) : visible.length === 0 ? (
+        <EmptyState icon={Search} title="没有符合条件的番剧" body="调整搜索或筛选条件后再试。" />
+      ) : (
+        <div className="anime-grid">
+          {visible.map((item) => (
+            <AnimeCard
+              key={item.id}
+              anime={item}
+              titleMatch={titleMatches[String(item.id)]}
+              followed={followedIds.has(item.id)}
+              onVisible={requestChineseTitle}
+              onOpen={() => setSelected(item)}
+              onToggle={() => onToggleFollow(item)}
+            />
+          ))}
+        </div>
+      )}
+
+      {selected && (
+        <AnimeDetail
+          anime={selected}
+          titleMatch={titleMatches[String(selected.id)]}
+          followed={followedIds.has(selected.id)}
+          onClose={() => setSelected(null)}
+          onToggle={() => onToggleFollow(selected)}
+        />
+      )}
+    </>
+  );
+}
+
+function localizedTitle(anime: Anime, match?: BangumiTitleMatch): string {
+  return match?.status === 'matched' && match.nameCn ? match.nameCn : reminderTitleOf(anime.title);
+}
+
+function AnimeCard({
+  anime,
+  titleMatch,
+  followed,
+  onOpen,
+  onToggle,
+  onVisible,
+}: {
+  anime: Anime;
+  titleMatch?: BangumiTitleMatch;
+  followed: boolean;
+  onOpen: () => void;
+  onToggle: () => void;
+  onVisible: (anime: Anime) => void;
+}) {
+  const next = anime.nextAiringEpisode;
+  const cardRef = useRef<HTMLElement>(null);
+  const displayTitle = localizedTitle(anime, titleMatch);
+  const originalTitle = titleOf(anime.title);
+
+  useEffect(() => {
+    if (titleMatch || !cardRef.current) return;
+    if (!('IntersectionObserver' in window)) {
+      onVisible(anime);
+      return;
+    }
+    const root = document.querySelector('.view-container');
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) {
+        onVisible(anime);
+        observer.disconnect();
+      }
+    }, { root, rootMargin: '700px 0px' });
+    observer.observe(cardRef.current);
+    return () => observer.disconnect();
+  }, [anime.id, titleMatch, onVisible]);
+
+  return (
+    <article className="anime-card" ref={cardRef}>
+      <button className="poster-button" onClick={onOpen} aria-label={`查看 ${displayTitle} 详情`}>
+        <img src={anime.coverImage?.extraLarge || anime.coverImage?.medium} alt="" loading="lazy" />
+        <span className="score">{anime.averageScore ? `${anime.averageScore}%` : 'NEW'}</span>
+      </button>
+      <div className="anime-card-body">
+        <div className="anime-meta"><span>{formatLabel(anime.format)}</span><span>{anime.episodes ? `${anime.episodes} 集` : '集数待定'}</span></div>
+        <button className="anime-title" onClick={onOpen}>{displayTitle}</button>
+        <p className="anime-subtitle">{originalTitle !== displayTitle ? originalTitle : secondaryTitle(anime.title) || anime.studios?.nodes[0]?.name || '制作信息待定'}</p>
+        <div className="airing-line">
+          <Clock3 size={15} />
+          <span>{next ? `第 ${next.episode} 集 · ${formatAiring(next.airingAt)}` : anime.status === 'FINISHED' ? '本季已完结' : '更新时间待定'}</span>
+        </div>
+        <button className={`follow-button ${followed ? 'followed' : ''}`} onClick={onToggle}>
+          {followed ? <Check size={17} /> : <Bell size={17} />}
+          {followed ? '已加入追番' : '加入追番'}
+        </button>
+      </div>
+    </article>
+  );
+}
+
+function AnimeDetail({ anime, titleMatch, followed, onClose, onToggle }: { anime: Anime; titleMatch?: BangumiTitleMatch; followed: boolean; onClose: () => void; onToggle: () => void }) {
+  const displayTitle = localizedTitle(anime, titleMatch);
+  const originalTitle = titleOf(anime.title);
+  return (
+    <div className="modal-backdrop" onMouseDown={onClose}>
+      <section className="detail-panel" onMouseDown={(event) => event.stopPropagation()} aria-modal="true" role="dialog">
+        <button className="close-button" onClick={onClose} title="关闭"><X size={20} /></button>
+        <div className="detail-banner" style={anime.bannerImage ? { backgroundImage: `url(${anime.bannerImage})` } : undefined} />
+        <div className="detail-content">
+          <img className="detail-cover" src={anime.coverImage?.extraLarge || anime.coverImage?.medium} alt="" />
+          <div className="detail-main">
+            <div className="eyebrow">{formatLabel(anime.format)} · {anime.episodes ? `${anime.episodes} 集` : '集数待定'}</div>
+            <h2>{displayTitle}</h2>
+            {originalTitle !== displayTitle && <p className="detail-alt-title">{originalTitle}</p>}
+            <div className="detail-stats">
+              <span><strong>{anime.averageScore || '—'}</strong> 评分</span>
+              <span><strong>{anime.duration || '—'}</strong> 分钟</span>
+              <span><strong>{anime.studios?.nodes[0]?.name || '待定'}</strong> 制作</span>
+            </div>
+            <p className="description">{stripDescription(anime.description)}</p>
+            <div className="genre-list">{anime.genres?.map((genre) => <span key={genre}>{genre}</span>)}</div>
+            {anime.nextAiringEpisode && (
+              <div className="next-airing">
+                <Clock3 size={19} />
+                <div><strong>第 {anime.nextAiringEpisode.episode} 集</strong><span>{formatAiring(anime.nextAiringEpisode.airingAt)} · {relativeTime(anime.nextAiringEpisode.airingAt)}</span></div>
+              </div>
+            )}
+            <div className="detail-actions">
+              <button className={`primary-button ${followed ? 'subtle' : ''}`} onClick={onToggle}>
+                {followed ? <Check size={18} /> : <Bell size={18} />}{followed ? '已加入追番' : '加入追番'}
+              </button>
+              {anime.siteUrl && <button className="secondary-button" onClick={() => api.openExternal(anime.siteUrl!)}><ExternalLink size={17} /> AniList 页面</button>}
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function TasksView({ tasks, onToggle }: { tasks: WatchTask[]; onToggle: (id: string) => Promise<void> }) {
+  const [filter, setFilter] = useState<'pending' | 'completed' | 'all'>('pending');
+  const visible = tasks.filter((task) => filter === 'all' || task.status === filter);
+  const pending = tasks.filter((task) => task.status === 'pending').length;
+  const completed = tasks.filter((task) => task.status === 'completed').length;
+
+  return (
+    <>
+      <section className="task-summary">
+        <div><span>待观看</span><strong>{pending}</strong><small>播出后自动加入</small></div>
+        <div><span>已看完</span><strong>{completed}</strong><small>保留观看记录</small></div>
+        <div><span>完成率</span><strong>{tasks.length ? Math.round((completed / tasks.length) * 100) : 0}%</strong><small>当前任务清单</small></div>
+      </section>
+      <section className="section-heading compact">
+        <div><div className="eyebrow"><ListChecks size={14} /> 每集任务</div><h2>观看清单</h2><p>勾选一集，任务即归档到已完成。</p></div>
+        <div className="segmented-control task-tabs">
+          <button className={filter === 'pending' ? 'selected' : ''} onClick={() => setFilter('pending')}>待看 {pending}</button>
+          <button className={filter === 'completed' ? 'selected' : ''} onClick={() => setFilter('completed')}>已看 {completed}</button>
+          <button className={filter === 'all' ? 'selected' : ''} onClick={() => setFilter('all')}>全部</button>
+        </div>
+      </section>
+      {visible.length === 0 ? (
+        <EmptyState icon={CheckCircle2} title={filter === 'pending' ? '待看清单已清空' : '这里还没有观看记录'} body={filter === 'pending' ? '追番更新后，每集会自动出现在这里。' : '看完一集并勾选后会保存在这里。'} />
+      ) : (
+        <div className="task-list">
+          {visible.map((task) => <TaskRow key={task.id} task={task} onToggle={() => onToggle(task.id)} />)}
+        </div>
+      )}
+    </>
+  );
+}
+
+function TaskRow({ task, onToggle }: { task: WatchTask; onToggle: () => void }) {
+  return (
+    <article className={`task-row ${task.status === 'completed' ? 'completed' : ''}`}>
+      <button className="task-check" title={task.status === 'completed' ? '恢复为待看' : '标记为已看'} onClick={onToggle}>
+        {task.status === 'completed' ? <CheckCircle2 size={23} /> : <Circle size={23} />}
+      </button>
+      {task.coverImage ? <img src={task.coverImage} alt="" /> : <span className="cover-placeholder" />}
+      <div className="task-copy"><strong>{task.animeTitle}</strong><span>第 {task.episode} 集</span></div>
+      <div className="task-time"><Clock3 size={15} /><span>{formatAiring(task.airingAt)}</span></div>
+      <span className="task-state">{task.status === 'completed' ? '已看完' : '待观看'}</span>
+    </article>
+  );
+}
+
+function FollowingView({
+  items,
+  onUnfollow,
+  onOpenTasks,
+  onRename,
+}: {
+  items: AppState['following'];
+  onUnfollow: (id: number) => void;
+  onOpenTasks: () => void;
+  onRename: (id: number, displayTitle: string) => Promise<void>;
+}) {
+  const [editingId, setEditingId] = useState<number | null>(null);
+  const [draftTitle, setDraftTitle] = useState('');
+  const sorted = [...items].sort((a, b) => (a.nextAiringEpisode?.airingAt || Infinity) - (b.nextAiringEpisode?.airingAt || Infinity));
+  return (
+    <>
+      <section className="section-heading compact">
+        <div><div className="eyebrow"><BellRing size={14} /> 自动跟踪</div><h2>正在追的番剧</h2><p>{items.length} 部作品会在播出后自动创建观看任务。</p></div>
+        <button className="secondary-button" onClick={onOpenTasks}><ListChecks size={17} /> 查看任务</button>
+      </section>
+      {items.length === 0 ? (
+        <EmptyState icon={Bell} title="还没有添加追番" body="到季度新番中选择作品，更新提醒会自动开启。" />
+      ) : (
+        <div className="following-list">
+          {sorted.map((item) => (
+            <article className="following-row" key={item.id}>
+              <img src={item.coverImage} alt="" />
+              <div className="following-copy">
+                <span>{formatLabel(item.format)} · 通知与任务标题</span>
+                {editingId === item.id ? (
+                  <div className="title-editor">
+                    <input
+                      value={draftTitle}
+                      onChange={(event) => setDraftTitle(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Escape') setEditingId(null);
+                        if (event.key === 'Enter' && draftTitle.trim()) {
+                          void onRename(item.id, draftTitle).then(() => setEditingId(null));
+                        }
+                      }}
+                      aria-label={`${item.displayTitle} 的中文提醒名`}
+                      placeholder="输入中文提醒名"
+                      autoFocus
+                    />
+                    <button
+                      title="保存提醒名"
+                      disabled={!draftTitle.trim()}
+                      onClick={() => void onRename(item.id, draftTitle).then(() => setEditingId(null))}
+                    ><Check size={16} /></button>
+                    <button title="取消修改" onClick={() => setEditingId(null)}><X size={16} /></button>
+                  </div>
+                ) : (
+                  <div className="following-name">
+                    <strong>{item.displayTitle}</strong>
+                    <button
+                      title="修改中文提醒名"
+                      onClick={() => { setEditingId(item.id); setDraftTitle(item.displayTitle); }}
+                    ><Pencil size={14} /></button>
+                  </div>
+                )}
+                <small>{titleOf(item.title) !== item.displayTitle ? `${titleOf(item.title)} · ` : ''}{item.episodes ? `全 ${item.episodes} 集` : '总集数待定'}</small>
+              </div>
+              <div className="following-next">
+                <small>下次更新</small>
+                <strong>{item.nextAiringEpisode ? `第 ${item.nextAiringEpisode.episode} 集` : '暂无日程'}</strong>
+                <span>{item.nextAiringEpisode ? `${formatAiring(item.nextAiringEpisode.airingAt)} · ${relativeTime(item.nextAiringEpisode.airingAt)}` : '等待 AniList 公布'}</span>
+              </div>
+              <button className="icon-button danger" title="取消追番" aria-label={`取消追番 ${item.displayTitle}`} onClick={() => onUnfollow(item.id)}><Minus size={19} /></button>
+            </article>
+          ))}
+        </div>
+      )}
+    </>
+  );
+}
+
+function SettingsView({ state, onChange }: { state: AppState; onChange: (patch: Partial<AppSettings>) => Promise<void> }) {
+  const [proxyUrl, setProxyUrl] = useState(state.settings.bangumiApiBaseUrl);
+  const [proxyStatus, setProxyStatus] = useState('');
+  const [testingProxy, setTestingProxy] = useState(false);
+  const [cacheBytes, setCacheBytes] = useState<number | null>(null);
+  const [cacheSupported, setCacheSupported] = useState<boolean | null>(null);
+  const [cacheStatus, setCacheStatus] = useState('');
+  const [clearingCache, setClearingCache] = useState(false);
+
+  useEffect(() => setProxyUrl(state.settings.bangumiApiBaseUrl), [state.settings.bangumiApiBaseUrl]);
+
+  useEffect(() => {
+    let active = true;
+    api.getCacheInfo()
+      .then((info) => {
+        if (!active) return;
+        setCacheSupported(info.supported);
+        setCacheBytes(info.supported ? info.bytes : null);
+      })
+      .catch((reason) => { if (active) setCacheStatus(reason instanceof Error ? reason.message : '无法读取缓存大小'); });
+    return () => { active = false; };
+  }, []);
+
+  const clearCache = async () => {
+    setClearingCache(true);
+    setCacheStatus('');
+    try {
+      const before = cacheBytes || 0;
+      const info = await api.clearCache();
+      setCacheSupported(info.supported);
+      setCacheBytes(info.supported ? info.bytes : null);
+      setCacheStatus(before > info.bytes ? `已清理 ${formatStorageSize(before - info.bytes)}` : '当前没有可清理缓存');
+    } catch (reason) {
+      setCacheStatus(reason instanceof Error ? reason.message : '清理缓存失败');
+    } finally {
+      setClearingCache(false);
+    }
+  };
+
+  const saveAndTestProxy = async () => {
+    setTestingProxy(true);
+    setProxyStatus('正在测试…');
+    try {
+      if (!proxyUrl.trim()) {
+        await onChange({ bangumiApiBaseUrl: '' });
+        setProxyStatus('已恢复使用官方 API');
+        return;
+      }
+      const result = await api.testBangumiConnection(proxyUrl);
+      setProxyStatus(result.message);
+      if (result.ok) {
+        await onChange({ bangumiApiBaseUrl: proxyUrl });
+      }
+    } catch (reason) {
+      setProxyStatus(reason instanceof Error ? reason.message : '地址无效');
+    } finally {
+      setTestingProxy(false);
+    }
+  };
+
+  return (
+    <div className="settings-layout">
+      <section className="settings-section">
+        <div className="settings-title"><BellRing size={20} /><div><h2>更新提醒</h2><p>新一集播出并加入任务时发送系统通知。</p></div></div>
+        <SettingRow title="播出通知" description={state.runtime?.notificationsSupported === false ? '当前系统不支持通知' : '使用 Windows 通知中心显示更新'}>
+          <Toggle checked={state.settings.notifyWhenAired} disabled={state.runtime?.notificationsSupported === false} onChange={(value) => onChange({ notifyWhenAired: value })} />
+        </SettingRow>
+        <SettingRow title="同步间隔" description="AniList 数据的后台检查频率">
+          <label className="number-select"><select value={state.settings.pollIntervalMinutes} onChange={(event) => onChange({ pollIntervalMinutes: Number(event.target.value) })}><option value={1}>每 1 分钟</option><option value={5}>每 5 分钟</option><option value={10}>每 10 分钟</option><option value={15}>每 15 分钟</option></select></label>
+        </SettingRow>
+      </section>
+      <section className="settings-section">
+        <div className="settings-title"><Network size={20} /><div><h2>中文标题网络</h2><p>默认使用公共反代，也可改为自建地址；清空则使用官方 API。</p></div></div>
+        <div className="proxy-setting">
+          <label htmlFor="bangumi-proxy">Bangumi API 反代地址</label>
+          <div className="proxy-controls">
+            <input id="bangumi-proxy" type="url" value={proxyUrl} onChange={(event) => { setProxyUrl(event.target.value); setProxyStatus(''); }} placeholder="https://api.example.com" />
+            <button className="secondary-button" onClick={saveAndTestProxy} disabled={testingProxy}>{testingProxy ? <LoaderCircle size={15} className="spin" /> : <Network size={15} />}<span>测试并保存</span></button>
+          </div>
+          <p className={proxyStatus === '连接成功' ? 'proxy-status success' : 'proxy-status'}>{proxyStatus || '反代服务可见你的网络地址和搜索标题，但不会收到追番清单或账号信息。'}</p>
+        </div>
+      </section>
+      <section className="settings-section">
+        <div className="settings-title"><MonitorDot size={20} /><div><h2>桌面行为</h2><p>控制应用启动与后台驻留方式。</p></div></div>
+        <SettingRow title="开机后启动" description={state.runtime?.isDesktop ? '登录 Windows 后自动运行 AniLog' : '仅桌面应用支持此设置'}>
+          <Toggle checked={state.settings.launchAtLogin} disabled={!state.runtime?.isDesktop} onChange={(value) => onChange({ launchAtLogin: value })} />
+        </SettingRow>
+        <SettingRow title="关闭时驻留托盘" description="继续在后台同步并发送更新提醒">
+          <Toggle checked={state.settings.minimizeToTray} disabled={!state.runtime?.isDesktop} onChange={(value) => onChange({ minimizeToTray: value })} />
+        </SettingRow>
+      </section>
+      <section className="settings-section">
+        <div className="settings-title"><HardDrive size={20} /><div><h2>缓存空间</h2><p>封面与网络数据可按需重新下载，不包含追番记录和观看任务。</p></div></div>
+        <SettingRow title="图片与网络缓存" description={cacheStatus || '季度列表、中文标题和本地记录会保留'}>
+          <div className="cache-actions">
+            <strong>{cacheSupported === false ? '仅桌面端' : cacheBytes === null ? '正在计算' : formatStorageSize(cacheBytes)}</strong>
+            <button className="secondary-button" disabled={clearingCache || cacheBytes === null || cacheSupported === false} onClick={clearCache}>
+              {clearingCache ? <LoaderCircle size={15} className="spin" /> : <Trash2 size={15} />}
+              <span>清理缓存</span>
+            </button>
+          </div>
+        </SettingRow>
+      </section>
+      <section className="settings-section source-note">
+        <SlidersHorizontal size={20} />
+        <div><h2>数据与隐私</h2><p>番剧与播出日程来自 AniList，中文标题来自 Bangumi。追番清单、观看任务和设置仅保存在本机应用数据目录中，不上传个人数据。</p><small>上次同步：{state.lastSyncAt ? formatAiring(state.lastSyncAt) : '尚未同步'}</small></div>
+      </section>
+    </div>
+  );
+}
+
+function formatStorageSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function SettingRow({ title, description, children }: { title: string; description: string; children: React.ReactNode }) {
+  return <div className="setting-row"><div><strong>{title}</strong><span>{description}</span></div>{children}</div>;
+}
+
+function Toggle({ checked, disabled, onChange }: { checked: boolean; disabled?: boolean; onChange: (checked: boolean) => void }) {
+  return <button className={`toggle ${checked ? 'on' : ''}`} disabled={disabled} role="switch" aria-checked={checked} onClick={() => onChange(!checked)}><span /></button>;
+}
+
+function EmptyState({ icon: Icon, title, body, action, onAction }: { icon: typeof Search; title: string; body: string; action?: string; onAction?: () => void }) {
+  return (
+    <div className="empty-state"><span><Icon size={27} /></span><h3>{title}</h3><p>{body}</p>{action && <button className="secondary-button" onClick={onAction}>{action}</button>}</div>
+  );
+}
+
+export default App;

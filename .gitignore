@@ -1,0 +1,16 @@
+node_modules/
+dist/
+release/
+release-[0-9]*/
+release-final/
+data/
+*.log
+.vite/
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db

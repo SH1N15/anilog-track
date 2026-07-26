@@ -1,0 +1,78 @@
+{
+  "name": "anilog",
+  "version": "0.2.7",
+  "private": true,
+  "description": "A local-first Windows anime schedule, notification, and episode task tracker powered by AniList.",
+  "author": "SH1N15",
+  "license": "MIT",
+  "homepage": "https://github.com/SH1N15/anilog-track#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SH1N15/anilog-track.git"
+  },
+  "bugs": {
+    "url": "https://github.com/SH1N15/anilog-track/issues"
+  },
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "concurrently -k \"vite --host 127.0.0.1\" \"node electron/start-dev.cjs\"",
+    "build": "tsc -b && vite build",
+    "test:bangumi": "node scripts/test-bangumi.cjs",
+    "test:data": "node scripts/test-data-path.cjs",
+    "test:season-cache": "node scripts/test-season-cache.cjs",
+    "test:window-lifecycle": "node scripts/test-window-lifecycle.cjs",
+    "test:cache-storage": "node scripts/test-cache-storage.cjs",
+    "icons": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/generate-icons.ps1",
+    "preview": "vite preview --host 127.0.0.1",
+    "start": "electron .",
+    "dist": "npm run build && electron-builder --win nsis"
+  },
+  "dependencies": {
+    "bangumi-data": "0.3.215"
+  },
+  "devDependencies": {
+    "@types/node": "26.1.1",
+    "@types/react": "19.2.17",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "4.6.0",
+    "concurrently": "10.0.4",
+    "electron": "43.2.0",
+    "electron-builder": "26.15.3",
+    "lucide-react": "1.27.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "typescript": "5.9.3",
+    "vite": "6.4.3"
+  },
+  "build": {
+    "appId": "io.anilog.desktop",
+    "productName": "AniLog",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "assets/**/*",
+      "LICENSE",
+      "THIRD_PARTY_NOTICES.md",
+      "package.json"
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "build/icon.png",
+      "electronLanguages": [
+        "zh-CN",
+        "zh-TW",
+        "en-US"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  },
+  "allowScripts": {
+    "electron@43.2.0": true
+  }
+}
