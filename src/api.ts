@@ -1,6 +1,7 @@
 import type { Anime, AppState, BangumiTitleMatch, DesktopApi, Season, Settings } from './types';
 import { IS_ORIGINAL_EDITION, normalizeTitlePreference, titleForPreference } from './edition';
 import { reminderTitleOf } from './utils';
+import { removeOrphanedPendingTasks, removePendingTasksForAnime } from '../electron/task-retention.cjs';
 
 const STORAGE_KEY = IS_ORIGINAL_EDITION ? 'anilog-original-browser-state' : 'anilog-browser-state';
 const BANGUMI_RESOLVER_VERSION = 4;
@@ -51,6 +52,7 @@ browserState.tasks = (browserState.tasks || []).map((task) => {
   const followed = browserFollowedById.get(task.animeId);
   return followed ? { ...task, animeTitle: followed.displayTitle } : task;
 });
+browserState.tasks = removeOrphanedPendingTasks(browserState.tasks, browserFollowedById.keys());
 const listeners = new Set<(state: AppState) => void>();
 const seasonListeners = new Set<(update: { season: Season; year: number; anime: Anime[]; fetchedAt: number }) => void>();
 
@@ -448,7 +450,10 @@ const browserApi: DesktopApi = {
   fetchSeason: browserFetchSeason,
   async toggleFollow(anime) {
     const existing = browserState.following.findIndex((item) => item.id === anime.id);
-    if (existing >= 0) browserState.following.splice(existing, 1);
+    if (existing >= 0) {
+      browserState.following.splice(existing, 1);
+      browserState.tasks = removePendingTasksForAnime(browserState.tasks, anime.id);
+    }
     else {
       const bangumiMatch = IS_ORIGINAL_EDITION ? undefined : browserState.bangumiTitles[String(anime.id)];
       const hasChineseTitle = !IS_ORIGINAL_EDITION && bangumiMatch?.status === 'matched' && bangumiMatch.nameCn;

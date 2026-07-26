@@ -33,6 +33,12 @@ jobs:
       - name: Test edition separation
         run: npm run test:editions
 
+      - name: Test state refresh race handling
+        run: npm run test:state-refresh
+
+      - name: Test unfollow task retention
+        run: npm run test:task-retention
+
       - name: Test window lifecycle
         run: npm run test:window-lifecycle
 

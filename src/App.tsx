@@ -31,6 +31,7 @@ import {
 import { api } from './api';
 import type { Anime, AppState, BangumiTitleMatch, Season, Settings as AppSettings, ViewId, WatchTask } from './types';
 import { IS_ORIGINAL_EDITION, PRODUCT_NAME, titleForPreference } from './edition';
+import { createStateRefreshController } from './state-refresh';
 import {
   currentSeason,
   formatAiring,
@@ -95,8 +96,28 @@ function App() {
   }, []);
 
   useEffect(() => {
-    api.getState().then(setState).catch((reason) => setError(reason.message));
-    return api.onStateChanged(setState);
+    const controller = createStateRefreshController({
+      getState: api.getState,
+      subscribe: api.onStateChanged,
+      applyState: setState,
+      onError: (reason) => {
+        setError(reason instanceof Error ? reason.message : '无法读取本地状态');
+      },
+    });
+
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === 'visible') void controller.refresh();
+    };
+    const refreshWhenFocused = () => { void controller.refresh(); };
+
+    void controller.refresh(true);
+    document.addEventListener('visibilitychange', refreshWhenVisible);
+    window.addEventListener('focus', refreshWhenFocused);
+    return () => {
+      controller.dispose();
+      document.removeEventListener('visibilitychange', refreshWhenVisible);
+      window.removeEventListener('focus', refreshWhenFocused);
+    };
   }, []);
 
   useEffect(() => {
@@ -228,8 +249,14 @@ function App() {
               onUnfollow={async (id) => {
                 const source = anime.find((item) => item.id === id);
                 const followed = state.following.find((item) => item.id === id);
+                if (!followed) return;
+                const pendingTaskCount = state.tasks.filter((task) => task.animeId === id && task.status === 'pending').length;
+                const taskNotice = pendingTaskCount > 0
+                  ? `取消追番后将移除 ${pendingTaskCount} 个待看任务，已完成记录会保留。`
+                  : '取消追番后，已完成记录会保留。';
+                if (!window.confirm(`确认取消追番《${followed.displayTitle}》吗？\n\n${taskNotice}`)) return;
                 if (source) setState(await api.toggleFollow(source));
-                else if (followed) setState(await api.toggleFollow({ ...followed, coverImage: { medium: followed.coverImage } }));
+                else setState(await api.toggleFollow({ ...followed, coverImage: { medium: followed.coverImage } }));
               }}
             />
           )}

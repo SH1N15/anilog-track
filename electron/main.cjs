@@ -6,6 +6,7 @@ const { configurePackagedDataPaths } = require('./data-path.cjs');
 const { createSeasonCache } = require('./season-cache.cjs');
 const { createWindowLifecycle } = require('./window-lifecycle.cjs');
 const { createCacheStorage } = require('./cache-storage.cjs');
+const { removeOrphanedPendingTasks, removePendingTasksForAnime } = require('./task-retention.cjs');
 
 const EDITION = editionFromEnvironment();
 const bangumiResolver = EDITION.usesBangumi ? require('./bangumi.cjs') : null;
@@ -121,6 +122,7 @@ function loadState() {
       const followed = followedById.get(task.animeId);
       return followed ? { ...task, animeTitle: followed.displayTitle } : task;
     });
+    loaded.tasks = removeOrphanedPendingTasks(loaded.tasks, followedById.keys());
     return loaded;
   } catch {
     return structuredClone(DEFAULT_STATE);
@@ -544,6 +546,10 @@ function createWindow() {
   if (devUrl) mainWindow.loadURL(devUrl);
   else mainWindow.loadFile(path.join(__dirname, '..', 'dist', EDITION.id, 'index.html'));
 
+  // Showing an existing or recreated tray window always publishes the latest
+  // task state, even if the renderer missed the original background event.
+  mainWindow.on('show', broadcastState);
+
   return mainWindow;
 }
 
@@ -571,6 +577,7 @@ function registerIpc() {
     const index = state.following.findIndex((item) => item.id === anime.id);
     if (index >= 0) {
       state.following.splice(index, 1);
+      state.tasks = removePendingTasksForAnime(state.tasks, anime.id);
     } else {
       const bangumiMatch = EDITION.usesBangumi ? state.bangumiTitles[String(anime.id)] : null;
       const hasChineseTitle = EDITION.usesBangumi && bangumiMatch?.status === 'matched' && bangumiMatch.nameCn;
