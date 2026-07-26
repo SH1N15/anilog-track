@@ -1,7 +1,8 @@
 import type { Anime, AppState, BangumiTitleMatch, DesktopApi, Season, Settings } from './types';
+import { IS_ORIGINAL_EDITION, normalizeTitlePreference, titleForPreference } from './edition';
 import { reminderTitleOf } from './utils';
 
-const STORAGE_KEY = 'anilog-browser-state';
+const STORAGE_KEY = IS_ORIGINAL_EDITION ? 'anilog-original-browser-state' : 'anilog-browser-state';
 const BANGUMI_RESOLVER_VERSION = 4;
 const initialState = (): AppState => ({
   version: 2,
@@ -13,10 +14,11 @@ const initialState = (): AppState => ({
     launchAtLogin: false,
     minimizeToTray: true,
     notifyWhenAired: true,
-    bangumiApiBaseUrl: 'https://bgmapi.anibt.net/v0',
+    bangumiApiBaseUrl: IS_ORIGINAL_EDITION ? '' : 'https://bgmapi.anibt.net/v0',
+    titlePreference: 'auto',
   },
   lastSyncAt: Math.floor(Date.now() / 1000),
-  runtime: { isDesktop: false, notificationsSupported: 'Notification' in window, platform: 'browser' },
+  runtime: { isDesktop: false, notificationsSupported: 'Notification' in window, platform: 'browser', edition: IS_ORIGINAL_EDITION ? 'original' : 'standard' },
 });
 
 let browserState: AppState;
@@ -25,21 +27,23 @@ try {
 } catch {
   browserState = initialState();
 }
-browserState.bangumiTitles = Object.fromEntries(
+browserState.bangumiTitles = IS_ORIGINAL_EDITION ? {} : Object.fromEntries(
   Object.entries(browserState.bangumiTitles || {}).filter(([, match]) => match.status === 'matched' || match.resolverVersion === BANGUMI_RESOLVER_VERSION),
 );
 browserState.version = 2;
 browserState.settings = { ...initialState().settings, ...(browserState.settings || {}) };
+browserState.settings.titlePreference = normalizeTitlePreference(browserState.settings.titlePreference);
 browserState.following = (browserState.following || []).map((item) => {
   const generatedTitles = [item.title?.native, item.title?.english, item.title?.romaji].filter(Boolean);
   const titleSource = item.titleSource || (generatedTitles.includes(item.displayTitle) || !item.displayTitle ? 'anilist' : 'custom');
   const cached = browserState.bangumiTitles[String(item.id)];
-  const useBangumi = titleSource !== 'custom' && cached?.status === 'matched' && cached.nameCn;
+  const useBangumi = !IS_ORIGINAL_EDITION && titleSource !== 'custom' && cached?.status === 'matched' && cached.nameCn;
+  const usePreferredTitle = IS_ORIGINAL_EDITION && titleSource !== 'custom';
   return {
     ...item,
-    titleSource: useBangumi ? 'bangumi' : titleSource,
-    bangumiId: useBangumi ? cached.subjectId : item.bangumiId || null,
-    displayTitle: useBangumi ? cached.nameCn! : (item.displayTitle || reminderTitleOf(item.title)),
+    titleSource: useBangumi ? 'bangumi' : usePreferredTitle ? 'anilist' : titleSource,
+    bangumiId: useBangumi ? cached.subjectId : IS_ORIGINAL_EDITION ? null : item.bangumiId || null,
+    displayTitle: useBangumi ? cached.nameCn! : usePreferredTitle ? titleForPreference(item.title, browserState.settings.titlePreference) : (item.displayTitle || reminderTitleOf(item.title)),
   };
 });
 const browserFollowedById = new Map(browserState.following.map((item) => [item.id, item]));
@@ -446,12 +450,12 @@ const browserApi: DesktopApi = {
     const existing = browserState.following.findIndex((item) => item.id === anime.id);
     if (existing >= 0) browserState.following.splice(existing, 1);
     else {
-      const bangumiMatch = browserState.bangumiTitles[String(anime.id)];
-      const hasChineseTitle = bangumiMatch?.status === 'matched' && bangumiMatch.nameCn;
+      const bangumiMatch = IS_ORIGINAL_EDITION ? undefined : browserState.bangumiTitles[String(anime.id)];
+      const hasChineseTitle = !IS_ORIGINAL_EDITION && bangumiMatch?.status === 'matched' && bangumiMatch.nameCn;
       browserState.following.push({
       id: anime.id,
       title: anime.title,
-      displayTitle: hasChineseTitle ? bangumiMatch.nameCn! : reminderTitleOf(anime.title),
+      displayTitle: hasChineseTitle ? bangumiMatch.nameCn! : IS_ORIGINAL_EDITION ? titleForPreference(anime.title, browserState.settings.titlePreference) : reminderTitleOf(anime.title),
       titleSource: hasChineseTitle ? 'bangumi' : 'anilist',
       bangumiId: hasChineseTitle ? bangumiMatch.subjectId : null,
       coverImage: anime.coverImage?.medium || anime.coverImage?.extraLarge || '',
@@ -478,8 +482,9 @@ const browserApi: DesktopApi = {
     }
     return browserState;
   },
-  resolveBangumiTitle: resolveBrowserBangumiTitle,
-  async testBangumiConnection(requestedBaseUrl) {
+  ...(!IS_ORIGINAL_EDITION ? {
+    resolveBangumiTitle: resolveBrowserBangumiTitle,
+    async testBangumiConnection(requestedBaseUrl: string) {
     let baseUrl: string;
     try {
       baseUrl = normalizeBangumiApiBaseUrl(requestedBaseUrl) || 'https://api.bgm.tv/v0';
@@ -491,7 +496,8 @@ const browserApi: DesktopApi = {
     } catch (error) {
       return { ok: false, message: error instanceof Error ? `连接失败：${error.message}` : '连接失败', baseUrl: requestedBaseUrl };
     }
-  },
+    },
+  } : {}),
   async toggleTask(taskId) {
     const task = browserState.tasks.find((item) => item.id === taskId);
     if (task) {
@@ -502,11 +508,27 @@ const browserApi: DesktopApi = {
     return browserState;
   },
   async updateSettings(settings: Partial<Settings>) {
-    if (typeof settings.bangumiApiBaseUrl === 'string') {
+    if (!IS_ORIGINAL_EDITION && typeof settings.bangumiApiBaseUrl === 'string') {
       settings = { ...settings, bangumiApiBaseUrl: normalizeBangumiApiBaseUrl(settings.bangumiApiBaseUrl) };
       browserBangumiUnavailableUntil = 0;
+    } else if (IS_ORIGINAL_EDITION && Object.prototype.hasOwnProperty.call(settings, 'bangumiApiBaseUrl')) {
+      const { bangumiApiBaseUrl: _ignored, ...safeSettings } = settings;
+      settings = safeSettings;
+    }
+    if (typeof settings.titlePreference === 'string') {
+      settings = { ...settings, titlePreference: normalizeTitlePreference(settings.titlePreference) };
     }
     browserState.settings = { ...browserState.settings, ...settings };
+    if (IS_ORIGINAL_EDITION && Object.prototype.hasOwnProperty.call(settings, 'titlePreference')) {
+      browserState.following.forEach((item) => {
+        if (item.titleSource !== 'custom') item.displayTitle = titleForPreference(item.title, browserState.settings.titlePreference);
+      });
+      const followedById = new Map(browserState.following.map((item) => [item.id, item]));
+      browserState.tasks.forEach((task) => {
+        const followed = followedById.get(task.animeId);
+        if (followed) task.animeTitle = followed.displayTitle;
+      });
+    }
     saveBrowserState();
     return browserState;
   },

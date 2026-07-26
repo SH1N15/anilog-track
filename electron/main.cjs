@@ -1,18 +1,25 @@
 const { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, net, Notification, session, shell, Tray } = require('electron');
 const fs = require('node:fs');
 const path = require('node:path');
-const { BANGUMI_RESOLVER_VERSION, bangumiSearchKeywords, matchBangumiCandidates, matchOfflineBangumi } = require('./bangumi.cjs');
+const { editionFromEnvironment, normalizeTitlePreference, titleForPreference } = require('./edition.cjs');
 const { configurePackagedDataPaths } = require('./data-path.cjs');
 const { createSeasonCache } = require('./season-cache.cjs');
 const { createWindowLifecycle } = require('./window-lifecycle.cjs');
 const { createCacheStorage } = require('./cache-storage.cjs');
+
+const EDITION = editionFromEnvironment();
+const bangumiResolver = EDITION.usesBangumi ? require('./bangumi.cjs') : null;
+const BANGUMI_RESOLVER_VERSION = bangumiResolver?.BANGUMI_RESOLVER_VERSION || 0;
+const bangumiSearchKeywords = bangumiResolver?.bangumiSearchKeywords || (() => []);
+const matchBangumiCandidates = bangumiResolver?.matchBangumiCandidates || (() => ({ status: 'unavailable' }));
+const matchOfflineBangumi = bangumiResolver?.matchOfflineBangumi || (() => null);
 
 let dataLocation;
 try {
   dataLocation = configurePackagedDataPaths(app);
   if (!dataLocation.legacyRemoved) console.warn('旧版 C 盘数据未能删除，请确认应用退出后手动清理。');
 } catch (error) {
-  dialog.showErrorBox('AniLog 无法初始化数据目录', `${error.message}\n\n请确认安装目录可写，并重新启动 AniLog。`);
+  dialog.showErrorBox(`${EDITION.productName} 无法初始化数据目录`, `${error.message}\n\n请确认安装目录可写，并重新启动 ${EDITION.productName}。`);
   throw error;
 }
 
@@ -30,7 +37,8 @@ const DEFAULT_STATE = {
     launchAtLogin: false,
     minimizeToTray: true,
     notifyWhenAired: true,
-    bangumiApiBaseUrl: DEFAULT_BANGUMI_PROXY,
+    bangumiApiBaseUrl: EDITION.usesBangumi ? DEFAULT_BANGUMI_PROXY : '',
+    titlePreference: 'auto',
   },
   lastSyncAt: Math.floor(Date.now() / 1000),
 };
@@ -85,22 +93,27 @@ function loadState() {
       ...parsed,
       following: Array.isArray(parsed.following) ? parsed.following : [],
       tasks: Array.isArray(parsed.tasks) ? parsed.tasks : [],
-      bangumiTitles: parsed.bangumiTitles && typeof parsed.bangumiTitles === 'object'
+      bangumiTitles: EDITION.usesBangumi && parsed.bangumiTitles && typeof parsed.bangumiTitles === 'object'
         ? Object.fromEntries(Object.entries(parsed.bangumiTitles).filter(([, match]) => match?.status === 'matched' || match?.resolverVersion === BANGUMI_RESOLVER_VERSION))
         : {},
-      settings: { ...DEFAULT_STATE.settings, ...(parsed.settings || {}) },
+      settings: {
+        ...DEFAULT_STATE.settings,
+        ...(parsed.settings || {}),
+        titlePreference: normalizeTitlePreference(parsed.settings?.titlePreference),
+      },
       version: STATE_VERSION,
     };
     loaded.following = loaded.following.map((item) => {
       const generatedTitles = [item.title?.native, item.title?.english, item.title?.romaji].filter(Boolean);
       const titleSource = item.titleSource || (generatedTitles.includes(item.displayTitle) || !item.displayTitle ? 'anilist' : 'custom');
       const cached = loaded.bangumiTitles[String(item.id)];
-      const useBangumi = titleSource !== 'custom' && cached?.status === 'matched' && cached.nameCn;
+      const useBangumi = EDITION.usesBangumi && titleSource !== 'custom' && cached?.status === 'matched' && cached.nameCn;
+      const usePreferredTitle = !EDITION.usesBangumi && titleSource !== 'custom';
       return {
         ...item,
-        titleSource: useBangumi ? 'bangumi' : titleSource,
-        bangumiId: useBangumi ? cached.subjectId : item.bangumiId || null,
-        displayTitle: useBangumi ? cached.nameCn : (item.displayTitle || displayTitle(item.title)),
+        titleSource: useBangumi ? 'bangumi' : usePreferredTitle ? 'anilist' : titleSource,
+        bangumiId: useBangumi ? cached.subjectId : EDITION.usesBangumi ? item.bangumiId || null : null,
+        displayTitle: useBangumi ? cached.nameCn : usePreferredTitle ? titleForPreference(item.title, loaded.settings.titlePreference) : (item.displayTitle || displayTitle(item.title)),
       };
     });
     const followedById = new Map(loaded.following.map((item) => [item.id, item]));
@@ -129,6 +142,7 @@ function publicState() {
       isDesktop: true,
       notificationsSupported: Notification.isSupported(),
       platform: process.platform,
+      edition: EDITION.id,
     },
   };
 }
@@ -398,7 +412,7 @@ const AIRING_QUERY = `
 `;
 
 function displayTitle(title) {
-  return title?.english || title?.romaji || title?.native || '未命名番剧';
+  return titleForPreference(title, EDITION.usesBangumi ? 'auto' : state?.settings?.titlePreference);
 }
 
 function notifyTasks(created) {
@@ -522,21 +536,22 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
+      additionalArguments: [`--anilog-edition=${EDITION.id}`],
     },
   });
 
   const devUrl = process.env.VITE_DEV_SERVER_URL;
   if (devUrl) mainWindow.loadURL(devUrl);
-  else mainWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'));
+  else mainWindow.loadFile(path.join(__dirname, '..', 'dist', EDITION.id, 'index.html'));
 
   return mainWindow;
 }
 
 function createTray() {
   tray = new Tray(loadImageAsset('tray.png'));
-  tray.setToolTip('AniLog - 追番任务');
+  tray.setToolTip(`${EDITION.productName} - 追番任务`);
   tray.setContextMenu(Menu.buildFromTemplate([
-    { label: '打开 AniLog', click: showWindow },
+    { label: `打开 ${EDITION.productName}`, click: showWindow },
     { label: '立即同步', click: () => syncAiredEpisodes().catch(console.error) },
     { type: 'separator' },
     { label: '退出', click: () => { isQuitting = true; app.quit(); } },
@@ -548,15 +563,17 @@ function createTray() {
 function registerIpc() {
   ipcMain.handle('state:get', () => publicState());
   ipcMain.handle('season:fetch', (_event, params) => seasonCache.get(params));
-  ipcMain.handle('bangumi:resolve-title', (_event, anime) => resolveBangumiTitle(anime));
-  ipcMain.handle('bangumi:test-connection', (_event, baseUrl) => testBangumiConnection(baseUrl));
+  if (EDITION.usesBangumi) {
+    ipcMain.handle('bangumi:resolve-title', (_event, anime) => resolveBangumiTitle(anime));
+    ipcMain.handle('bangumi:test-connection', (_event, baseUrl) => testBangumiConnection(baseUrl));
+  }
   ipcMain.handle('follow:toggle', async (_event, anime) => {
     const index = state.following.findIndex((item) => item.id === anime.id);
     if (index >= 0) {
       state.following.splice(index, 1);
     } else {
-      const bangumiMatch = state.bangumiTitles[String(anime.id)];
-      const hasChineseTitle = bangumiMatch?.status === 'matched' && bangumiMatch.nameCn;
+      const bangumiMatch = EDITION.usesBangumi ? state.bangumiTitles[String(anime.id)] : null;
+      const hasChineseTitle = EDITION.usesBangumi && bangumiMatch?.status === 'matched' && bangumiMatch.nameCn;
       state.following.push({
         id: anime.id,
         title: anime.title,
@@ -602,11 +619,27 @@ function registerIpc() {
     return publicState();
   });
   ipcMain.handle('settings:update', (_event, patch) => {
-    if (Object.prototype.hasOwnProperty.call(patch, 'bangumiApiBaseUrl')) {
+    if (EDITION.usesBangumi && Object.prototype.hasOwnProperty.call(patch, 'bangumiApiBaseUrl')) {
       patch = { ...patch, bangumiApiBaseUrl: normalizeBangumiApiBaseUrl(patch.bangumiApiBaseUrl) };
       bangumiUnavailableUntil = 0;
+    } else if (!EDITION.usesBangumi && Object.prototype.hasOwnProperty.call(patch, 'bangumiApiBaseUrl')) {
+      const { bangumiApiBaseUrl: _ignored, ...safePatch } = patch;
+      patch = safePatch;
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, 'titlePreference')) {
+      patch = { ...patch, titlePreference: normalizeTitlePreference(patch.titlePreference) };
     }
     state.settings = { ...state.settings, ...patch };
+    if (!EDITION.usesBangumi && Object.prototype.hasOwnProperty.call(patch, 'titlePreference')) {
+      state.following.forEach((item) => {
+        if (item.titleSource !== 'custom') item.displayTitle = displayTitle(item.title);
+      });
+      const followedById = new Map(state.following.map((item) => [item.id, item]));
+      state.tasks.forEach((task) => {
+        const followed = followedById.get(task.animeId);
+        if (followed) task.animeTitle = followed.displayTitle;
+      });
+    }
     app.setLoginItemSettings({ openAtLogin: Boolean(state.settings.launchAtLogin) });
     scheduleSync();
     saveState();
@@ -621,7 +654,7 @@ function registerIpc() {
   });
 }
 
-app.setAppUserModelId('io.anilog.desktop');
+app.setAppUserModelId(EDITION.appId);
 app.whenReady().then(() => {
   state = loadState();
   seasonCache = createSeasonCache({
@@ -644,9 +677,11 @@ app.whenReady().then(() => {
   createTray();
   scheduleSync();
   syncAiredEpisodes().catch((error) => console.error('Initial sync failed:', error));
-  state.following
-    .filter((item) => item.titleSource !== 'custom')
-    .forEach((item) => resolveBangumiTitle(item).catch(() => {}));
+  if (EDITION.usesBangumi) {
+    state.following
+      .filter((item) => item.titleSource !== 'custom')
+      .forEach((item) => resolveBangumiTitle(item).catch(() => {}));
+  }
 });
 
 app.on('before-quit', () => { isQuitting = true; });

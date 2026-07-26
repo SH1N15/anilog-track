@@ -1,6 +1,6 @@
 {
   "name": "anilog",
-  "version": "0.2.7",
+  "version": "0.3.0",
   "private": true,
   "description": "A local-first Windows anime schedule, notification, and episode task tracker powered by AniList.",
   "author": "SH1N15",
@@ -16,16 +16,23 @@
   "main": "electron/main.cjs",
   "scripts": {
     "dev": "concurrently -k \"vite --host 127.0.0.1\" \"node electron/start-dev.cjs\"",
-    "build": "tsc -b && vite build",
+    "dev:original": "set \"ANILOG_EDITION=original\"&& set \"VITE_ANILOG_EDITION=original\"&& concurrently -k \"vite --host 127.0.0.1\" \"node electron/start-dev.cjs\"",
+    "build": "node scripts/build-renderer.cjs standard",
+    "build:original": "node scripts/build-renderer.cjs original",
+    "build:all": "npm run build && npm run build:original",
     "test:bangumi": "node scripts/test-bangumi.cjs",
     "test:data": "node scripts/test-data-path.cjs",
     "test:season-cache": "node scripts/test-season-cache.cjs",
     "test:window-lifecycle": "node scripts/test-window-lifecycle.cjs",
     "test:cache-storage": "node scripts/test-cache-storage.cjs",
+    "test:editions": "node scripts/test-editions.cjs",
     "icons": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/generate-icons.ps1",
-    "preview": "vite preview --host 127.0.0.1",
+    "preview": "vite preview --outDir dist/standard --host 127.0.0.1",
+    "preview:original": "vite preview --outDir dist/original --host 127.0.0.1",
     "start": "electron .",
-    "dist": "npm run build && electron-builder --win nsis"
+    "dist": "npm run build && electron-builder --win nsis",
+    "dist:original": "npm run build:original && electron-builder --win nsis --config electron-builder.original.yml",
+    "dist:all": "npm run build:all && electron-builder --win nsis && electron-builder --win nsis --config electron-builder.original.yml"
   },
   "dependencies": {
     "bangumi-data": "0.3.215"
@@ -51,7 +58,7 @@
       "output": "release"
     },
     "files": [
-      "dist/**/*",
+      "dist/standard/**/*",
       "electron/**/*",
       "assets/**/*",
       "LICENSE",

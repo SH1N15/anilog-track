@@ -1,12 +1,11 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
-contextBridge.exposeInMainWorld('animeTracker', {
+const isOriginalEdition = process.argv.includes('--anilog-edition=original');
+const desktopApi = {
   getState: () => ipcRenderer.invoke('state:get'),
   fetchSeason: (params) => ipcRenderer.invoke('season:fetch', params),
   toggleFollow: (anime) => ipcRenderer.invoke('follow:toggle', anime),
   updateFollowTitle: (animeId, displayTitle) => ipcRenderer.invoke('follow:title', { animeId, displayTitle }),
-  resolveBangumiTitle: (anime) => ipcRenderer.invoke('bangumi:resolve-title', anime),
-  testBangumiConnection: (baseUrl) => ipcRenderer.invoke('bangumi:test-connection', baseUrl),
   toggleTask: (taskId) => ipcRenderer.invoke('task:toggle', taskId),
   updateSettings: (settings) => ipcRenderer.invoke('settings:update', settings),
   syncNow: () => ipcRenderer.invoke('sync:now'),
@@ -23,4 +22,11 @@ contextBridge.exposeInMainWorld('animeTracker', {
     ipcRenderer.on('season:updated', listener);
     return () => ipcRenderer.removeListener('season:updated', listener);
   },
-});
+};
+
+if (!isOriginalEdition) {
+  desktopApi.resolveBangumiTitle = (anime) => ipcRenderer.invoke('bangumi:resolve-title', anime);
+  desktopApi.testBangumiConnection = (baseUrl) => ipcRenderer.invoke('bangumi:test-connection', baseUrl);
+}
+
+contextBridge.exposeInMainWorld('animeTracker', desktopApi);

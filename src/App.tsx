@@ -13,6 +13,7 @@ import {
   Filter,
   HardDrive,
   Inbox,
+  Languages,
   ListChecks,
   LoaderCircle,
   Minus,
@@ -29,6 +30,7 @@ import {
 } from 'lucide-react';
 import { api } from './api';
 import type { Anime, AppState, BangumiTitleMatch, Season, Settings as AppSettings, ViewId, WatchTask } from './types';
+import { IS_ORIGINAL_EDITION, PRODUCT_NAME, titleForPreference } from './edition';
 import {
   currentSeason,
   formatAiring,
@@ -47,7 +49,7 @@ const EMPTY_STATE: AppState = {
   following: [],
   tasks: [],
   bangumiTitles: {},
-  settings: { pollIntervalMinutes: 5, launchAtLogin: false, minimizeToTray: true, notifyWhenAired: true, bangumiApiBaseUrl: 'https://bgmapi.anibt.net/v0' },
+  settings: { pollIntervalMinutes: 5, launchAtLogin: false, minimizeToTray: true, notifyWhenAired: true, bangumiApiBaseUrl: IS_ORIGINAL_EDITION ? '' : 'https://bgmapi.anibt.net/v0', titlePreference: 'auto' },
   lastSyncAt: 0,
 };
 
@@ -58,7 +60,7 @@ const NAV_ITEMS: Array<{ id: ViewId; label: string; icon: typeof CalendarDays }>
   { id: 'settings', label: '偏好设置', icon: Settings },
 ];
 
-const UI_STATE_KEY = 'anilog-ui-state';
+const UI_STATE_KEY = IS_ORIGINAL_EDITION ? 'anilog-original-ui-state' : 'anilog-ui-state';
 
 function loadUiState(fallback: { season: Season; year: number }): { view: ViewId; season: Season; year: number } {
   try {
@@ -87,6 +89,10 @@ function App() {
   const [error, setError] = useState('');
   const [lastSyncMessage, setLastSyncMessage] = useState('');
   const seasonRequest = useRef(0);
+
+  useEffect(() => {
+    document.title = PRODUCT_NAME;
+  }, []);
 
   useEffect(() => {
     api.getState().then(setState).catch((reason) => setError(reason.message));
@@ -145,8 +151,8 @@ function App() {
         <button className="brand" onClick={() => setView('season')} aria-label="返回季度新番">
           <span className="brand-mark">A</span>
           <span>
-            <strong>AniLog</strong>
-            <small>追番日程</small>
+            <strong>{PRODUCT_NAME}</strong>
+            <small>{IS_ORIGINAL_EDITION ? '原名追番日程' : '追番日程'}</small>
           </span>
         </button>
 
@@ -206,6 +212,7 @@ function App() {
               year={year}
               followedIds={new Set(state.following.map((item) => item.id))}
               titleMatches={state.bangumiTitles}
+              titlePreference={state.settings.titlePreference}
               onSeasonChange={setSeason}
               onYearChange={setYear}
               onRetry={loadSeason}
@@ -243,6 +250,7 @@ function SeasonView({
   year,
   followedIds,
   titleMatches,
+  titlePreference,
   onSeasonChange,
   onYearChange,
   onRetry,
@@ -255,6 +263,7 @@ function SeasonView({
   year: number;
   followedIds: Set<number>;
   titleMatches: Record<string, BangumiTitleMatch>;
+  titlePreference: AppSettings['titlePreference'];
   onSeasonChange: (season: Season) => void;
   onYearChange: (year: number) => void;
   onRetry: () => void;
@@ -271,6 +280,7 @@ function SeasonView({
   }, [season, year]);
 
   const requestChineseTitle = useCallback((item: Anime) => {
+    if (IS_ORIGINAL_EDITION || !api.resolveBangumiTitle) return;
     if (requestedTitles.current.has(item.id)) return;
     requestedTitles.current.add(item.id);
     void api.resolveBangumiTitle(item).catch(() => {});
@@ -279,7 +289,7 @@ function SeasonView({
   const visible = useMemo(() => {
     const normalized = query.trim().toLowerCase();
     return anime.filter((item) => {
-      const matchesQuery = !normalized || [titleMatches[String(item.id)]?.nameCn, item.title.native, item.title.english, item.title.romaji, item.studios?.nodes[0]?.name]
+      const matchesQuery = !normalized || [IS_ORIGINAL_EDITION ? undefined : titleMatches[String(item.id)]?.nameCn, item.title.native, item.title.english, item.title.romaji, item.studios?.nodes[0]?.name]
         .some((value) => value?.toLowerCase().includes(normalized));
       const matchesFormat = format === 'ALL' || item.format === format;
       const matchesFollowing = !onlyFollowing || followedIds.has(item.id);
@@ -351,6 +361,7 @@ function SeasonView({
               key={item.id}
               anime={item}
               titleMatch={titleMatches[String(item.id)]}
+              titlePreference={titlePreference}
               followed={followedIds.has(item.id)}
               onVisible={requestChineseTitle}
               onOpen={() => setSelected(item)}
@@ -364,6 +375,7 @@ function SeasonView({
         <AnimeDetail
           anime={selected}
           titleMatch={titleMatches[String(selected.id)]}
+          titlePreference={titlePreference}
           followed={followedIds.has(selected.id)}
           onClose={() => setSelected(null)}
           onToggle={() => onToggleFollow(selected)}
@@ -373,13 +385,15 @@ function SeasonView({
   );
 }
 
-function localizedTitle(anime: Anime, match?: BangumiTitleMatch): string {
+function localizedTitle(anime: Anime, match?: BangumiTitleMatch, preference: AppSettings['titlePreference'] = 'auto'): string {
+  if (IS_ORIGINAL_EDITION) return titleForPreference(anime.title, preference);
   return match?.status === 'matched' && match.nameCn ? match.nameCn : reminderTitleOf(anime.title);
 }
 
 function AnimeCard({
   anime,
   titleMatch,
+  titlePreference,
   followed,
   onOpen,
   onToggle,
@@ -387,6 +401,7 @@ function AnimeCard({
 }: {
   anime: Anime;
   titleMatch?: BangumiTitleMatch;
+  titlePreference: AppSettings['titlePreference'];
   followed: boolean;
   onOpen: () => void;
   onToggle: () => void;
@@ -394,11 +409,11 @@ function AnimeCard({
 }) {
   const next = anime.nextAiringEpisode;
   const cardRef = useRef<HTMLElement>(null);
-  const displayTitle = localizedTitle(anime, titleMatch);
+  const displayTitle = localizedTitle(anime, titleMatch, titlePreference);
   const originalTitle = titleOf(anime.title);
 
   useEffect(() => {
-    if (titleMatch || !cardRef.current) return;
+    if (IS_ORIGINAL_EDITION || titleMatch || !cardRef.current) return;
     if (!('IntersectionObserver' in window)) {
       onVisible(anime);
       return;
@@ -437,8 +452,8 @@ function AnimeCard({
   );
 }
 
-function AnimeDetail({ anime, titleMatch, followed, onClose, onToggle }: { anime: Anime; titleMatch?: BangumiTitleMatch; followed: boolean; onClose: () => void; onToggle: () => void }) {
-  const displayTitle = localizedTitle(anime, titleMatch);
+function AnimeDetail({ anime, titleMatch, titlePreference, followed, onClose, onToggle }: { anime: Anime; titleMatch?: BangumiTitleMatch; titlePreference: AppSettings['titlePreference']; followed: boolean; onClose: () => void; onToggle: () => void }) {
+  const displayTitle = localizedTitle(anime, titleMatch, titlePreference);
   const originalTitle = titleOf(anime.title);
   return (
     <div className="modal-backdrop" onMouseDown={onClose}>
@@ -563,8 +578,8 @@ function FollowingView({
                           void onRename(item.id, draftTitle).then(() => setEditingId(null));
                         }
                       }}
-                      aria-label={`${item.displayTitle} 的中文提醒名`}
-                      placeholder="输入中文提醒名"
+                      aria-label={`${item.displayTitle} 的提醒标题`}
+                      placeholder="输入提醒标题"
                       autoFocus
                     />
                     <button
@@ -578,7 +593,7 @@ function FollowingView({
                   <div className="following-name">
                     <strong>{item.displayTitle}</strong>
                     <button
-                      title="修改中文提醒名"
+                      title="修改提醒标题"
                       onClick={() => { setEditingId(item.id); setDraftTitle(item.displayTitle); }}
                     ><Pencil size={14} /></button>
                   </div>
@@ -647,6 +662,7 @@ function SettingsView({ state, onChange }: { state: AppState; onChange: (patch: 
         setProxyStatus('已恢复使用官方 API');
         return;
       }
+      if (!api.testBangumiConnection) throw new Error('当前版本不提供 Bangumi 网络功能');
       const result = await api.testBangumiConnection(proxyUrl);
       setProxyStatus(result.message);
       if (result.ok) {
@@ -670,17 +686,33 @@ function SettingsView({ state, onChange }: { state: AppState; onChange: (patch: 
           <label className="number-select"><select value={state.settings.pollIntervalMinutes} onChange={(event) => onChange({ pollIntervalMinutes: Number(event.target.value) })}><option value={1}>每 1 分钟</option><option value={5}>每 5 分钟</option><option value={10}>每 10 分钟</option><option value={15}>每 15 分钟</option></select></label>
         </SettingRow>
       </section>
-      <section className="settings-section">
-        <div className="settings-title"><Network size={20} /><div><h2>中文标题网络</h2><p>默认使用公共反代，也可改为自建地址；清空则使用官方 API。</p></div></div>
-        <div className="proxy-setting">
-          <label htmlFor="bangumi-proxy">Bangumi API 反代地址</label>
-          <div className="proxy-controls">
-            <input id="bangumi-proxy" type="url" value={proxyUrl} onChange={(event) => { setProxyUrl(event.target.value); setProxyStatus(''); }} placeholder="https://api.example.com" />
-            <button className="secondary-button" onClick={saveAndTestProxy} disabled={testingProxy}>{testingProxy ? <LoaderCircle size={15} className="spin" /> : <Network size={15} />}<span>测试并保存</span></button>
+      {IS_ORIGINAL_EDITION ? (
+        <section className="settings-section">
+          <div className="settings-title"><Languages size={20} /><div><h2>番名显示</h2><p>界面保持中文，番剧标题直接使用 AniList 提供的原始名称。</p></div></div>
+          <SettingRow title="首选标题" description="首选语言缺失时会自动使用其他可用标题">
+            <label className="number-select">
+              <select value={state.settings.titlePreference} onChange={(event) => onChange({ titlePreference: event.target.value as AppSettings['titlePreference'] })}>
+                <option value="auto">自动（英文优先）</option>
+                <option value="english">英文</option>
+                <option value="romaji">罗马字</option>
+                <option value="native">日本語</option>
+              </select>
+            </label>
+          </SettingRow>
+        </section>
+      ) : (
+        <section className="settings-section">
+          <div className="settings-title"><Network size={20} /><div><h2>中文标题网络</h2><p>默认使用公共反代，也可改为自建地址；清空则使用官方 API。</p></div></div>
+          <div className="proxy-setting">
+            <label htmlFor="bangumi-proxy">Bangumi API 反代地址</label>
+            <div className="proxy-controls">
+              <input id="bangumi-proxy" type="url" value={proxyUrl} onChange={(event) => { setProxyUrl(event.target.value); setProxyStatus(''); }} placeholder="https://api.example.com" />
+              <button className="secondary-button" onClick={saveAndTestProxy} disabled={testingProxy}>{testingProxy ? <LoaderCircle size={15} className="spin" /> : <Network size={15} />}<span>测试并保存</span></button>
+            </div>
+            <p className={proxyStatus === '连接成功' ? 'proxy-status success' : 'proxy-status'}>{proxyStatus || '反代服务可见你的网络地址和搜索标题，但不会收到追番清单或账号信息。'}</p>
           </div>
-          <p className={proxyStatus === '连接成功' ? 'proxy-status success' : 'proxy-status'}>{proxyStatus || '反代服务可见你的网络地址和搜索标题，但不会收到追番清单或账号信息。'}</p>
-        </div>
-      </section>
+        </section>
+      )}
       <section className="settings-section">
         <div className="settings-title"><MonitorDot size={20} /><div><h2>桌面行为</h2><p>控制应用启动与后台驻留方式。</p></div></div>
         <SettingRow title="开机后启动" description={state.runtime?.isDesktop ? '登录 Windows 后自动运行 AniLog' : '仅桌面应用支持此设置'}>
@@ -692,7 +724,7 @@ function SettingsView({ state, onChange }: { state: AppState; onChange: (patch: 
       </section>
       <section className="settings-section">
         <div className="settings-title"><HardDrive size={20} /><div><h2>缓存空间</h2><p>封面与网络数据可按需重新下载，不包含追番记录和观看任务。</p></div></div>
-        <SettingRow title="图片与网络缓存" description={cacheStatus || '季度列表、中文标题和本地记录会保留'}>
+        <SettingRow title="图片与网络缓存" description={cacheStatus || (IS_ORIGINAL_EDITION ? '季度列表和本地记录会保留' : '季度列表、中文标题和本地记录会保留')}>
           <div className="cache-actions">
             <strong>{cacheSupported === false ? '仅桌面端' : cacheBytes === null ? '正在计算' : formatStorageSize(cacheBytes)}</strong>
             <button className="secondary-button" disabled={clearingCache || cacheBytes === null || cacheSupported === false} onClick={clearCache}>
@@ -704,7 +736,7 @@ function SettingsView({ state, onChange }: { state: AppState; onChange: (patch: 
       </section>
       <section className="settings-section source-note">
         <SlidersHorizontal size={20} />
-        <div><h2>数据与隐私</h2><p>番剧与播出日程来自 AniList，中文标题来自 Bangumi。追番清单、观看任务和设置仅保存在本机应用数据目录中，不上传个人数据。</p><small>上次同步：{state.lastSyncAt ? formatAiring(state.lastSyncAt) : '尚未同步'}</small></div>
+        <div><h2>数据与隐私</h2><p>{IS_ORIGINAL_EDITION ? '番剧、标题与播出日程均来自 AniList，不连接 Bangumi 或第三方 Bangumi 反代。追番清单、观看任务和设置仅保存在本机应用数据目录中，不上传个人数据。' : '番剧与播出日程来自 AniList，中文标题来自 Bangumi。追番清单、观看任务和设置仅保存在本机应用数据目录中，不上传个人数据。'}</p><small>上次同步：{state.lastSyncAt ? formatAiring(state.lastSyncAt) : '尚未同步'}</small></div>
       </section>
     </div>
   );

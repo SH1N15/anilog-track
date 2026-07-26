@@ -7,14 +7,17 @@
 
 ## 下载与安装
 
-前往 [GitHub Releases](https://github.com/SH1N15/anilog-track/releases) 下载最新的 `AniLog Setup x.y.z.exe`。
+前往 [GitHub Releases](https://github.com/SH1N15/anilog-track/releases) 下载需要的版本：
+
+- `AniLog Setup x.y.z.exe`：标准版，使用 Bangumi 中文标题
+- `AniLog-Original-Setup-x.y.z.exe`：原名版，界面仍为中文，只使用 AniList 的英文、罗马字或日文标题
 
 - 支持 Windows 10/11 x64
-- 番剧日程和中文标题查询需要网络连接
+- 番剧日程需要网络连接；标准版的在线中文标题查询还会访问 Bangumi API 或配置的反代
 - 当前安装包尚未进行商业代码签名，Windows 可能显示“未知发布者”提示
 - 更新安装会保留安装目录下的 `data` 文件夹
 
-应用默认将追番记录、观看任务、缓存和设置保存在 `<安装目录>\data`。卸载或移动安装目录前，请先备份这个文件夹。
+应用默认将追番记录、观看任务、缓存和设置保存在 `<安装目录>\data`。两个版本使用不同的应用 ID 和默认安装目录，可以同时安装，数据互不共享。卸载或移动安装目录前，请先备份对应的 `data` 文件夹。
 
 ## 功能
 
@@ -25,6 +28,7 @@
 - 新番列表优先显示 Bangumi 中文标题，匹配不到时回退到英文
 - 中文标题优先按 AniList ID 精确映射；上下篇共用一个 AniList 条目时生成安全的季级标题
 - 中文标题会用于搜索、通知和观看任务，也可在“我的追番”中自定义
+- 原名版完全不连接 Bangumi，可在“偏好设置 → 番名显示”中选择英文、罗马字或日文标题
 - 勾选每集任务，保留已完成观看记录
 - 追番、任务和偏好设置仅保存在本机
 
@@ -33,6 +37,12 @@
 ```powershell
 npm ci
 npm run dev
+```
+
+使用原名版配置开发运行：
+
+```powershell
+npm run dev:original
 ```
 
 如果 Electron 下载受网络限制，可在 PowerShell 中临时使用镜像后重新安装：
@@ -51,18 +61,26 @@ npm run build
 npm run dist
 ```
 
+构建原名版或一次构建两个安装包：
+
+```powershell
+npm run dist:original
+npm run dist:all
+```
+
 若 Windows 在 Electron 解压阶段报告 `EPERM`，可直接使用项目已安装的 Electron 运行时：
 
 ```powershell
 npx electron-builder --win nsis --config.electronDist=node_modules/electron/dist
 ```
 
-安装包生成在 `release` 目录中。
+两个安装包都会生成在 `release` 目录中。
 
 ## 测试
 
 ```powershell
-npm run build
+npm run build:all
+npm run test:editions
 npm run test:window-lifecycle
 npm run test:cache-storage
 npm run test:season-cache
@@ -80,6 +98,8 @@ npm audit --omit=dev --audit-level=high
 
 AniLog 使用 AniList GraphQL API 获取公开番剧与播出日程，并使用 Bangumi 数据补充中文标题，不需要 AniList 或 Bangumi 账号。
 
+AniLog 原名版只使用 AniList GraphQL API。它不会加载 `bangumi-data`，不会注册 Bangumi 通信接口，也不会向 Bangumi 官方 API 或第三方反代发送请求。默认按“英文 → 罗马字 → 日文”显示标题，也可以在设置中改变首选顺序。应用的其他功能与中文标题标准版一致。
+
 中文标题首先来自 `bangumi-data` 的本地节目数据，缺失条目再通过 Bangumi API 查询。应用只查询进入可视区域且尚未缓存的条目，并在网络异常时自动暂停请求。
 
 本地解析优先读取 `bangumi-data` 提供的 AniList ID 映射，再回退到规范化标题、完整首播日期、季度或 Stage 编号、词序相似度和作品类型匹配。一条 AniList 作品对应多个 Bangumi 篇章时，仅在中文标题拥有足够长的共同前缀时合并显示。匹配缓存带有解析器版本，升级算法后会自动重新检查旧的未匹配与歧义结果。
@@ -92,6 +112,6 @@ AniLog 使用 AniList GraphQL API 获取公开番剧与播出日程，并使用 
 
 ## 许可证
 
-AniLog 源代码使用 [MIT License](LICENSE)。第三方数据和依赖保留各自的许可证，详情见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+AniLog 源代码使用 [MIT License](LICENSE)。第三方数据和依赖保留各自的许可证，标准版详情见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)，原名版说明见 [THIRD_PARTY_NOTICES_ORIGINAL.md](THIRD_PARTY_NOTICES_ORIGINAL.md)。
 
 AniLog 是非官方客户端，与 AniList、Bangumi 及相关权利方不存在隶属或背书关系。

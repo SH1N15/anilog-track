@@ -1,0 +1,28 @@
+appId: io.anilog.desktop.original
+productName: AniLog 原名版
+artifactName: AniLog-Original-Setup-${version}.${ext}
+directories:
+  output: release
+afterPack: build/after-pack-original.cjs
+files:
+  - dist/original/**/*
+  - electron/**/*
+  - assets/**/*
+  - LICENSE
+  - THIRD_PARTY_NOTICES_ORIGINAL.md
+  - package.json
+  - '!electron/bangumi.cjs'
+  - '!node_modules/bangumi-data/**/*'
+extraMetadata:
+  name: anilog-original
+  main: electron/main-original.cjs
+win:
+  target: nsis
+  icon: build/icon.png
+  electronLanguages:
+    - zh-CN
+    - zh-TW
+    - en-US
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true

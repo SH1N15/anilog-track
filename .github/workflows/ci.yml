@@ -28,7 +28,10 @@ jobs:
         run: npm ci
 
       - name: Build application
-        run: npm run build
+        run: npm run build:all
+
+      - name: Test edition separation
+        run: npm run test:editions
 
       - name: Test window lifecycle
         run: npm run test:window-lifecycle

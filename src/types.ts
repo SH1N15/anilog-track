@@ -1,5 +1,6 @@
 export type Season = 'WINTER' | 'SPRING' | 'SUMMER' | 'FALL';
 export type ViewId = 'season' | 'tasks' | 'following' | 'settings';
+export type TitlePreference = 'auto' | 'english' | 'romaji' | 'native';
 
 export interface AnimeTitle {
   native?: string | null;
@@ -67,6 +68,7 @@ export interface Settings {
   minimizeToTray: boolean;
   notifyWhenAired: boolean;
   bangumiApiBaseUrl: string;
+  titlePreference: TitlePreference;
 }
 
 export interface ConnectionTestResult {
@@ -116,6 +118,7 @@ export interface AppState {
     isDesktop: boolean;
     notificationsSupported: boolean;
     platform: string;
+    edition: 'standard' | 'original';
   };
 }
 
@@ -124,8 +127,8 @@ export interface DesktopApi {
   fetchSeason(params: { season: Season; year: number }): Promise<Anime[]>;
   toggleFollow(anime: Anime): Promise<AppState>;
   updateFollowTitle(animeId: number, displayTitle: string): Promise<AppState>;
-  resolveBangumiTitle(anime: Anime): Promise<BangumiTitleMatch>;
-  testBangumiConnection(baseUrl: string): Promise<ConnectionTestResult>;
+  resolveBangumiTitle?(anime: Anime): Promise<BangumiTitleMatch>;
+  testBangumiConnection?(baseUrl: string): Promise<ConnectionTestResult>;
   toggleTask(taskId: string): Promise<AppState>;
   updateSettings(settings: Partial<Settings>): Promise<AppState>;
   syncNow(): Promise<{ created: number; syncedAt: number }>;
