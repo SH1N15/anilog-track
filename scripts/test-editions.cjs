@@ -45,7 +45,7 @@ for (const bundleDirectory of [originalBundleDirectory, path.join(root, 'dist', 
       .filter((name) => name.endsWith('.js'))
       .map((name) => fs.readFileSync(path.join(bundleDirectory, name), 'utf8'))
       .join('\n');
-    for (const forbidden of ['bgmapi.anibt.net', 'api.bgm.tv', 'search/subjects', 'bangumi:resolve-title', 'bangumi:test-connection']) {
+    for (const forbidden of ['bgmapi.anibt.net', 'sh1n.cc.cd', 'api.bgm.tv', 'search/subjects', 'bangumi:resolve-title', 'bangumi:test-connection']) {
       assert.equal(bundle.includes(forbidden), false, `Original renderer contains ${forbidden}`);
     }
     assert.equal(bundle.includes('Seasonal Anime'), true, 'Original renderer does not contain English UI strings');

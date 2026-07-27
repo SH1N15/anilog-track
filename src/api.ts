@@ -16,6 +16,18 @@ import {
 
 const STORAGE_KEY = IS_ANDROID_APP ? (IS_ORIGINAL_EDITION ? 'anilog-android-original-state' : 'anilog-android-state') : IS_ORIGINAL_EDITION ? 'anilog-original-browser-state' : 'anilog-browser-state';
 const BANGUMI_RESOLVER_VERSION = 4;
+const DEFAULT_BANGUMI_PROXY = 'https://sh1n.cc.cd/v0';
+const LEGACY_DEFAULT_BANGUMI_PROXY = 'https://bgmapi.anibt.net/v0';
+
+function migrateBangumiApiBaseUrl(value: unknown): string {
+  if (IS_ORIGINAL_EDITION) return '';
+  const configured = typeof value === 'string' ? value.trim().replace(/\/$/, '') : '';
+  if (!configured) return value === '' ? '' : DEFAULT_BANGUMI_PROXY;
+  return configured === LEGACY_DEFAULT_BANGUMI_PROXY || configured === 'https://bgmapi.anibt.net'
+    ? DEFAULT_BANGUMI_PROXY
+    : String(value);
+}
+
 const initialState = (): AppState => ({
   version: 2,
   following: [],
@@ -30,7 +42,7 @@ const initialState = (): AppState => ({
     createWatchTasks: true,
     dailyTaskReminderEnabled: false,
     dailyTaskReminderTime: '20:00',
-    bangumiApiBaseUrl: IS_ORIGINAL_EDITION ? '' : 'https://bgmapi.anibt.net/v0',
+    bangumiApiBaseUrl: IS_ORIGINAL_EDITION ? '' : DEFAULT_BANGUMI_PROXY,
     titlePreference: 'auto',
   },
   lastSyncAt: Math.floor(Date.now() / 1000),
@@ -58,6 +70,7 @@ browserState.runtime = initialState().runtime;
 browserState.settings = { ...initialState().settings, ...(browserState.settings || {}) };
 browserState.settings.uiLanguage = normalizeUiLanguage(browserState.settings.uiLanguage);
 browserState.settings.titlePreference = normalizeTitlePreference(browserState.settings.titlePreference);
+browserState.settings.bangumiApiBaseUrl = migrateBangumiApiBaseUrl(browserState.settings.bangumiApiBaseUrl);
 browserState.following = (browserState.following || []).map((item) => {
   const generatedTitles = [item.title?.native, item.title?.english, item.title?.romaji].filter(Boolean);
   const titleSource = item.titleSource || (generatedTitles.includes(item.displayTitle) || !item.displayTitle ? 'anilist' : 'custom');

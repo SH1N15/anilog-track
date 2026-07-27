@@ -42,7 +42,8 @@ try {
 
 const ANILIST_API = 'https://graphql.anilist.co';
 const OFFICIAL_BANGUMI_API = 'https://api.bgm.tv/v0';
-const DEFAULT_BANGUMI_PROXY = 'https://bgmapi.anibt.net/v0';
+const DEFAULT_BANGUMI_PROXY = 'https://sh1n.cc.cd/v0';
+const LEGACY_DEFAULT_BANGUMI_PROXY = 'https://bgmapi.anibt.net/v0';
 const STATE_VERSION = 2;
 function installedUiLanguage() {
   if (EDITION.usesBangumi) return 'zh-CN';
@@ -109,6 +110,15 @@ function normalizeBangumiApiBaseUrl(value) {
   return url.toString().replace(/\/$/, '');
 }
 
+function migrateBangumiApiBaseUrl(value) {
+  if (!EDITION.usesBangumi) return '';
+  const configured = typeof value === 'string' ? value.trim().replace(/\/$/, '') : '';
+  if (!configured) return value === '' ? '' : DEFAULT_BANGUMI_PROXY;
+  return configured === LEGACY_DEFAULT_BANGUMI_PROXY || configured === 'https://bgmapi.anibt.net'
+    ? DEFAULT_BANGUMI_PROXY
+    : value;
+}
+
 function bangumiEndpoints() {
   const configured = normalizeBangumiApiBaseUrl(state.settings.bangumiApiBaseUrl);
   return configured && configured !== OFFICIAL_BANGUMI_API
@@ -137,6 +147,7 @@ function loadState() {
         uiLanguage: normalizeUiLanguage(parsed.settings?.uiLanguage || DEFAULT_STATE.settings.uiLanguage, !EDITION.usesBangumi),
         titlePreference: normalizeTitlePreference(parsed.settings?.titlePreference),
         dailyTaskReminderTime: normalizeReminderTime(parsed.settings?.dailyTaskReminderTime),
+        bangumiApiBaseUrl: migrateBangumiApiBaseUrl(parsed.settings?.bangumiApiBaseUrl),
       },
       version: STATE_VERSION,
     };

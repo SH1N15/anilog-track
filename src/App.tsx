@@ -55,7 +55,7 @@ const EMPTY_STATE: AppState = {
   following: [],
   tasks: [],
   bangumiTitles: {},
-  settings: { uiLanguage: 'zh-CN', pollIntervalMinutes: 5, launchAtLogin: false, minimizeToTray: true, notifyWhenAired: true, createWatchTasks: true, dailyTaskReminderEnabled: false, dailyTaskReminderTime: '20:00', bangumiApiBaseUrl: IS_ORIGINAL_EDITION ? '' : 'https://bgmapi.anibt.net/v0', titlePreference: 'auto' },
+  settings: { uiLanguage: 'zh-CN', pollIntervalMinutes: 5, launchAtLogin: false, minimizeToTray: true, notifyWhenAired: true, createWatchTasks: true, dailyTaskReminderEnabled: false, dailyTaskReminderTime: '20:00', bangumiApiBaseUrl: IS_ORIGINAL_EDITION ? '' : 'https://sh1n.cc.cd/v0', titlePreference: 'auto' },
   lastSyncAt: 0,
   syncMetadata: { followingDeletedAt: {} },
 };
