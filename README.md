@@ -3,7 +3,7 @@
 无需账号的跨平台追番工具（Windows / Android）：新番日程提醒、打勾式看番清单与 WebDAV 本地同步。
 Account-free, local-first anime schedule, notification, and episode task manager for Windows and Android.
 
-[![CI](https://github.com/SH1N15/anilog-track/actions/workflows/ci.yml/badge.svg)](https://github.com/SH1N15/anilog-track/actions/workflows/ci.yml)
+[![CI](https://github.com/SH1N15/anilog-tracker/actions/workflows/ci.yml/badge.svg)](https://github.com/SH1N15/anilog-tracker/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 ## 界面预览
@@ -28,12 +28,12 @@ Account-free, local-first anime schedule, notification, and episode task manager
   
 ## 下载与安装
 
-前往 [GitHub Releases](https://github.com/SH1N15/anilog-track/releases) 下载需要的版本：
+前往 [GitHub Releases](https://github.com/SH1N15/anilog-tracker/releases) 下载需要的版本：
 
 - `AniLog Setup x.y.z.exe`：标准版，使用 Bangumi 中文标题
-- [`AniLog-Original-Setup-0.4.1.exe`](https://github.com/SH1N15/anilog-track/releases/download/v0.4.1/AniLog-Original-Setup-0.4.1.exe)：Windows 原名版，安装时可选中文或英文，不连接 Bangumi
-- [`AniLog-Android-v0.4.0.apk`](https://github.com/SH1N15/anilog-track/releases/download/v0.4.0/AniLog-Android-v0.4.0.apk)：Android 标准版，使用 Bangumi 中文标题
-- [`AniLog-Original-Android-v0.4.1.apk`](https://github.com/SH1N15/anilog-track/releases/download/v0.4.1/AniLog-Original-Android-v0.4.1.apk)：Android 原名版，可在设置中切换中文或英文，不连接 Bangumi
+- [`AniLog-Original-Setup-0.4.1.exe`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.4.1/AniLog-Original-Setup-0.4.1.exe)：Windows 原名版，安装时可选中文或英文，不连接 Bangumi
+- [`AniLog-Android-v0.4.0.apk`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.4.0/AniLog-Android-v0.4.0.apk)：Android 标准版，使用 Bangumi 中文标题
+- [`AniLog-Original-Android-v0.4.1.apk`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.4.1/AniLog-Original-Android-v0.4.1.apk)：Android 原名版，可在设置中切换中文或英文，不连接 Bangumi
 
 - 支持 Windows 10/11 x64，以及 Android 7.0 或更高版本
 - 番剧日程需要网络连接；标准版的在线中文标题查询还会访问 Bangumi API 或配置的反代
@@ -102,7 +102,7 @@ AniLog Original is a local-first anime schedule, release notification, and episo
 - English title order defaults to English, then Romaji, then Japanese. The order can be changed in Settings.
 - Following, watch tasks, notifications, local storage, and optional user-owned WebDAV sync work in both languages.
 
-Download the bilingual Original builds from [GitHub Releases](https://github.com/SH1N15/anilog-track/releases). Windows 10/11 x64 and Android 7.0 or later are supported.
+Download the bilingual Original builds from [GitHub Releases](https://github.com/SH1N15/anilog-tracker/releases). Windows 10/11 x64 and Android 7.0 or later are supported.
 
 中文标题首先来自 `bangumi-data` 的本地节目数据，缺失条目再通过 Bangumi API 查询。应用只查询进入可视区域且尚未缓存的条目，并在网络异常时自动暂停请求。
 

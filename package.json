@@ -5,13 +5,13 @@
   "description": "A local-first Windows and Android anime schedule, notification, and episode task tracker powered by AniList.",
   "author": "SH1N15",
   "license": "MIT",
-  "homepage": "https://github.com/SH1N15/anilog-track#readme",
+  "homepage": "https://github.com/SH1N15/anilog-tracker#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/SH1N15/anilog-track.git"
+    "url": "git+https://github.com/SH1N15/anilog-tracker.git"
   },
   "bugs": {
-    "url": "https://github.com/SH1N15/anilog-track/issues"
+    "url": "https://github.com/SH1N15/anilog-tracker/issues"
   },
   "main": "electron/main.cjs",
   "scripts": {
