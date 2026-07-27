@@ -1,7 +1,7 @@
 # AniLog
 
-基于 AniList 的本地追番日程与观看任务应用，支持 Windows 和 Android。
-A local-first Windows and Android anime schedule, release notification, and episode task tracker.
+无需账号的跨平台追番工具（Windows / Android）：新番日程提醒、打勾式看番清单与 WebDAV 本地同步。
+Account-free, local-first anime schedule, notification, and episode task manager for Windows and Android.
 
 [![CI](https://github.com/SH1N15/anilog-track/actions/workflows/ci.yml/badge.svg)](https://github.com/SH1N15/anilog-track/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
