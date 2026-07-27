@@ -57,7 +57,9 @@ Windows 版将追番记录、观看任务、缓存和设置保存在 `<安装目
 - 勾选每集任务，保留已完成观看记录
 - 默认本地保存；WebDAV 同步为可选功能，缓存、通知和设备偏好不会上传
 
-## 开发运行
+## 开发
+
+需要 Node.js 22。
 
 ```powershell
 npm ci
@@ -70,70 +72,7 @@ npm run dev
 npm run dev:original
 ```
 
-如果 Electron 下载受网络限制，可在 PowerShell 中临时使用镜像后重新安装：
-
-```powershell
-$env:ELECTRON_MIRROR='https://npmmirror.com/mirrors/electron/'
-node node_modules\electron\install.js
-```
-
-浏览器预览地址为 `http://127.0.0.1:5173/`。浏览器模式用于界面预览；后台托盘、开机启动和 Windows 通知仅在 Electron 桌面窗口中生效。
-
-## 构建
-
-```powershell
-npm run build
-npm run dist
-```
-
-构建原名版或一次构建两个安装包：
-
-```powershell
-npm run dist:original
-npm run dist:all
-```
-
-若 Windows 在 Electron 解压阶段报告 `EPERM`，可直接使用项目已安装的 Electron 运行时：
-
-```powershell
-npx electron-builder --win nsis --config.electronDist=node_modules/electron/dist
-```
-
-两个安装包都会生成在 `release` 目录中。
-
-### Android 构建
-
-Android 版需要 JDK 21、Android SDK 36.1 和对应 Build Tools。首次构建建议先用 Android Studio 安装 SDK，然后在项目根目录运行：
-
-```powershell
-npm ci
-npm run android:sync
-.\android\gradlew.bat -p android assembleDebug
-```
-
-Debug APK 生成在：
-
-```text
-android/app/build/outputs/apk/debug/app-debug.apk
-```
-
-`android/local.properties`、APK、Gradle 缓存、构建目录和签名密钥均被 Git 忽略，不会上传到仓库。发布者必须妥善备份签名密钥；后续更新需要使用相同密钥，并增加 `versionCode` 后重新构建签名 APK 或 AAB。
-
-## 测试
-
-```powershell
-npm run build:all
-npm run build:android
-npm run test:editions
-npm run test:window-lifecycle
-npm run test:webdav-sync
-npm run test:webdav-service
-npm run test:cache-storage
-npm run test:season-cache
-npm run test:data
-npm run test:bangumi
-npm audit --omit=dev --audit-level=high
-```
+完整的环境配置、构建和测试说明见 [CONTRIBUTING.md](CONTRIBUTING.md)，维护者发布版本时请参考 [docs/RELEASING.md](docs/RELEASING.md)。
 
 ## 使用说明
 
