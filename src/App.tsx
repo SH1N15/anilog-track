@@ -55,7 +55,7 @@ const EMPTY_STATE: AppState = {
   following: [],
   tasks: [],
   bangumiTitles: {},
-  settings: { uiLanguage: 'zh-CN', pollIntervalMinutes: 5, launchAtLogin: false, minimizeToTray: true, notifyWhenAired: true, createWatchTasks: true, bangumiApiBaseUrl: IS_ORIGINAL_EDITION ? '' : 'https://bgmapi.anibt.net/v0', titlePreference: 'auto' },
+  settings: { uiLanguage: 'zh-CN', pollIntervalMinutes: 5, launchAtLogin: false, minimizeToTray: true, notifyWhenAired: true, createWatchTasks: true, dailyTaskReminderEnabled: false, dailyTaskReminderTime: '20:00', bangumiApiBaseUrl: IS_ORIGINAL_EDITION ? '' : 'https://bgmapi.anibt.net/v0', titlePreference: 'auto' },
   lastSyncAt: 0,
   syncMetadata: { followingDeletedAt: {} },
 };
@@ -108,7 +108,11 @@ function App() {
   useEffect(() => {
     const openTasks = () => setView('tasks');
     window.addEventListener('anilog:open-tasks', openTasks);
-    return () => window.removeEventListener('anilog:open-tasks', openTasks);
+    const unsubscribeDesktop = api.onOpenTasks?.(openTasks);
+    return () => {
+      window.removeEventListener('anilog:open-tasks', openTasks);
+      unsubscribeDesktop?.();
+    };
   }, []);
 
   useEffect(() => {
@@ -822,6 +826,19 @@ function SettingsView({ state, language, onChange }: { state: AppState; language
         {isAndroid && <SettingRow title={t('自动创建待看任务', 'Create watch tasks automatically')} description={t('关闭后只发送通知，不再新增手机端任务', 'When off, updates only send notifications and do not add mobile tasks')}>
           <Toggle checked={state.settings.createWatchTasks} onChange={(value) => onChange({ createWatchTasks: value })} />
         </SettingRow>}
+        <SettingRow title={t('每日待看提醒', 'Daily watch reminder')} description={t('仅在存在待看任务时发送一次汇总通知', 'Send one summary notification only when tasks are pending')}>
+          <Toggle checked={state.settings.dailyTaskReminderEnabled} disabled={state.runtime?.notificationsSupported === false} onChange={(value) => onChange({ dailyTaskReminderEnabled: value })} />
+        </SettingRow>
+        <SettingRow title={t('提醒时间', 'Reminder time')} description={t('错过时间后，将在设备或应用下次启动时补发', 'If missed, it will be delivered after the device or app next starts')}>
+          <input
+            className="time-input"
+            type="time"
+            value={state.settings.dailyTaskReminderTime}
+            disabled={!state.settings.dailyTaskReminderEnabled}
+            aria-label={t('每日待看提醒时间', 'Daily watch reminder time')}
+            onChange={(event) => onChange({ dailyTaskReminderTime: event.target.value })}
+          />
+        </SettingRow>
         <SettingRow title={t('同步间隔', 'Sync interval')} description={t('AniList 数据的后台检查频率', 'How often AniList is checked in the background')}>
           {isAndroid ? <span className="fixed-setting-value">{t('约每 6 小时', 'About every 6 hours')}</span> : <label className="number-select"><select value={state.settings.pollIntervalMinutes} onChange={(event) => onChange({ pollIntervalMinutes: Number(event.target.value) })}><option value={1}>{t('每 1 分钟', 'Every minute')}</option><option value={5}>{t('每 5 分钟', 'Every 5 minutes')}</option><option value={10}>{t('每 10 分钟', 'Every 10 minutes')}</option><option value={15}>{t('每 15 分钟', 'Every 15 minutes')}</option></select></label>}
         </SettingRow>

@@ -84,6 +84,7 @@ Original Debug APK 位于 `android/app/build/outputs/apk/original/debug/app-orig
 npm run build:all
 npm run build:android
 npm run build:android-original
+npm run test:daily-task-reminder
 npm run test:editions
 npm run test:state-refresh
 npm run test:task-retention

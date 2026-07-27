@@ -25,6 +25,7 @@ npm ci
 npm run build:all
 npm run build:android
 npm run build:android-original
+npm run test:daily-task-reminder
 npm run test:editions
 npm run test:state-refresh
 npm run test:task-retention
@@ -48,7 +49,7 @@ npm run dist:all
 
 预期生成：
 
-- `release/AniLog Setup X.Y.Z.exe`
+- `release/AniLog-Setup-X.Y.Z.exe`
 - `release/AniLog-Original-Setup-X.Y.Z.exe`
 
 两个 Electron 打包任务会使用相同的临时输出目录，必须串行运行。Windows 安装包没有商业代码签名时，发布说明中应保留“未知发布者”提示。
@@ -91,9 +92,10 @@ zipalign -c -P 16 -v 4 AniLog-Android-vX.Y.Z.apk
 
 ```powershell
 Get-FileHash -Algorithm SHA256 `
-  'release\AniLog Setup X.Y.Z.exe', `
+  'release\AniLog-Setup-X.Y.Z.exe', `
   'release\AniLog-Original-Setup-X.Y.Z.exe', `
-  'release\AniLog-Android-vX.Y.Z.apk'
+  'release\AniLog-Android-vX.Y.Z.apk', `
+  'release\AniLog-Original-Android-vX.Y.Z.apk'
 ```
 
 把三个 SHA-256 值写入对应发布说明。

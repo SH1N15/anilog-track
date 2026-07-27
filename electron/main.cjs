@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, net, Notification, safeStorage, session, shell, Tray } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, net, Notification, powerMonitor, safeStorage, session, shell, Tray } = require('electron');
 const fs = require('node:fs');
 const path = require('node:path');
 const { editionFromEnvironment, normalizeTitlePreference, productName, titleForPreference } = require('./edition.cjs');
@@ -8,6 +8,12 @@ const { createSeasonCache } = require('./season-cache.cjs');
 const { createWindowLifecycle, isHiddenLaunch } = require('./window-lifecycle.cjs');
 const { createCacheStorage } = require('./cache-storage.cjs');
 const { removeOrphanedPendingTasks, removePendingTasksForAnime } = require('./task-retention.cjs');
+const {
+  localDateKey,
+  nextReminderAt,
+  normalizeReminderTime,
+  shouldSendMissedReminder,
+} = require('./daily-task-reminder.cjs');
 const { createWebDavService } = require('./webdav-service.cjs');
 const {
   ensureSyncMetadata,
@@ -59,10 +65,13 @@ const DEFAULT_STATE = {
     minimizeToTray: true,
     notifyWhenAired: true,
     createWatchTasks: true,
+    dailyTaskReminderEnabled: false,
+    dailyTaskReminderTime: '20:00',
     bangumiApiBaseUrl: EDITION.usesBangumi ? DEFAULT_BANGUMI_PROXY : '',
     titlePreference: 'auto',
   },
   lastSyncAt: Math.floor(Date.now() / 1000),
+  lastTaskReminderDate: '',
   syncMetadata: { followingDeletedAt: {} },
 };
 
@@ -70,6 +79,7 @@ let windowLifecycle = null;
 let tray = null;
 let isQuitting = false;
 let syncTimer = null;
+let taskReminderTimer = null;
 let syncInFlight = null;
 let state = null;
 const bangumiQueue = [];
@@ -126,6 +136,7 @@ function loadState() {
         ...(parsed.settings || {}),
         uiLanguage: normalizeUiLanguage(parsed.settings?.uiLanguage || DEFAULT_STATE.settings.uiLanguage, !EDITION.usesBangumi),
         titlePreference: normalizeTitlePreference(parsed.settings?.titlePreference),
+        dailyTaskReminderTime: normalizeReminderTime(parsed.settings?.dailyTaskReminderTime),
       },
       version: STATE_VERSION,
     };
@@ -472,6 +483,64 @@ function notifyTasks(created) {
   });
 }
 
+function openTasksWindow() {
+  if (isQuitting) return;
+  const mainWindow = windowLifecycle?.show();
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const send = () => {
+    if (!mainWindow.isDestroyed()) mainWindow.webContents.send('tasks:open');
+  };
+  if (mainWindow.webContents.isLoading()) mainWindow.webContents.once('did-finish-load', send);
+  else send();
+}
+
+function notifyDailyTasks(now = new Date()) {
+  if (!state.settings.dailyTaskReminderEnabled || !Notification.isSupported()) return false;
+  const pending = state.tasks.filter((task) => task.status === 'pending');
+  if (pending.length === 0) return false;
+
+  const language = state.settings.uiLanguage;
+  const preview = pending.slice(0, 3).map((task) => tr(
+    language,
+    `${task.animeTitle} 第 ${task.episode} 集`,
+    `${task.animeTitle} Episode ${task.episode}`,
+  ));
+  const remaining = pending.length - preview.length;
+  const body = `${preview.join(tr(language, '；', '; '))}${remaining > 0
+    ? tr(language, `；另有 ${remaining} 集`, `; ${remaining} more`)
+    : ''}`;
+  const notification = new Notification({
+    title: tr(language, `今日还有 ${pending.length} 集待看`, `${pending.length} episode${pending.length === 1 ? '' : 's'} to watch`),
+    body,
+    silent: false,
+  });
+  notification.on('click', openTasksWindow);
+  notification.show();
+  state.lastTaskReminderDate = localDateKey(now);
+  saveState();
+  return true;
+}
+
+function scheduleTaskReminder({ checkMissed = false } = {}) {
+  if (taskReminderTimer) clearTimeout(taskReminderTimer);
+  taskReminderTimer = null;
+  if (isQuitting || !state?.settings?.dailyTaskReminderEnabled) return;
+
+  const now = new Date();
+  if (checkMissed && shouldSendMissedReminder(
+    now,
+    state.settings.dailyTaskReminderTime,
+    state.lastTaskReminderDate,
+  )) notifyDailyTasks(now);
+
+  const delay = Math.max(1_000, nextReminderAt(new Date(), state.settings.dailyTaskReminderTime).getTime() - Date.now());
+  taskReminderTimer = setTimeout(() => {
+    taskReminderTimer = null;
+    notifyDailyTasks(new Date());
+    scheduleTaskReminder();
+  }, delay);
+}
+
 async function syncAiredEpisodes({ silent = false } = {}) {
   if (isQuitting) return { created: 0, syncedAt: Math.floor(Date.now() / 1000) };
   if (syncInFlight) return syncInFlight;
@@ -564,6 +633,8 @@ function beginShutdown() {
   isQuitting = true;
   if (syncTimer) clearInterval(syncTimer);
   syncTimer = null;
+  if (taskReminderTimer) clearTimeout(taskReminderTimer);
+  taskReminderTimer = null;
   webDavService?.stop();
 }
 
@@ -706,6 +777,9 @@ function registerIpc() {
     if (Object.prototype.hasOwnProperty.call(patch, 'uiLanguage')) {
       patch = { ...patch, uiLanguage: normalizeUiLanguage(patch.uiLanguage, !EDITION.usesBangumi) };
     }
+    if (Object.prototype.hasOwnProperty.call(patch, 'dailyTaskReminderTime')) {
+      patch = { ...patch, dailyTaskReminderTime: normalizeReminderTime(patch.dailyTaskReminderTime) };
+    }
     state.settings = { ...state.settings, ...patch };
     if (!EDITION.usesBangumi && Object.prototype.hasOwnProperty.call(patch, 'titlePreference')) {
       state.following.forEach((item) => {
@@ -720,6 +794,7 @@ function registerIpc() {
     updateLoginItemSettings(state.settings.launchAtLogin);
     updateTrayMenu();
     scheduleSync();
+    scheduleTaskReminder();
     saveState();
     broadcastState();
     return publicState();
@@ -772,6 +847,8 @@ app.whenReady().then(() => {
   updateLoginItemSettings(state.settings.launchAtLogin);
   if (!START_HIDDEN) showWindow();
   scheduleSync();
+  scheduleTaskReminder({ checkMissed: true });
+  powerMonitor.on('resume', () => scheduleTaskReminder({ checkMissed: true }));
   webDavService.start();
   syncAiredEpisodes().catch((error) => console.error('Initial sync failed:', error));
   if (EDITION.usesBangumi) {

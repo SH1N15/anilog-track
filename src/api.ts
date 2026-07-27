@@ -28,6 +28,8 @@ const initialState = (): AppState => ({
     minimizeToTray: true,
     notifyWhenAired: true,
     createWatchTasks: true,
+    dailyTaskReminderEnabled: false,
+    dailyTaskReminderTime: '20:00',
     bangumiApiBaseUrl: IS_ORIGINAL_EDITION ? '' : 'https://bgmapi.anibt.net/v0',
     titlePreference: 'auto',
   },
@@ -91,6 +93,17 @@ function mobileFollowing() {
   }));
 }
 
+function mobilePendingTasks() {
+  return browserState.tasks
+    .filter((task) => task.status === 'pending')
+    .map((task) => ({
+      id: task.id,
+      animeTitle: task.animeTitle,
+      episode: task.episode,
+      airingAt: task.airingAt,
+    }));
+}
+
 let mobileConfigureChain: Promise<unknown> = Promise.resolve();
 function configureMobileBackground(): Promise<unknown> {
   if (!IS_ANDROID_APP) return Promise.resolve();
@@ -98,8 +111,11 @@ function configureMobileBackground(): Promise<unknown> {
     .catch(() => undefined)
     .then(() => mobilePlugin.configure({
       following: mobileFollowing(),
+      pendingTasks: mobilePendingTasks(),
       notificationsEnabled: browserState.settings.notifyWhenAired,
       createTasksEnabled: browserState.settings.createWatchTasks,
+      dailyTaskReminderEnabled: browserState.settings.dailyTaskReminderEnabled,
+      dailyTaskReminderTime: browserState.settings.dailyTaskReminderTime,
       uiLanguage: browserState.settings.uiLanguage,
     }));
   return mobileConfigureChain;
@@ -744,6 +760,9 @@ const browserApi: DesktopApi = {
     }
     browserState.settings = { ...browserState.settings, ...settings };
     browserState.settings.uiLanguage = normalizeUiLanguage(browserState.settings.uiLanguage);
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(browserState.settings.dailyTaskReminderTime)) {
+      browserState.settings.dailyTaskReminderTime = '20:00';
+    }
     if (IS_ORIGINAL_EDITION && Object.prototype.hasOwnProperty.call(settings, 'titlePreference')) {
       browserState.following.forEach((item) => {
         if (item.titleSource !== 'custom') item.displayTitle = titleForPreference(item.title, browserState.settings.titlePreference, browserState.settings.uiLanguage);
@@ -755,7 +774,7 @@ const browserApi: DesktopApi = {
       });
     }
     saveBrowserState();
-    if (IS_ANDROID_APP && settings.notifyWhenAired === true) {
+    if (IS_ANDROID_APP && (settings.notifyWhenAired === true || settings.dailyTaskReminderEnabled === true)) {
       const permission = await mobilePlugin.requestNotificationPermission();
       if (browserState.runtime) browserState.runtime.notificationPermissionGranted = permission.granted;
       saveBrowserState();

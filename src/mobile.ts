@@ -18,6 +18,13 @@ export interface MobileAiredEvent {
   createdAt: number;
 }
 
+export interface MobilePendingTask {
+  id: string;
+  animeTitle: string;
+  episode: number;
+  airingAt: number;
+}
+
 export interface MobileStatus {
   granted: boolean;
   syncedAt: number;
@@ -39,7 +46,15 @@ export interface NativeWebDavConfig {
 }
 
 interface AniLogMobilePlugin {
-  configure(options: { following: MobileFollowSchedule[]; notificationsEnabled: boolean; createTasksEnabled: boolean; uiLanguage: string }): Promise<MobileStatus>;
+  configure(options: {
+    following: MobileFollowSchedule[];
+    pendingTasks: MobilePendingTask[];
+    notificationsEnabled: boolean;
+    createTasksEnabled: boolean;
+    dailyTaskReminderEnabled: boolean;
+    dailyTaskReminderTime: string;
+    uiLanguage: string;
+  }): Promise<MobileStatus>;
   consumeEvents(): Promise<MobileStatus>;
   syncNow(): Promise<MobileStatus>;
   requestNotificationPermission(): Promise<{ granted: boolean }>;

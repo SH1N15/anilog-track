@@ -1,6 +1,6 @@
 {
   "name": "anilog",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "private": true,
   "description": "A local-first Windows and Android anime schedule, notification, and episode task tracker powered by AniList.",
   "author": "SH1N15",
@@ -34,6 +34,7 @@
     "test:editions": "node scripts/test-editions.cjs",
     "test:state-refresh": "node scripts/test-state-refresh.cjs",
     "test:task-retention": "node scripts/test-task-retention.cjs",
+    "test:daily-task-reminder": "node scripts/test-daily-task-reminder.cjs",
     "test:webdav-sync": "node scripts/test-webdav-sync.cjs",
     "test:webdav-service": "node scripts/test-webdav-service.cjs",
     "icons": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/generate-icons.ps1",
@@ -67,6 +68,7 @@
   "build": {
     "appId": "io.anilog.desktop",
     "productName": "AniLog",
+    "artifactName": "AniLog-Setup-${version}.${ext}",
     "directories": {
       "output": "release"
     },

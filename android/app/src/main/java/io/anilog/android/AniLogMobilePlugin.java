@@ -32,18 +32,33 @@ public class AniLogMobilePlugin extends Plugin {
     @Override
     public void load() {
         NotificationScheduler.ensureChannel(getContext());
+        DailyTaskReminderScheduler.ensureChannel(getContext());
+        DailyTaskReminderScheduler.schedule(getContext(), true);
         BackgroundSync.schedulePeriodic(getContext());
     }
 
     @PluginMethod
     public void configure(PluginCall call) {
         JSArray requested = call.getArray("following", new JSArray());
+        JSArray pendingTasks = call.getArray("pendingTasks", new JSArray());
         JSONArray before = MobileStore.following(getContext());
         boolean notificationsEnabled = call.getBoolean("notificationsEnabled", true);
         boolean createTasksEnabled = call.getBoolean("createTasksEnabled", true);
+        boolean dailyTaskReminderEnabled = call.getBoolean("dailyTaskReminderEnabled", false);
+        String dailyTaskReminderTime = call.getString("dailyTaskReminderTime", "20:00");
         String uiLanguage = call.getString("uiLanguage", "zh-CN");
-        MobileStore.configure(getContext(), requested, notificationsEnabled, createTasksEnabled, uiLanguage);
+        MobileStore.configure(
+            getContext(),
+            requested,
+            pendingTasks,
+            notificationsEnabled,
+            createTasksEnabled,
+            dailyTaskReminderEnabled,
+            dailyTaskReminderTime,
+            uiLanguage
+        );
         NotificationScheduler.ensureChannel(getContext());
+        DailyTaskReminderScheduler.ensureChannel(getContext());
 
         Set<Integer> currentIds = idsOf(requested);
         for (int index = 0; index < before.length(); index += 1) {
@@ -53,6 +68,7 @@ public class AniLogMobilePlugin extends Plugin {
             }
         }
         NotificationScheduler.scheduleAll(getContext());
+        DailyTaskReminderScheduler.schedule(getContext(), false);
         BackgroundSync.schedulePeriodic(getContext());
         call.resolve(status(new JSONArray(), false));
     }

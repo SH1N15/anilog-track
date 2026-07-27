@@ -76,6 +76,8 @@ export interface Settings {
   minimizeToTray: boolean;
   notifyWhenAired: boolean;
   createWatchTasks: boolean;
+  dailyTaskReminderEnabled: boolean;
+  dailyTaskReminderTime: string;
   bangumiApiBaseUrl: string;
   titlePreference: TitlePreference;
 }
@@ -171,6 +173,7 @@ export interface DesktopApi {
   openExternal(url: string): Promise<void>;
   onStateChanged(callback: (state: AppState) => void): () => void;
   onSeasonUpdated(callback: (update: { season: Season; year: number; anime: Anime[]; fetchedAt: number }) => void): () => void;
+  onOpenTasks?(callback: () => void): () => void;
 }
 
 declare global {

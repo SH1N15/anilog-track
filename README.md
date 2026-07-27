@@ -24,16 +24,17 @@ Account-free, local-first anime schedule, notification, and episode task manager
 
 - 自动整理每季度新番及下一集播出时间
 - 新一集播出后在 Windows 或 Android 发送通知，并可创建待看任务
+- 可按自定义时间每日汇总提醒尚未完成的待看任务
 - 无需 AniList 或 Bangumi 账号；默认本地保存，也可使用自己的 WebDAV 账户进行双端同步
   
 ## 下载与安装
 
 前往 [GitHub Releases](https://github.com/SH1N15/anilog-tracker/releases) 下载需要的版本：
 
-- [`AniLog.Setup.0.4.0.exe`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.4.1/AniLog.Setup.0.4.0.exe)：标准版，使用 Bangumi 中文标题
-- [`AniLog-Original-Setup-0.4.1.exe`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.4.1/AniLog-Original-Setup-0.4.1.exe)：Windows 原名版，安装时可选中文或英文，不连接 Bangumi
-- [`AniLog-Android-v0.4.0.apk`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.4.0/AniLog-Android-v0.4.0.apk)：Android 标准版，使用 Bangumi 中文标题
-- [`AniLog-Original-Android-v0.4.1.apk`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.4.1/AniLog-Original-Android-v0.4.1.apk)：Android 原名版，可在设置中切换中文或英文，不连接 Bangumi
+- [`AniLog-Setup-0.5.0.exe`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.5.0/AniLog-Setup-0.5.0.exe)：Windows 标准版，使用 Bangumi 中文标题
+- [`AniLog-Original-Setup-0.5.0.exe`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.5.0/AniLog-Original-Setup-0.5.0.exe)：Windows 原名版，安装时可选中文或英文，不连接 Bangumi
+- [`AniLog-Android-v0.5.0.apk`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.5.0/AniLog-Android-v0.5.0.apk)：Android 标准版，使用 Bangumi 中文标题
+- [`AniLog-Original-Android-v0.5.0.apk`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.5.0/AniLog-Original-Android-v0.5.0.apk)：Android 原名版，可在设置中切换中文或英文，不连接 Bangumi
 
 - 支持 Windows 10/11 x64，以及 Android 7.0 或更高版本
 - 番剧日程需要网络连接；标准版的在线中文标题查询还会访问 Bangumi API 或配置的反代
@@ -50,6 +51,7 @@ Windows 版将追番记录、观看任务、缓存和设置保存在 `<安装目
 - 自主添加或取消追番，按本机时区显示下一集播出时间
 - Windows 应用可驻留系统托盘，定时检查 AniList 播出日程
 - 新一集播出后发送系统通知，并自动创建待看任务
+- 可选每日待看提醒：自定义本机提醒时间，仅有待看任务时发送一次摘要，点击通知直接打开任务列表
 - Android 使用系统后台调度校正日程，无需常驻进程；可关闭手机端的自动待看任务，仅保留通知
 - 使用用户自己的通用 WebDAV 账户双向同步追番和观看任务，支持离线修改后的冲突合并
 - 新番列表优先显示 Bangumi 中文标题，匹配不到时回退到英文
@@ -83,6 +85,8 @@ npm run dev:original
 4. 看完后在“观看任务”中勾选对应集数，完成观看任务。
 5. 如需双端同步，在两台设备的“偏好设置 → 跨设备同步”中填写同一个 WebDAV 账户，测试成功后启用同步。
 
+每日待看提醒默认关闭，可在“偏好设置 → 更新提醒”中启用并选择时间。提醒只读取当前设备的本地任务，不会额外访问 AniList、Bangumi 或 WebDAV；没有待看任务时不会显示通知。设备在设定时间关机或休眠时，AniLog 会在下次启动或恢复后补发当日提醒，同一天最多发送一次。
+
 WebDAV 会在应用启动或恢复前台、数据发生修改时检查更新，也可手动点击“立即同步”；Windows 后台运行期间还会每 15 分钟检查一次，Android 不需要为 WebDAV 常驻后台。同步文件位于 WebDAV 根目录的 `AniLog/anilog-sync.json`。Windows 使用系统安全存储加密密码，Android 使用系统 Keystore；坚果云等服务应填写第三方应用密码，而不是账户登录密码。服务不可用时，本地追番、任务和通知不受影响。
 
 Windows 开机自启使用隐藏启动参数，登录后直接驻留托盘，不主动打开主窗口。Windows 注销或关机时会停止后台同步后退出。
@@ -101,6 +105,7 @@ AniLog Original is a local-first anime schedule, release notification, and episo
 - The Android Original app follows the system language on first launch. You can switch languages later under **Settings → Language and titles**.
 - English title order defaults to English, then Romaji, then Japanese. The order can be changed in Settings.
 - Following, watch tasks, notifications, local storage, and optional user-owned WebDAV sync work in both languages.
+- Optional daily watch-task summaries use local data only and open the task list when tapped.
 
 Download the bilingual Original builds from [GitHub Releases](https://github.com/SH1N15/anilog-tracker/releases). Windows 10/11 x64 and Android 7.0 or later are supported.
 

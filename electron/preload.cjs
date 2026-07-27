@@ -1,6 +1,12 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 const isOriginalEdition = process.argv.includes('--anilog-edition=original');
+const openTasksListeners = new Set();
+let openTasksPending = false;
+ipcRenderer.on('tasks:open', () => {
+  if (openTasksListeners.size === 0) openTasksPending = true;
+  openTasksListeners.forEach((listener) => listener());
+});
 const desktopApi = {
   getState: () => ipcRenderer.invoke('state:get'),
   fetchSeason: (params) => ipcRenderer.invoke('season:fetch', params),
@@ -25,6 +31,14 @@ const desktopApi = {
     const listener = (_event, update) => callback(update);
     ipcRenderer.on('season:updated', listener);
     return () => ipcRenderer.removeListener('season:updated', listener);
+  },
+  onOpenTasks: (callback) => {
+    openTasksListeners.add(callback);
+    if (openTasksPending) {
+      openTasksPending = false;
+      queueMicrotask(callback);
+    }
+    return () => openTasksListeners.delete(callback);
   },
 };
 
