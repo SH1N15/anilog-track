@@ -1,6 +1,7 @@
 export type Season = 'WINTER' | 'SPRING' | 'SUMMER' | 'FALL';
 export type ViewId = 'season' | 'tasks' | 'following' | 'settings';
 export type TitlePreference = 'auto' | 'english' | 'romaji' | 'native';
+export type UiLanguage = 'zh-CN' | 'en-US';
 
 export interface AnimeTitle {
   native?: string | null;
@@ -69,6 +70,7 @@ export interface SyncMetadata {
 }
 
 export interface Settings {
+  uiLanguage: UiLanguage;
   pollIntervalMinutes: number;
   launchAtLogin: boolean;
   minimizeToTray: boolean;

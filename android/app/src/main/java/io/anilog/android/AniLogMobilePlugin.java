@@ -41,7 +41,9 @@ public class AniLogMobilePlugin extends Plugin {
         JSONArray before = MobileStore.following(getContext());
         boolean notificationsEnabled = call.getBoolean("notificationsEnabled", true);
         boolean createTasksEnabled = call.getBoolean("createTasksEnabled", true);
-        MobileStore.configure(getContext(), requested, notificationsEnabled, createTasksEnabled);
+        String uiLanguage = call.getString("uiLanguage", "zh-CN");
+        MobileStore.configure(getContext(), requested, notificationsEnabled, createTasksEnabled, uiLanguage);
+        NotificationScheduler.ensureChannel(getContext());
 
         Set<Integer> currentIds = idsOf(requested);
         for (int index = 0; index < before.length(); index += 1) {

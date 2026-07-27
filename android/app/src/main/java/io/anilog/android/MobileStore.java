@@ -5,6 +5,7 @@ import android.content.SharedPreferences;
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
+import java.util.Locale;
 
 final class MobileStore {
     private static final String PREFS = "anilog_mobile";
@@ -15,6 +16,7 @@ final class MobileStore {
     private static final String CREATE_TASKS = "create_tasks_enabled";
     private static final String LAST_SYNC = "last_sync_at";
     private static final String OPEN_TASKS = "open_tasks";
+    private static final String UI_LANGUAGE = "ui_language";
     private static final Object LOCK = new Object();
 
     private MobileStore() {}
@@ -31,12 +33,13 @@ final class MobileStore {
         }
     }
 
-    static void configure(Context context, JSONArray following, boolean notificationsEnabled, boolean createTasksEnabled) {
+    static void configure(Context context, JSONArray following, boolean notificationsEnabled, boolean createTasksEnabled, String uiLanguage) {
         synchronized (LOCK) {
             prefs(context).edit()
                 .putString(FOLLOWING, following.toString())
                 .putBoolean(NOTIFICATIONS, notificationsEnabled)
                 .putBoolean(CREATE_TASKS, createTasksEnabled)
+                .putString(UI_LANGUAGE, normalizeUiLanguage(context, uiLanguage))
                 .apply();
         }
     }
@@ -86,6 +89,16 @@ final class MobileStore {
 
     static boolean createTasksEnabled(Context context) {
         return prefs(context).getBoolean(CREATE_TASKS, true);
+    }
+
+    static String uiLanguage(Context context) {
+        return normalizeUiLanguage(context, prefs(context).getString(UI_LANGUAGE, ""));
+    }
+
+    private static String normalizeUiLanguage(Context context, String value) {
+        if (!context.getPackageName().endsWith(".original")) return "zh-CN";
+        String language = value == null || value.isEmpty() ? Locale.getDefault().getLanguage() : value;
+        return language.toLowerCase(Locale.ROOT).startsWith("zh") ? "zh-CN" : "en-US";
     }
 
     static boolean addAiredEvent(Context context, JSONObject event, boolean storeEvent) {

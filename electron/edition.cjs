@@ -7,7 +7,7 @@ const EDITIONS = {
   },
   original: {
     id: 'original',
-    productName: 'AniLog 原名版',
+    productName: 'AniLog Original',
     appId: 'io.anilog.desktop.original',
     usesBangumi: false,
   },
@@ -21,7 +21,7 @@ function normalizeTitlePreference(value) {
   return ['auto', 'english', 'romaji', 'native'].includes(value) ? value : 'auto';
 }
 
-function titleForPreference(title, preference = 'auto') {
+function titleForPreference(title, preference = 'auto', language = 'zh-CN') {
   const orders = {
     auto: ['english', 'romaji', 'native'],
     english: ['english', 'romaji', 'native'],
@@ -29,12 +29,17 @@ function titleForPreference(title, preference = 'auto') {
     native: ['native', 'romaji', 'english'],
   };
   const order = orders[normalizeTitlePreference(preference)];
-  return order.map((key) => title?.[key]).find(Boolean) || '未命名番剧';
+  return order.map((key) => title?.[key]).find(Boolean) || (language === 'en-US' ? 'Untitled anime' : '未命名番剧');
+}
+
+function productName(edition, language = 'zh-CN') {
+  return edition.id === 'original' && language === 'zh-CN' ? 'AniLog 原名版' : edition.productName;
 }
 
 module.exports = {
   EDITIONS,
   editionFromEnvironment,
   normalizeTitlePreference,
+  productName,
   titleForPreference,
 };

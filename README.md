@@ -31,15 +31,16 @@ Account-free, local-first anime schedule, notification, and episode task manager
 前往 [GitHub Releases](https://github.com/SH1N15/anilog-track/releases) 下载需要的版本：
 
 - `AniLog Setup x.y.z.exe`：标准版，使用 Bangumi 中文标题
-- `AniLog-Original-Setup-x.y.z.exe`：原名版，界面仍为中文，只使用 AniList 的英文、罗马字或日文标题
+- [`AniLog-Original-Setup-0.4.1.exe`](https://github.com/SH1N15/anilog-track/releases/download/v0.4.1/AniLog-Original-Setup-0.4.1.exe)：Windows 原名版，安装时可选中文或英文，不连接 Bangumi
 - [`AniLog-Android-v0.4.0.apk`](https://github.com/SH1N15/anilog-track/releases/download/v0.4.0/AniLog-Android-v0.4.0.apk)：Android 标准版，使用 Bangumi 中文标题
+- [`AniLog-Original-Android-v0.4.1.apk`](https://github.com/SH1N15/anilog-track/releases/download/v0.4.1/AniLog-Original-Android-v0.4.1.apk)：Android 原名版，可在设置中切换中文或英文，不连接 Bangumi
 
 - 支持 Windows 10/11 x64，以及 Android 7.0 或更高版本
 - 番剧日程需要网络连接；标准版的在线中文标题查询还会访问 Bangumi API 或配置的反代
 - Windows 安装包尚未进行商业代码签名，可能显示“未知发布者”提示
 - Windows 更新安装会保留安装目录下的 `data` 文件夹
 
-Android 版使用项目发布密钥签名。公开下载包及其 SHA-256 校验值以 GitHub Releases 页面为准。Android 目前只提供标准版。
+Android 版使用项目发布密钥签名。公开下载包及其 SHA-256 校验值以 GitHub Releases 页面为准。标准版与原名版使用不同包名，可以同时安装。
 
 Windows 版将追番记录、观看任务、缓存和设置保存在 `<安装目录>\data`；Android 版保存在系统分配的应用数据目录。默认情况下两端数据彼此独立；启用 WebDAV 后，仅同步追番、观看任务和取消追番记录。卸载 Windows 版或移动安装目录前，请备份对应的 `data` 文件夹；卸载 Android 应用会清除手机端本地记录。
 
@@ -53,7 +54,7 @@ Windows 版将追番记录、观看任务、缓存和设置保存在 `<安装目
 - 使用用户自己的通用 WebDAV 账户双向同步追番和观看任务，支持离线修改后的冲突合并
 - 新番列表优先显示 Bangumi 中文标题，匹配不到时回退到英文
 - 中文标题会用于搜索、通知和观看任务，也可在“我的追番”中自定义
-- 原名版完全不连接 Bangumi，可在“偏好设置 → 番名显示”中选择英文、罗马字或日文标题
+- 原名版完全不连接 Bangumi；Windows 安装时可选中英文，Windows 与 Android 均可在“偏好设置 → 语言与番名”中切换界面语言及英文、罗马字或日文标题
 - 勾选每集任务，保留已完成观看记录
 - 默认本地保存；WebDAV 同步为可选功能，缓存、通知和设备偏好不会上传
 
@@ -91,6 +92,17 @@ Android 首次追番时需要允许通知。未授予“准时通知”权限时
 AniLog 使用 AniList GraphQL API 获取公开番剧与播出日程，并使用 Bangumi 数据补充中文标题，不需要 AniList 或 Bangumi 账号。
 
 AniLog 原名版只使用 AniList GraphQL API。它不会加载 `bangumi-data`，不会注册 Bangumi 通信接口，也不会向 Bangumi 官方 API 或第三方反代发送请求。默认按“英文 → 罗马字 → 日文”显示标题，也可以在设置中改变首选顺序。应用的其他功能与中文标题标准版一致。
+
+## English
+
+AniLog Original is a local-first anime schedule, release notification, and episode task tracker for Windows and Android. It uses AniList titles only and never connects to Bangumi or a third-party Bangumi proxy.
+
+- The Windows installer lets you choose English or Simplified Chinese and remembers that choice on first launch.
+- The Android Original app follows the system language on first launch. You can switch languages later under **Settings → Language and titles**.
+- English title order defaults to English, then Romaji, then Japanese. The order can be changed in Settings.
+- Following, watch tasks, notifications, local storage, and optional user-owned WebDAV sync work in both languages.
+
+Download the bilingual Original builds from [GitHub Releases](https://github.com/SH1N15/anilog-track/releases). Windows 10/11 x64 and Android 7.0 or later are supported.
 
 中文标题首先来自 `bangumi-data` 的本地节目数据，缺失条目再通过 Bangumi API 查询。应用只查询进入可视区域且尚未缓存的条目，并在网络异常时自动暂停请求。
 

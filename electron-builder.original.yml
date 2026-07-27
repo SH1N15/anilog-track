@@ -1,5 +1,5 @@
 appId: io.anilog.desktop.original
-productName: AniLog 原名版
+productName: AniLog Original
 artifactName: AniLog-Original-Setup-${version}.${ext}
 directories:
   output: release
@@ -26,3 +26,8 @@ win:
 nsis:
   oneClick: false
   allowToChangeInstallationDirectory: true
+  displayLanguageSelector: true
+  installerLanguages:
+    - en_US
+    - zh_CN
+  include: build/installer-original.nsh

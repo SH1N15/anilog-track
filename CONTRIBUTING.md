@@ -36,6 +36,8 @@ Windows 原名版：
 npm run dev:original
 ```
 
+原名版的中英文文案集中使用 `src/i18n.ts` 的语言工具。新增用户可见文本时，应同时提供中文和英文，并验证标准版仍固定使用中文。
+
 浏览器预览地址通常为 `http://127.0.0.1:5173/`。浏览器模式仅用于界面预览；系统托盘、开机自启和 Windows 通知只在 Electron 中生效。
 
 ## 构建 Windows 版
@@ -60,10 +62,19 @@ npx electron-builder --win nsis --config.electronDist=node_modules/electron/dist
 
 ```powershell
 npm run android:sync
-.\android\gradlew.bat -p android assembleDebug
+.\android\gradlew.bat -p android assembleStandardDebug
 ```
 
-Debug APK 位于 `android/app/build/outputs/apk/debug/app-debug.apk`。
+Debug APK 位于 `android/app/build/outputs/apk/standard/debug/app-standard-debug.apk`。
+
+构建使用 AniList 原名、支持中英文界面的 Android Original：
+
+```powershell
+npm run android:sync:original
+.\android\gradlew.bat -p android assembleOriginalDebug
+```
+
+Original Debug APK 位于 `android/app/build/outputs/apk/original/debug/app-original-debug.apk`，包名为 `io.anilog.android.original`，可与标准版同时安装。每次切换 Android 版本时都应先执行对应的 `android:sync` 命令，确保 Capacitor 网页资源与目标版本一致。
 
 `android/local.properties`、APK、Gradle 缓存、构建目录和签名密钥均被 Git 忽略。不要把密码、应用专用密码、签名密钥或其他凭据提交到仓库。
 
@@ -72,6 +83,7 @@ Debug APK 位于 `android/app/build/outputs/apk/debug/app-debug.apk`。
 ```powershell
 npm run build:all
 npm run build:android
+npm run build:android-original
 npm run test:editions
 npm run test:state-refresh
 npm run test:task-retention

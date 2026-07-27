@@ -24,12 +24,13 @@ final class NotificationScheduler {
 
     static void ensureChannel(Context context) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return;
+        boolean english = "en-US".equals(MobileStore.uiLanguage(context));
         NotificationChannel channel = new NotificationChannel(
             CHANNEL_ID,
-            "番剧更新",
+            english ? "Anime updates" : "番剧更新",
             NotificationManager.IMPORTANCE_DEFAULT
         );
-        channel.setDescription("新一集播出时显示通知");
+        channel.setDescription(english ? "Notifications when new episodes air" : "新一集播出时显示通知");
         NotificationManager manager = context.getSystemService(NotificationManager.class);
         manager.createNotificationChannel(channel);
     }
@@ -94,7 +95,8 @@ final class NotificationScheduler {
         if (follow == null || follow.optInt("nextEpisode") != episode || follow.optLong("nextAiringAt") != airingAt) return;
 
         JSONObject event = new JSONObject();
-        String title = follow.optString("displayTitle", "未命名番剧");
+        boolean english = "en-US".equals(MobileStore.uiLanguage(context));
+        String title = follow.optString("displayTitle", english ? "Untitled anime" : "未命名番剧");
         try {
             event.put("id", animeId + "-" + episode);
             event.put("animeId", animeId);
@@ -128,10 +130,13 @@ final class NotificationScheduler {
             openApp,
             PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
         );
+        boolean english = "en-US".equals(MobileStore.uiLanguage(context));
         NotificationCompat.Builder notification = new NotificationCompat.Builder(context, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle(title + " 更新了")
-            .setContentText("第 " + episode + (taskCreated ? " 集已播出，已加入待看任务。" : " 集已播出。"))
+            .setContentTitle(english ? title + " has a new episode" : title + " 更新了")
+            .setContentText(english
+                ? "Episode " + episode + (taskCreated ? " has aired and was added to your watch tasks." : " has aired.")
+                : "第 " + episode + (taskCreated ? " 集已播出，已加入待看任务。" : " 集已播出。"))
             .setAutoCancel(true)
             .setContentIntent(contentIntent)
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)

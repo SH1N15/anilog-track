@@ -39,7 +39,7 @@ export interface NativeWebDavConfig {
 }
 
 interface AniLogMobilePlugin {
-  configure(options: { following: MobileFollowSchedule[]; notificationsEnabled: boolean; createTasksEnabled: boolean }): Promise<MobileStatus>;
+  configure(options: { following: MobileFollowSchedule[]; notificationsEnabled: boolean; createTasksEnabled: boolean; uiLanguage: string }): Promise<MobileStatus>;
   consumeEvents(): Promise<MobileStatus>;
   syncNow(): Promise<MobileStatus>;
   requestNotificationPermission(): Promise<{ granted: boolean }>;

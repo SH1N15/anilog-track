@@ -1,7 +1,8 @@
 const { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, net, Notification, safeStorage, session, shell, Tray } = require('electron');
 const fs = require('node:fs');
 const path = require('node:path');
-const { editionFromEnvironment, normalizeTitlePreference, titleForPreference } = require('./edition.cjs');
+const { editionFromEnvironment, normalizeTitlePreference, productName, titleForPreference } = require('./edition.cjs');
+const { normalizeUiLanguage, systemUiLanguage, tr } = require('./i18n.cjs');
 const { configurePackagedDataPaths } = require('./data-path.cjs');
 const { createSeasonCache } = require('./season-cache.cjs');
 const { createWindowLifecycle, isHiddenLaunch } = require('./window-lifecycle.cjs');
@@ -23,11 +24,13 @@ const matchBangumiCandidates = bangumiResolver?.matchBangumiCandidates || (() =>
 const matchOfflineBangumi = bangumiResolver?.matchOfflineBangumi || (() => null);
 
 let dataLocation;
+const fallbackLanguage = systemUiLanguage(!EDITION.usesBangumi);
 try {
   dataLocation = configurePackagedDataPaths(app);
   if (!dataLocation.legacyRemoved) console.warn('旧版 C 盘数据未能删除，请确认应用退出后手动清理。');
 } catch (error) {
-  dialog.showErrorBox(`${EDITION.productName} 无法初始化数据目录`, `${error.message}\n\n请确认安装目录可写，并重新启动 ${EDITION.productName}。`);
+  const name = productName(EDITION, fallbackLanguage);
+  dialog.showErrorBox(tr(fallbackLanguage, `${name} 无法初始化数据目录`, `${name} could not initialize its data folder`), `${error.message}\n\n${tr(fallbackLanguage, `请确认安装目录可写，并重新启动 ${name}。`, `Make sure the installation folder is writable, then restart ${name}.`)}`);
   throw error;
 }
 
@@ -35,12 +38,22 @@ const ANILIST_API = 'https://graphql.anilist.co';
 const OFFICIAL_BANGUMI_API = 'https://api.bgm.tv/v0';
 const DEFAULT_BANGUMI_PROXY = 'https://bgmapi.anibt.net/v0';
 const STATE_VERSION = 2;
+function installedUiLanguage() {
+  if (EDITION.usesBangumi) return 'zh-CN';
+  try {
+    const marker = path.join(path.dirname(process.execPath), 'original-locale.txt');
+    if (fs.existsSync(marker)) return normalizeUiLanguage(fs.readFileSync(marker, 'utf8'), true);
+  } catch {}
+  return fallbackLanguage;
+}
+
 const DEFAULT_STATE = {
   version: STATE_VERSION,
   following: [],
   tasks: [],
   bangumiTitles: {},
   settings: {
+    uiLanguage: installedUiLanguage(),
     pollIntervalMinutes: 5,
     launchAtLogin: false,
     minimizeToTray: true,
@@ -111,6 +124,7 @@ function loadState() {
       settings: {
         ...DEFAULT_STATE.settings,
         ...(parsed.settings || {}),
+        uiLanguage: normalizeUiLanguage(parsed.settings?.uiLanguage || DEFAULT_STATE.settings.uiLanguage, !EDITION.usesBangumi),
         titlePreference: normalizeTitlePreference(parsed.settings?.titlePreference),
       },
       version: STATE_VERSION,
@@ -125,7 +139,7 @@ function loadState() {
         ...item,
         titleSource: useBangumi ? 'bangumi' : usePreferredTitle ? 'anilist' : titleSource,
         bangumiId: useBangumi ? cached.subjectId : EDITION.usesBangumi ? item.bangumiId || null : null,
-        displayTitle: useBangumi ? cached.nameCn : usePreferredTitle ? titleForPreference(item.title, loaded.settings.titlePreference) : (item.displayTitle || displayTitle(item.title)),
+        displayTitle: useBangumi ? cached.nameCn : usePreferredTitle ? titleForPreference(item.title, loaded.settings.titlePreference, loaded.settings.uiLanguage) : (item.displayTitle || displayTitle(item.title)),
       };
     });
     const followedById = new Map(loaded.following.map((item) => [item.id, item]));
@@ -428,16 +442,17 @@ const AIRING_QUERY = `
 `;
 
 function displayTitle(title) {
-  return titleForPreference(title, EDITION.usesBangumi ? 'auto' : state?.settings?.titlePreference);
+  return titleForPreference(title, EDITION.usesBangumi ? 'auto' : state?.settings?.titlePreference, state?.settings?.uiLanguage);
 }
 
 function notifyTasks(created) {
   if (!state.settings.notifyWhenAired || !Notification.isSupported() || created.length === 0) return;
 
   if (created.length > 3) {
+    const language = state.settings.uiLanguage;
     const notification = new Notification({
-      title: '新番已更新',
-      body: `${created.length} 集新内容已经加入待看任务。`,
+      title: tr(language, '新番已更新', 'Anime updates are available'),
+      body: tr(language, `${created.length} 集新内容已经加入待看任务。`, `${created.length} new episodes were added to your watch tasks.`),
       silent: false,
     });
     notification.on('click', showWindow);
@@ -446,9 +461,10 @@ function notifyTasks(created) {
   }
 
   created.forEach((task) => {
+    const language = state.settings.uiLanguage;
     const notification = new Notification({
-      title: `${task.animeTitle} 更新了`,
-      body: `第 ${task.episode} 集已播出，已加入待看任务。`,
+      title: tr(language, `${task.animeTitle} 更新了`, `${task.animeTitle} has a new episode`),
+      body: tr(language, `第 ${task.episode} 集已播出，已加入待看任务。`, `Episode ${task.episode} has aired and was added to your watch tasks.`),
       silent: false,
     });
     notification.on('click', showWindow);
@@ -592,15 +608,22 @@ function createWindow() {
 
 function createTray() {
   tray = new Tray(loadImageAsset('tray.png'));
-  tray.setToolTip(`${EDITION.productName} - 追番任务`);
-  tray.setContextMenu(Menu.buildFromTemplate([
-    { label: `打开 ${EDITION.productName}`, click: showWindow },
-    { label: '立即同步', click: () => syncAiredEpisodes().catch(console.error) },
-    { type: 'separator' },
-    { label: '退出', click: () => { beginShutdown(); app.quit(); } },
-  ]));
+  updateTrayMenu();
   tray.on('click', showWindow);
   tray.on('double-click', showWindow);
+}
+
+function updateTrayMenu() {
+  if (!tray) return;
+  const language = state?.settings?.uiLanguage || installedUiLanguage();
+  const name = productName(EDITION, language);
+  tray.setToolTip(tr(language, `${name} - 追番任务`, `${name} - Anime tracker`));
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: tr(language, `打开 ${name}`, `Open ${name}`), click: showWindow },
+    { label: tr(language, '立即同步', 'Sync now'), click: () => syncAiredEpisodes().catch(console.error) },
+    { type: 'separator' },
+    { label: tr(language, '退出', 'Quit'), click: () => { beginShutdown(); app.quit(); } },
+  ]));
 }
 
 function registerIpc() {
@@ -680,6 +703,9 @@ function registerIpc() {
     if (Object.prototype.hasOwnProperty.call(patch, 'titlePreference')) {
       patch = { ...patch, titlePreference: normalizeTitlePreference(patch.titlePreference) };
     }
+    if (Object.prototype.hasOwnProperty.call(patch, 'uiLanguage')) {
+      patch = { ...patch, uiLanguage: normalizeUiLanguage(patch.uiLanguage, !EDITION.usesBangumi) };
+    }
     state.settings = { ...state.settings, ...patch };
     if (!EDITION.usesBangumi && Object.prototype.hasOwnProperty.call(patch, 'titlePreference')) {
       state.following.forEach((item) => {
@@ -692,6 +718,7 @@ function registerIpc() {
       });
     }
     updateLoginItemSettings(state.settings.launchAtLogin);
+    updateTrayMenu();
     scheduleSync();
     saveState();
     broadcastState();

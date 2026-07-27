@@ -1,5 +1,6 @@
 import type { Anime, AppState, BangumiTitleMatch, DesktopApi, Season, Settings } from './types';
 import { IS_ORIGINAL_EDITION, normalizeTitlePreference, titleForPreference } from './edition';
+import { detectUiLanguage, normalizeUiLanguage, tr } from './i18n';
 import { reminderTitleOf } from './utils';
 import { removeOrphanedPendingTasks, removePendingTasksForAnime } from '../electron/task-retention.cjs';
 import { IS_ANDROID_APP, mobilePlugin, type MobileStatus } from './mobile';
@@ -13,7 +14,7 @@ import {
   mergeDocumentIntoState,
 } from '../electron/webdav-sync.cjs';
 
-const STORAGE_KEY = IS_ANDROID_APP ? 'anilog-android-state' : IS_ORIGINAL_EDITION ? 'anilog-original-browser-state' : 'anilog-browser-state';
+const STORAGE_KEY = IS_ANDROID_APP ? (IS_ORIGINAL_EDITION ? 'anilog-android-original-state' : 'anilog-android-state') : IS_ORIGINAL_EDITION ? 'anilog-original-browser-state' : 'anilog-browser-state';
 const BANGUMI_RESOLVER_VERSION = 4;
 const initialState = (): AppState => ({
   version: 2,
@@ -21,6 +22,7 @@ const initialState = (): AppState => ({
   tasks: [],
   bangumiTitles: {},
   settings: {
+    uiLanguage: detectUiLanguage(),
     pollIntervalMinutes: 5,
     launchAtLogin: false,
     minimizeToTray: true,
@@ -52,6 +54,7 @@ browserState.bangumiTitles = IS_ORIGINAL_EDITION ? {} : Object.fromEntries(
 browserState.version = 2;
 browserState.runtime = initialState().runtime;
 browserState.settings = { ...initialState().settings, ...(browserState.settings || {}) };
+browserState.settings.uiLanguage = normalizeUiLanguage(browserState.settings.uiLanguage);
 browserState.settings.titlePreference = normalizeTitlePreference(browserState.settings.titlePreference);
 browserState.following = (browserState.following || []).map((item) => {
   const generatedTitles = [item.title?.native, item.title?.english, item.title?.romaji].filter(Boolean);
@@ -63,7 +66,7 @@ browserState.following = (browserState.following || []).map((item) => {
     ...item,
     titleSource: useBangumi ? 'bangumi' : usePreferredTitle ? 'anilist' : titleSource,
     bangumiId: useBangumi ? cached.subjectId : IS_ORIGINAL_EDITION ? null : item.bangumiId || null,
-    displayTitle: useBangumi ? cached.nameCn! : usePreferredTitle ? titleForPreference(item.title, browserState.settings.titlePreference) : (item.displayTitle || reminderTitleOf(item.title)),
+    displayTitle: useBangumi ? cached.nameCn! : usePreferredTitle ? titleForPreference(item.title, browserState.settings.titlePreference, browserState.settings.uiLanguage) : (item.displayTitle || reminderTitleOf(item.title)),
   };
 });
 const browserFollowedById = new Map(browserState.following.map((item) => [item.id, item]));
@@ -97,6 +100,7 @@ function configureMobileBackground(): Promise<unknown> {
       following: mobileFollowing(),
       notificationsEnabled: browserState.settings.notifyWhenAired,
       createTasksEnabled: browserState.settings.createWatchTasks,
+      uiLanguage: browserState.settings.uiLanguage,
     }));
   return mobileConfigureChain;
 }
@@ -212,7 +216,7 @@ async function syncBrowserWebDav(): Promise<import('./types').WebDavSyncResult> 
         ok: true,
         changed: localChanged,
         syncedAt: finished.lastSyncAt || Math.floor(Date.now() / 1000),
-        message: localChanged ? '已合并电脑端的更新' : '两端数据已同步',
+        message: tr(browserState.settings.uiLanguage, localChanged ? '已合并电脑端的更新' : '两端数据已同步', localChanged ? 'Updates from the computer were merged' : 'Both devices are in sync'),
       };
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : 'WebDAV 同步失败';
@@ -664,7 +668,7 @@ const browserApi: DesktopApi = {
       browserState.following.push({
       id: anime.id,
       title: anime.title,
-      displayTitle: hasChineseTitle ? bangumiMatch.nameCn! : IS_ORIGINAL_EDITION ? titleForPreference(anime.title, browserState.settings.titlePreference) : reminderTitleOf(anime.title),
+      displayTitle: hasChineseTitle ? bangumiMatch.nameCn! : IS_ORIGINAL_EDITION ? titleForPreference(anime.title, browserState.settings.titlePreference, browserState.settings.uiLanguage) : reminderTitleOf(anime.title),
       titleSource: hasChineseTitle ? 'bangumi' : 'anilist',
       bangumiId: hasChineseTitle ? bangumiMatch.subjectId : null,
       coverImage: anime.coverImage?.medium || anime.coverImage?.extraLarge || '',
@@ -739,9 +743,10 @@ const browserApi: DesktopApi = {
       settings = { ...settings, titlePreference: normalizeTitlePreference(settings.titlePreference) };
     }
     browserState.settings = { ...browserState.settings, ...settings };
+    browserState.settings.uiLanguage = normalizeUiLanguage(browserState.settings.uiLanguage);
     if (IS_ORIGINAL_EDITION && Object.prototype.hasOwnProperty.call(settings, 'titlePreference')) {
       browserState.following.forEach((item) => {
-        if (item.titleSource !== 'custom') item.displayTitle = titleForPreference(item.title, browserState.settings.titlePreference);
+        if (item.titleSource !== 'custom') item.displayTitle = titleForPreference(item.title, browserState.settings.titlePreference, browserState.settings.uiLanguage);
       });
       const followedById = new Map(browserState.following.map((item) => [item.id, item]));
       browserState.tasks.forEach((task) => {
