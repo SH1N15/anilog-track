@@ -113,7 +113,7 @@ Download the bilingual Original builds from [GitHub Releases](https://github.com
 
 本地解析优先读取 `bangumi-data` 提供的 AniList ID 映射，再回退到规范化标题、完整首播日期、季度或 Stage 编号、词序相似度和作品类型匹配。一条 AniList 作品对应多个 Bangumi 篇章时，仅在中文标题拥有足够长的共同前缀时合并显示。匹配缓存带有解析器版本，升级算法后会自动重新检查旧的未匹配与歧义结果。
 
-中国大陆网络无法直连 Bangumi 时，标准版默认使用项目维护者部署的 `https://sh1n.cc.cd/v0` 反代。旧版本仍使用默认公共反代的用户升级后会自动迁移到新地址；用户自行填写的反代和主动选择的官方 API 不受影响。也可在“偏好设置 → 中文标题网络”中填写其他 HTTPS API 反代地址，或清空地址改用官方 API。地址可填域名根路径或以 `/v0` 结尾的 API 根路径，应用会测试连接后保存；反代失败时自动尝试官方 API，最终回退到本地标题数据。
+中国大陆网络无法直连 Bangumi 时，标准版默认使用项目维护者部署的反代地址。项目维护者不保证该反代一直生效，用户也可在“偏好设置 → 中文标题网络”中填写其他 HTTPS API 反代地址，或清空地址改用官方 API。地址可填域名根路径或以 `/v0` 结尾的 API 根路径，应用会测试连接后保存；反代失败时自动尝试官方 API，最终回退到本地标题数据。
 
 默认反代基于 [makabaka11/bangumi-proxy-workers](https://github.com/makabaka11/bangumi-proxy-workers) 部署。反代服务可看到请求来源 IP 和被搜索的番剧标题；应用不发送追番清单、观看任务或 Bangumi 登录凭据。
 
