@@ -30,7 +30,7 @@ Account-free, local-first anime schedule, notification, and episode task manager
 
 前往 [GitHub Releases](https://github.com/SH1N15/anilog-tracker/releases) 下载需要的版本：
 
-- `AniLog Setup x.y.z.exe`：标准版，使用 Bangumi 中文标题
+- [`AniLog.Setup.0.4.0.exe`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.4.1/AniLog.Setup.0.4.0.exe)：标准版，使用 Bangumi 中文标题
 - [`AniLog-Original-Setup-0.4.1.exe`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.4.1/AniLog-Original-Setup-0.4.1.exe)：Windows 原名版，安装时可选中文或英文，不连接 Bangumi
 - [`AniLog-Android-v0.4.0.apk`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.4.0/AniLog-Android-v0.4.0.apk)：Android 标准版，使用 Bangumi 中文标题
 - [`AniLog-Original-Android-v0.4.1.apk`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.4.1/AniLog-Original-Android-v0.4.1.apk)：Android 原名版，可在设置中切换中文或英文，不连接 Bangumi
