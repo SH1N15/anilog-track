@@ -11,6 +11,10 @@ const desktopApi = {
   syncNow: () => ipcRenderer.invoke('sync:now'),
   getCacheInfo: () => ipcRenderer.invoke('cache:get'),
   clearCache: () => ipcRenderer.invoke('cache:clear'),
+  getWebDavConfig: () => ipcRenderer.invoke('webdav:get-config'),
+  saveWebDavConfig: (config) => ipcRenderer.invoke('webdav:save-config', config),
+  testWebDavConnection: () => ipcRenderer.invoke('webdav:test'),
+  syncWebDav: () => ipcRenderer.invoke('webdav:sync'),
   openExternal: (url) => ipcRenderer.invoke('external:open', url),
   onStateChanged: (callback) => {
     const listener = (_event, state) => callback(state);

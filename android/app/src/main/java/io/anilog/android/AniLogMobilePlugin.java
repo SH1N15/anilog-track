@@ -17,6 +17,7 @@ import com.getcapacitor.annotation.Permission;
 import com.getcapacitor.annotation.PermissionCallback;
 import java.util.HashSet;
 import java.util.Set;
+import java.net.URI;
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -26,6 +27,8 @@ import org.json.JSONObject;
     permissions = { @Permission(alias = "notifications", strings = { Manifest.permission.POST_NOTIFICATIONS }) }
 )
 public class AniLogMobilePlugin extends Plugin {
+    private final WebDavClient webDav = new WebDavClient();
+
     @Override
     public void load() {
         NotificationScheduler.ensureChannel(getContext());
@@ -94,6 +97,89 @@ public class AniLogMobilePlugin extends Plugin {
         call.resolve(permissionResult());
     }
 
+    @PluginMethod
+    public void getWebDavConfig(PluginCall call) {
+        call.resolve(WebDavStore.publicConfig(getContext()));
+    }
+
+    @PluginMethod
+    public void saveWebDavConfig(PluginCall call) {
+        try {
+            boolean enabled = call.getBoolean("enabled", false);
+            String baseUrl = normalizeWebDavUrl(call.getString("baseUrl", ""));
+            String username = call.getString("username", "").trim();
+            boolean replacePassword = call.getData().has("password");
+            String password = call.getString("password", "");
+            WebDavStore.Config existing = WebDavStore.load(getContext());
+            String effectivePassword = replacePassword ? password : existing.password;
+            if (enabled && (baseUrl.isEmpty() || username.isEmpty() || effectivePassword.isEmpty())) {
+                throw new IllegalArgumentException("启用同步前请完整填写地址、用户名和密码");
+            }
+            WebDavStore.save(getContext(), enabled, baseUrl, username, password, replacePassword);
+            call.resolve(WebDavStore.publicConfig(getContext()));
+        } catch (Exception error) {
+            call.reject(error.getMessage(), error);
+        }
+    }
+
+    @PluginMethod
+    public void testWebDavConnection(PluginCall call) {
+        execute(() -> {
+            try {
+                webDav.test(WebDavStore.load(getContext()));
+                JSObject result = new JSObject();
+                result.put("ok", true);
+                result.put("message", "WebDAV 连接成功");
+                call.resolve(result);
+            } catch (Exception error) {
+                call.reject(error.getMessage(), error);
+            }
+        });
+    }
+
+    @PluginMethod
+    public void webDavDownload(PluginCall call) {
+        execute(() -> {
+            try {
+                WebDavClient.Download download = webDav.download(WebDavStore.load(getContext()));
+                JSObject result = new JSObject();
+                result.put("found", download.found);
+                result.put("etag", download.etag);
+                result.put("body", download.body);
+                call.resolve(result);
+            } catch (Exception error) {
+                call.reject(error.getMessage(), error);
+            }
+        });
+    }
+
+    @PluginMethod
+    public void webDavUpload(PluginCall call) {
+        execute(() -> {
+            try {
+                boolean uploaded = webDav.upload(
+                    WebDavStore.load(getContext()),
+                    call.getString("body", ""),
+                    call.getBoolean("remoteFound", false),
+                    call.getString("etag", "")
+                );
+                JSObject result = new JSObject();
+                result.put("ok", uploaded);
+                result.put("conflict", !uploaded);
+                call.resolve(result);
+            } catch (Exception error) {
+                call.reject(error.getMessage(), error);
+            }
+        });
+    }
+
+    @PluginMethod
+    public void finishWebDavSync(PluginCall call) {
+        String error = call.getString("error");
+        WebDavStore.finishSync(getContext(), error);
+        call.resolve(WebDavStore.publicConfig(getContext()));
+    }
+
     @PermissionCallback
     private void notificationPermissionCallback(PluginCall call) {
         call.resolve(permissionResult());
@@ -136,5 +222,15 @@ public class AniLogMobilePlugin extends Plugin {
             if (item != null) ids.add(item.optInt("id"));
         }
         return ids;
+    }
+
+    private String normalizeWebDavUrl(String input) throws Exception {
+        String value = input == null ? "" : input.trim();
+        if (value.isEmpty()) return "";
+        URI uri = new URI(value);
+        if (!"https".equalsIgnoreCase(uri.getScheme()) || uri.getHost() == null || uri.getUserInfo() != null || uri.getQuery() != null || uri.getFragment() != null) {
+            throw new IllegalArgumentException("WebDAV 地址必须是无账号、参数或片段的 HTTPS 地址");
+        }
+        return value.replaceAll("/+$", "") + "/";
     }
 }

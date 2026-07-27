@@ -1,6 +1,10 @@
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
-const { createWindowLifecycle } = require('../electron/window-lifecycle.cjs');
+const { createWindowLifecycle, isHiddenLaunch } = require('../electron/window-lifecycle.cjs');
+
+assert.equal(isHiddenLaunch(['AniLog.exe']), false);
+assert.equal(isHiddenLaunch(['AniLog.exe', '--hidden']), true);
+assert.equal(isHiddenLaunch(['AniLog.exe', '--background']), true);
 
 class FakeWindow extends EventEmitter {
   constructor() {

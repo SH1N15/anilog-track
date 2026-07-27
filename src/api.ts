@@ -3,6 +3,15 @@ import { IS_ORIGINAL_EDITION, normalizeTitlePreference, titleForPreference } fro
 import { reminderTitleOf } from './utils';
 import { removeOrphanedPendingTasks, removePendingTasksForAnime } from '../electron/task-retention.cjs';
 import { IS_ANDROID_APP, mobilePlugin, type MobileStatus } from './mobile';
+import {
+  documentFromState,
+  documentsEqual,
+  ensureSyncMetadata,
+  markFollowingChanged,
+  markFollowingDeleted,
+  markTaskChanged,
+  mergeDocumentIntoState,
+} from '../electron/webdav-sync.cjs';
 
 const STORAGE_KEY = IS_ANDROID_APP ? 'anilog-android-state' : IS_ORIGINAL_EDITION ? 'anilog-original-browser-state' : 'anilog-browser-state';
 const BANGUMI_RESOLVER_VERSION = 4;
@@ -21,6 +30,7 @@ const initialState = (): AppState => ({
     titlePreference: 'auto',
   },
   lastSyncAt: Math.floor(Date.now() / 1000),
+  syncMetadata: { followingDeletedAt: {} },
   runtime: {
     isDesktop: false,
     notificationsSupported: IS_ANDROID_APP || 'Notification' in window,
@@ -62,6 +72,7 @@ browserState.tasks = (browserState.tasks || []).map((task) => {
   return followed ? { ...task, animeTitle: followed.displayTitle } : task;
 });
 browserState.tasks = removeOrphanedPendingTasks(browserState.tasks, browserFollowedById.keys());
+ensureSyncMetadata(browserState);
 const listeners = new Set<(state: AppState) => void>();
 const seasonListeners = new Set<(update: { season: Season; year: number; anime: Anime[]; fetchedAt: number }) => void>();
 
@@ -117,6 +128,7 @@ function mergeMobileStatus(status: MobileStatus): number {
       status: 'pending',
       createdAt: event.createdAt || Math.floor(Date.now() / 1000),
       completedAt: null,
+      syncUpdatedAt: Date.now(),
     });
     known.add(event.id);
     created += 1;
@@ -137,6 +149,7 @@ async function refreshMobileState(): Promise<number> {
   const created = mergeMobileStatus(status);
   saveBrowserState(false);
   await configureMobileBackground();
+  if (created > 0) scheduleBrowserWebDav();
   return created;
 }
 
@@ -152,6 +165,76 @@ function saveBrowserState(configureMobile = true) {
   listeners.forEach((listener) => listener(browserState));
   if (configureMobile) void configureMobileBackground().catch(() => {});
 }
+
+let browserWebDavInFlight: Promise<import('./types').WebDavSyncResult> | null = null;
+let browserWebDavTimer: ReturnType<typeof setTimeout> | null = null;
+
+async function syncBrowserWebDav(): Promise<import('./types').WebDavSyncResult> {
+  if (!IS_ANDROID_APP) throw new Error('当前平台不支持 WebDAV 同步');
+  if (browserWebDavInFlight) return browserWebDavInFlight;
+  browserWebDavInFlight = (async () => {
+    const config = await mobilePlugin.getWebDavConfig();
+    if (!config.enabled) throw new Error('请先启用 WebDAV 同步');
+    let localChanged = false;
+    try {
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const remote = await mobilePlugin.webDavDownload();
+        let merged = documentFromState(browserState);
+        let remoteChanged = !remote.found;
+        if (remote.found) {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(remote.body);
+          } catch {
+            throw new Error('WebDAV 同步文件不是有效的 JSON');
+          }
+          const result = mergeDocumentIntoState(browserState, parsed);
+          merged = result.document;
+          remoteChanged = result.remoteChanged;
+          if (result.changed) {
+            localChanged = true;
+            saveBrowserState(false);
+            await configureMobileBackground();
+          }
+          if (!remoteChanged || documentsEqual(parsed, merged)) break;
+        }
+        const upload = await mobilePlugin.webDavUpload({
+          body: JSON.stringify(merged, null, 2),
+          remoteFound: remote.found,
+          etag: remote.etag || '',
+        });
+        if (upload.ok) break;
+        if (attempt === 2) throw new Error('WebDAV 文件在同步期间反复变化，请稍后重试');
+      }
+      const finished = await mobilePlugin.finishWebDavSync({});
+      if (localChanged) listeners.forEach((listener) => listener(browserState));
+      return {
+        ok: true,
+        changed: localChanged,
+        syncedAt: finished.lastSyncAt || Math.floor(Date.now() / 1000),
+        message: localChanged ? '已合并电脑端的更新' : '两端数据已同步',
+      };
+    } catch (reason) {
+      const message = reason instanceof Error ? reason.message : 'WebDAV 同步失败';
+      await mobilePlugin.finishWebDavSync({ error: message }).catch(() => undefined);
+      throw reason;
+    }
+  })().finally(() => { browserWebDavInFlight = null; });
+  return browserWebDavInFlight;
+}
+
+function scheduleBrowserWebDav(delay = 5_000) {
+  if (!IS_ANDROID_APP) return;
+  if (browserWebDavTimer) clearTimeout(browserWebDavTimer);
+  browserWebDavTimer = setTimeout(() => {
+    browserWebDavTimer = null;
+    void mobilePlugin.getWebDavConfig()
+      .then((config) => config.enabled ? syncBrowserWebDav() : undefined)
+      .catch(() => undefined);
+  }, delay);
+}
+
+if (IS_ANDROID_APP) window.setInterval(() => scheduleBrowserWebDav(0), 15 * 60_000);
 
 const query = `
   query SeasonAnime($season: MediaSeason, $year: Int, $page: Int) {
@@ -563,6 +646,7 @@ function resolveBrowserBangumiTitle(anime: Anime): Promise<BangumiTitleMatch> {
 const browserApi: DesktopApi = {
   async getState() {
     if (IS_ANDROID_APP) await refreshMobileState();
+    if (IS_ANDROID_APP) scheduleBrowserWebDav(0);
     return browserState;
   },
   fetchSeason: browserFetchSeason,
@@ -572,6 +656,7 @@ const browserApi: DesktopApi = {
     if (existing >= 0) {
       browserState.following.splice(existing, 1);
       browserState.tasks = removePendingTasksForAnime(browserState.tasks, anime.id);
+      markFollowingDeleted(browserState, anime.id);
     }
     else {
       const bangumiMatch = IS_ORIGINAL_EDITION ? undefined : browserState.bangumiTitles[String(anime.id)];
@@ -589,8 +674,10 @@ const browserApi: DesktopApi = {
       siteUrl: anime.siteUrl,
       followedAt: Math.floor(Date.now() / 1000),
       });
+      markFollowingChanged(browserState, anime.id);
     }
     saveBrowserState();
+    scheduleBrowserWebDav();
     if (IS_ANDROID_APP && isAdding && browserState.settings.notifyWhenAired) {
       const permission = await mobilePlugin.requestNotificationPermission();
       if (browserState.runtime) browserState.runtime.notificationPermissionGranted = permission.granted;
@@ -607,7 +694,9 @@ const browserApi: DesktopApi = {
       browserState.tasks.forEach((task) => {
         if (task.animeId === animeId) task.animeTitle = nextTitle;
       });
+      markFollowingChanged(browserState, animeId);
       saveBrowserState();
+      scheduleBrowserWebDav();
     }
     return browserState;
   },
@@ -632,7 +721,9 @@ const browserApi: DesktopApi = {
     if (task) {
       task.status = task.status === 'completed' ? 'pending' : 'completed';
       task.completedAt = task.status === 'completed' ? Math.floor(Date.now() / 1000) : null;
+      markTaskChanged(browserState, taskId);
       saveBrowserState();
+      scheduleBrowserWebDav();
     }
     return browserState;
   },
@@ -682,6 +773,21 @@ const browserApi: DesktopApi = {
   },
   async getCacheInfo() { return { bytes: 0, sessionBytes: 0, legacyBytes: 0, supported: false }; },
   async clearCache() { return { bytes: 0, sessionBytes: 0, legacyBytes: 0, supported: false }; },
+  async getWebDavConfig() {
+    if (IS_ANDROID_APP) return mobilePlugin.getWebDavConfig();
+    return { supported: false, enabled: false, baseUrl: '', username: '', hasPassword: false, lastSyncAt: 0, lastError: '' };
+  },
+  async saveWebDavConfig(config) {
+    if (!IS_ANDROID_APP) throw new Error('当前平台不支持 WebDAV 同步');
+    const saved = await mobilePlugin.saveWebDavConfig(config);
+    if (saved.enabled) scheduleBrowserWebDav(0);
+    return saved;
+  },
+  async testWebDavConnection() {
+    if (!IS_ANDROID_APP) throw new Error('当前平台不支持 WebDAV 同步');
+    return mobilePlugin.testWebDavConnection();
+  },
+  syncWebDav: syncBrowserWebDav,
   ...(IS_ANDROID_APP ? {
     async requestExactScheduling() {
       await mobilePlugin.requestExactScheduling();

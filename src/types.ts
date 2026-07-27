@@ -48,6 +48,7 @@ export interface FollowedAnime {
   nextAiringEpisode?: AiringEpisode | null;
   siteUrl?: string;
   followedAt: number;
+  syncUpdatedAt?: number;
 }
 
 export interface WatchTask {
@@ -60,6 +61,11 @@ export interface WatchTask {
   status: 'pending' | 'completed';
   createdAt: number;
   completedAt: number | null;
+  syncUpdatedAt?: number;
+}
+
+export interface SyncMetadata {
+  followingDeletedAt: Record<string, number>;
 }
 
 export interface Settings {
@@ -115,6 +121,7 @@ export interface AppState {
   settings: Settings;
   bangumiTitles: Record<string, BangumiTitleMatch>;
   lastSyncAt: number;
+  syncMetadata: SyncMetadata;
   runtime?: {
     isDesktop: boolean;
     notificationsSupported: boolean;
@@ -123,6 +130,23 @@ export interface AppState {
     platform: string;
     edition: 'standard' | 'original';
   };
+}
+
+export interface WebDavConfig {
+  supported: boolean;
+  enabled: boolean;
+  baseUrl: string;
+  username: string;
+  hasPassword: boolean;
+  lastSyncAt: number;
+  lastError: string;
+}
+
+export interface WebDavSyncResult {
+  ok: boolean;
+  changed: boolean;
+  syncedAt: number;
+  message: string;
 }
 
 export interface DesktopApi {
@@ -137,6 +161,10 @@ export interface DesktopApi {
   syncNow(): Promise<{ created: number; syncedAt: number }>;
   getCacheInfo(): Promise<CacheInfo>;
   clearCache(): Promise<CacheInfo>;
+  getWebDavConfig(): Promise<WebDavConfig>;
+  saveWebDavConfig(config: { enabled: boolean; baseUrl: string; username: string; password?: string }): Promise<WebDavConfig>;
+  testWebDavConnection(): Promise<{ ok: boolean; message: string }>;
+  syncWebDav(): Promise<WebDavSyncResult>;
   requestExactScheduling?(): Promise<void>;
   openExternal(url: string): Promise<void>;
   onStateChanged(callback: (state: AppState) => void): () => void;

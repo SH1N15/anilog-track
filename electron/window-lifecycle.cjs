@@ -2,6 +2,10 @@ function isUsableWindow(window) {
   return Boolean(window && !window.isDestroyed());
 }
 
+function isHiddenLaunch(argv) {
+  return Array.isArray(argv) && (argv.includes('--hidden') || argv.includes('--background'));
+}
+
 function createWindowLifecycle({ createWindow, shouldKeepInTray, isQuitting }) {
   let activeWindow = null;
   let ready = false;
@@ -71,4 +75,4 @@ function createWindowLifecycle({ createWindow, shouldKeepInTray, isQuitting }) {
   };
 }
 
-module.exports = { createWindowLifecycle, isUsableWindow };
+module.exports = { createWindowLifecycle, isHiddenLaunch, isUsableWindow };

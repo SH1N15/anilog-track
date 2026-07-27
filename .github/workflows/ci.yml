@@ -45,6 +45,11 @@ jobs:
       - name: Test window lifecycle
         run: npm run test:window-lifecycle
 
+      - name: Test WebDAV merge and transport
+        run: |
+          npm run test:webdav-sync
+          npm run test:webdav-service
+
       - name: Test cache storage
         run: npm run test:cache-storage
 

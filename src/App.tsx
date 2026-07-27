@@ -9,6 +9,7 @@ import {
   ChevronRight,
   Circle,
   Clock3,
+  Cloud,
   ExternalLink,
   Filter,
   HardDrive,
@@ -20,6 +21,7 @@ import {
   MonitorDot,
   Network,
   RefreshCw,
+  Save,
   Pencil,
   Search,
   Settings,
@@ -29,7 +31,7 @@ import {
   X,
 } from 'lucide-react';
 import { api } from './api';
-import type { Anime, AppState, BangumiTitleMatch, Season, Settings as AppSettings, ViewId, WatchTask } from './types';
+import type { Anime, AppState, BangumiTitleMatch, Season, Settings as AppSettings, ViewId, WatchTask, WebDavConfig } from './types';
 import { IS_ORIGINAL_EDITION, PRODUCT_NAME, titleForPreference } from './edition';
 import { createStateRefreshController } from './state-refresh';
 import {
@@ -52,6 +54,7 @@ const EMPTY_STATE: AppState = {
   bangumiTitles: {},
   settings: { pollIntervalMinutes: 5, launchAtLogin: false, minimizeToTray: true, notifyWhenAired: true, createWatchTasks: true, bangumiApiBaseUrl: IS_ORIGINAL_EDITION ? '' : 'https://bgmapi.anibt.net/v0', titlePreference: 'auto' },
   lastSyncAt: 0,
+  syncMetadata: { followingDeletedAt: {} },
 };
 
 const NAV_ITEMS: Array<{ id: ViewId; label: string; icon: typeof CalendarDays }> = [
@@ -657,6 +660,12 @@ function SettingsView({ state, onChange }: { state: AppState; onChange: (patch: 
   const [cacheSupported, setCacheSupported] = useState<boolean | null>(null);
   const [cacheStatus, setCacheStatus] = useState('');
   const [clearingCache, setClearingCache] = useState(false);
+  const [webDavConfig, setWebDavConfig] = useState<WebDavConfig | null>(null);
+  const [webDavUrl, setWebDavUrl] = useState('');
+  const [webDavUsername, setWebDavUsername] = useState('');
+  const [webDavPassword, setWebDavPassword] = useState('');
+  const [webDavStatus, setWebDavStatus] = useState('');
+  const [webDavBusy, setWebDavBusy] = useState(false);
 
   useEffect(() => setProxyUrl(state.settings.bangumiApiBaseUrl), [state.settings.bangumiApiBaseUrl]);
 
@@ -671,6 +680,74 @@ function SettingsView({ state, onChange }: { state: AppState; onChange: (patch: 
       .catch((reason) => { if (active) setCacheStatus(reason instanceof Error ? reason.message : '无法读取缓存大小'); });
     return () => { active = false; };
   }, []);
+
+  useEffect(() => {
+    let active = true;
+    api.getWebDavConfig()
+      .then((config) => {
+        if (!active) return;
+        setWebDavConfig(config);
+        setWebDavUrl(config.baseUrl);
+        setWebDavUsername(config.username);
+        setWebDavStatus(config.lastError || '');
+      })
+      .catch((reason) => { if (active) setWebDavStatus(reason instanceof Error ? reason.message : '无法读取 WebDAV 设置'); });
+    return () => { active = false; };
+  }, []);
+
+  const webDavPayload = (enabled: boolean) => ({
+    enabled,
+    baseUrl: webDavUrl,
+    username: webDavUsername,
+    ...(webDavPassword ? { password: webDavPassword } : {}),
+  });
+
+  const saveWebDav = async (enabled = webDavConfig?.enabled || false) => {
+    setWebDavBusy(true);
+    setWebDavStatus('正在保存…');
+    try {
+      const saved = await api.saveWebDavConfig(webDavPayload(enabled));
+      setWebDavConfig(saved);
+      setWebDavPassword('');
+      setWebDavStatus('WebDAV 设置已保存');
+      return saved;
+    } catch (reason) {
+      setWebDavStatus(reason instanceof Error ? reason.message : 'WebDAV 设置保存失败');
+      return null;
+    } finally {
+      setWebDavBusy(false);
+    }
+  };
+
+  const testWebDav = async () => {
+    setWebDavBusy(true);
+    setWebDavStatus('正在测试连接…');
+    try {
+      const saved = await api.saveWebDavConfig(webDavPayload(webDavConfig?.enabled || false));
+      setWebDavConfig(saved);
+      setWebDavPassword('');
+      const result = await api.testWebDavConnection();
+      setWebDavStatus(result.message);
+    } catch (reason) {
+      setWebDavStatus(reason instanceof Error ? reason.message : 'WebDAV 连接失败');
+    } finally {
+      setWebDavBusy(false);
+    }
+  };
+
+  const syncWebDav = async () => {
+    setWebDavBusy(true);
+    setWebDavStatus('正在同步…');
+    try {
+      const result = await api.syncWebDav();
+      setWebDavConfig(await api.getWebDavConfig());
+      setWebDavStatus(result.message);
+    } catch (reason) {
+      setWebDavStatus(reason instanceof Error ? reason.message : 'WebDAV 同步失败');
+    } finally {
+      setWebDavBusy(false);
+    }
+  };
 
   const clearCache = async () => {
     setClearingCache(true);
@@ -728,6 +805,31 @@ function SettingsView({ state, onChange }: { state: AppState; onChange: (patch: 
             ? <span className="fixed-setting-value">已授权</span>
             : <button className="secondary-button" onClick={() => void api.requestExactScheduling?.()}>去授权</button>}
         </SettingRow>}
+      </section>
+      <section className="settings-section">
+        <div className="settings-title"><Cloud size={20} /><div><h2>跨设备同步</h2><p>使用你自己的 WebDAV 账户同步追番和观看任务。</p></div></div>
+        <SettingRow title="启用 WebDAV" description={webDavConfig?.supported === false ? '浏览器预览模式不支持此功能' : '设备设置、缓存和通知开关不会同步'}>
+          <Toggle
+            checked={Boolean(webDavConfig?.enabled)}
+            disabled={webDavBusy || !webDavConfig?.supported}
+            onChange={(enabled) => { void saveWebDav(enabled); }}
+          />
+        </SettingRow>
+        <div className="webdav-setting">
+          <div className="webdav-fields">
+            <label><span>服务器地址</span><input type="url" value={webDavUrl} disabled={!webDavConfig?.supported} onChange={(event) => { setWebDavUrl(event.target.value); setWebDavStatus(''); }} placeholder="https://dav.example.com/" /></label>
+            <label><span>用户名</span><input value={webDavUsername} disabled={!webDavConfig?.supported} onChange={(event) => { setWebDavUsername(event.target.value); setWebDavStatus(''); }} autoComplete="username" /></label>
+            <label><span>应用密码</span><input type="password" value={webDavPassword} disabled={!webDavConfig?.supported} onChange={(event) => { setWebDavPassword(event.target.value); setWebDavStatus(''); }} placeholder={webDavConfig?.hasPassword ? '已保存，留空则不修改' : '输入 WebDAV 应用密码'} autoComplete="new-password" /></label>
+          </div>
+          <div className="webdav-actions">
+            <button className="secondary-button" disabled={webDavBusy || !webDavConfig?.supported} onClick={() => void saveWebDav()}><Save size={15} /><span>保存</span></button>
+            <button className="secondary-button" disabled={webDavBusy || !webDavConfig?.supported} onClick={testWebDav}><Network size={15} /><span>测试连接</span></button>
+            <button className="secondary-button" disabled={webDavBusy || !webDavConfig?.enabled} onClick={syncWebDav}>{webDavBusy ? <LoaderCircle size={15} className="spin" /> : <RefreshCw size={15} />}<span>立即同步</span></button>
+          </div>
+          <p className={/成功|已同步|已保存|已合并/.test(webDavStatus) ? 'proxy-status success' : 'proxy-status'}>
+            {webDavStatus || (webDavConfig?.lastSyncAt ? `上次同步：${formatAiring(webDavConfig.lastSyncAt)}` : '密码保存在系统安全存储中，不会写入追番数据文件。')}
+          </p>
+        </div>
       </section>
       {IS_ORIGINAL_EDITION ? (
         <section className="settings-section">
@@ -788,7 +890,7 @@ function SettingsView({ state, onChange }: { state: AppState; onChange: (patch: 
       </section>}
       <section className="settings-section source-note">
         <SlidersHorizontal size={20} />
-        <div><h2>数据与隐私</h2><p>{IS_ORIGINAL_EDITION ? '番剧、标题与播出日程均来自 AniList，不连接 Bangumi 或第三方 Bangumi 反代。追番清单、观看任务和设置仅保存在本机应用数据目录中，不上传个人数据。' : '番剧与播出日程来自 AniList，中文标题来自 Bangumi。追番清单、观看任务和设置仅保存在本机应用数据目录中，不上传个人数据。'}</p><small>上次同步：{state.lastSyncAt ? formatAiring(state.lastSyncAt) : '尚未同步'}</small></div>
+        <div><h2>数据与隐私</h2><p>{IS_ORIGINAL_EDITION ? '番剧、标题与播出日程均来自 AniList，不连接 Bangumi 或第三方 Bangumi 反代。默认仅保存在本机；启用 WebDAV 后，只向你配置的服务器同步追番和观看任务。' : '番剧与播出日程来自 AniList，中文标题来自 Bangumi。默认仅保存在本机；启用 WebDAV 后，只向你配置的服务器同步追番和观看任务。'}</p><small>AniList 上次同步：{state.lastSyncAt ? formatAiring(state.lastSyncAt) : '尚未同步'}</small></div>
       </section>
     </div>
   );

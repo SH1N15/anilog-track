@@ -1,12 +1,19 @@
-const { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, net, Notification, session, shell, Tray } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, net, Notification, safeStorage, session, shell, Tray } = require('electron');
 const fs = require('node:fs');
 const path = require('node:path');
 const { editionFromEnvironment, normalizeTitlePreference, titleForPreference } = require('./edition.cjs');
 const { configurePackagedDataPaths } = require('./data-path.cjs');
 const { createSeasonCache } = require('./season-cache.cjs');
-const { createWindowLifecycle } = require('./window-lifecycle.cjs');
+const { createWindowLifecycle, isHiddenLaunch } = require('./window-lifecycle.cjs');
 const { createCacheStorage } = require('./cache-storage.cjs');
 const { removeOrphanedPendingTasks, removePendingTasksForAnime } = require('./task-retention.cjs');
+const { createWebDavService } = require('./webdav-service.cjs');
+const {
+  ensureSyncMetadata,
+  markFollowingChanged,
+  markFollowingDeleted,
+  markTaskChanged,
+} = require('./webdav-sync.cjs');
 
 const EDITION = editionFromEnvironment();
 const bangumiResolver = EDITION.usesBangumi ? require('./bangumi.cjs') : null;
@@ -43,6 +50,7 @@ const DEFAULT_STATE = {
     titlePreference: 'auto',
   },
   lastSyncAt: Math.floor(Date.now() / 1000),
+  syncMetadata: { followingDeletedAt: {} },
 };
 
 let windowLifecycle = null;
@@ -58,6 +66,8 @@ let bangumiUnavailableUntil = 0;
 let lastBangumiRequestAt = 0;
 let seasonCache = null;
 let cacheStorage = null;
+let webDavService = null;
+const START_HIDDEN = isHiddenLaunch(process.argv);
 
 function normalizeBangumiApiBaseUrl(value) {
   const input = typeof value === 'string' ? value.trim() : '';
@@ -124,9 +134,12 @@ function loadState() {
       return followed ? { ...task, animeTitle: followed.displayTitle } : task;
     });
     loaded.tasks = removeOrphanedPendingTasks(loaded.tasks, followedById.keys());
+    ensureSyncMetadata(loaded);
     return loaded;
   } catch {
-    return structuredClone(DEFAULT_STATE);
+    const fresh = structuredClone(DEFAULT_STATE);
+    ensureSyncMetadata(fresh);
+    return fresh;
   }
 }
 
@@ -444,6 +457,7 @@ function notifyTasks(created) {
 }
 
 async function syncAiredEpisodes({ silent = false } = {}) {
+  if (isQuitting) return { created: 0, syncedAt: Math.floor(Date.now() / 1000) };
   if (syncInFlight) return syncInFlight;
   syncInFlight = (async () => {
     const now = Math.floor(Date.now() / 1000);
@@ -485,6 +499,7 @@ async function syncAiredEpisodes({ silent = false } = {}) {
         status: 'pending',
         createdAt: now,
         completedAt: null,
+        syncUpdatedAt: Date.now(),
       };
       state.tasks.push(task);
       known.add(id);
@@ -495,6 +510,7 @@ async function syncAiredEpisodes({ silent = false } = {}) {
     state.tasks.sort((a, b) => b.airingAt - a.airingAt);
     saveState();
     broadcastState();
+    if (created.length > 0) webDavService?.schedule();
     if (!silent) notifyTasks(created);
     return { created: created.length, syncedAt: now };
   })().finally(() => {
@@ -505,6 +521,7 @@ async function syncAiredEpisodes({ silent = false } = {}) {
 
 function scheduleSync() {
   if (syncTimer) clearInterval(syncTimer);
+  if (isQuitting) return;
   const minutes = Math.max(1, Number(state.settings.pollIntervalMinutes) || 5);
   syncTimer = setInterval(() => {
     syncAiredEpisodes().catch((error) => console.error('Background sync failed:', error));
@@ -522,7 +539,23 @@ function loadImageAsset(name) {
 }
 
 function showWindow() {
+  if (isQuitting) return;
   windowLifecycle?.show();
+}
+
+function beginShutdown() {
+  if (isQuitting) return;
+  isQuitting = true;
+  if (syncTimer) clearInterval(syncTimer);
+  syncTimer = null;
+  webDavService?.stop();
+}
+
+function updateLoginItemSettings(enabled) {
+  app.setLoginItemSettings({
+    openAtLogin: Boolean(enabled),
+    args: enabled ? ['--hidden'] : [],
+  });
 }
 
 function createWindow() {
@@ -550,6 +583,9 @@ function createWindow() {
   // Showing an existing or recreated tray window always publishes the latest
   // task state, even if the renderer missed the original background event.
   mainWindow.on('show', broadcastState);
+  // Windows does not guarantee before-quit during logoff or shutdown.
+  mainWindow.on('query-session-end', beginShutdown);
+  mainWindow.on('session-end', beginShutdown);
 
   return mainWindow;
 }
@@ -561,7 +597,7 @@ function createTray() {
     { label: `打开 ${EDITION.productName}`, click: showWindow },
     { label: '立即同步', click: () => syncAiredEpisodes().catch(console.error) },
     { type: 'separator' },
-    { label: '退出', click: () => { isQuitting = true; app.quit(); } },
+    { label: '退出', click: () => { beginShutdown(); app.quit(); } },
   ]));
   tray.on('click', showWindow);
   tray.on('double-click', showWindow);
@@ -579,6 +615,7 @@ function registerIpc() {
     if (index >= 0) {
       state.following.splice(index, 1);
       state.tasks = removePendingTasksForAnime(state.tasks, anime.id);
+      markFollowingDeleted(state, anime.id);
     } else {
       const bangumiMatch = EDITION.usesBangumi ? state.bangumiTitles[String(anime.id)] : null;
       const hasChineseTitle = EDITION.usesBangumi && bangumiMatch?.status === 'matched' && bangumiMatch.nameCn;
@@ -597,9 +634,11 @@ function registerIpc() {
         siteUrl: anime.siteUrl,
         followedAt: Math.floor(Date.now() / 1000),
       });
+      markFollowingChanged(state, anime.id);
     }
     saveState();
     broadcastState();
+    webDavService?.schedule();
     return publicState();
   });
   ipcMain.handle('task:toggle', (_event, taskId) => {
@@ -607,8 +646,10 @@ function registerIpc() {
     if (task) {
       task.status = task.status === 'completed' ? 'pending' : 'completed';
       task.completedAt = task.status === 'completed' ? Math.floor(Date.now() / 1000) : null;
+      markTaskChanged(state, taskId);
       saveState();
       broadcastState();
+      webDavService?.schedule();
     }
     return publicState();
   });
@@ -621,8 +662,10 @@ function registerIpc() {
       state.tasks.forEach((task) => {
         if (task.animeId === animeId) task.animeTitle = nextTitle;
       });
+      markFollowingChanged(state, animeId);
       saveState();
       broadcastState();
+      webDavService?.schedule();
     }
     return publicState();
   });
@@ -648,7 +691,7 @@ function registerIpc() {
         if (followed) task.animeTitle = followed.displayTitle;
       });
     }
-    app.setLoginItemSettings({ openAtLogin: Boolean(state.settings.launchAtLogin) });
+    updateLoginItemSettings(state.settings.launchAtLogin);
     scheduleSync();
     saveState();
     broadcastState();
@@ -657,6 +700,10 @@ function registerIpc() {
   ipcMain.handle('sync:now', () => syncAiredEpisodes({ silent: true }));
   ipcMain.handle('cache:get', () => cacheStorage.getInfo());
   ipcMain.handle('cache:clear', () => cacheStorage.clear());
+  ipcMain.handle('webdav:get-config', () => webDavService.getConfig());
+  ipcMain.handle('webdav:save-config', (_event, config) => webDavService.saveConfig(config));
+  ipcMain.handle('webdav:test', () => webDavService.testConnection());
+  ipcMain.handle('webdav:sync', () => webDavService.syncNow());
   ipcMain.handle('external:open', (_event, url) => {
     if (typeof url === 'string' && /^https:\/\//.test(url)) shell.openExternal(url);
   });
@@ -675,15 +722,30 @@ app.whenReady().then(() => {
     userDataDirectory: app.getPath('userData'),
     sessionDataDirectory: app.getPath('sessionData'),
   });
+  webDavService = createWebDavService({
+    userDataDirectory: app.getPath('userData'),
+    safeStorage,
+    fetchImpl: net.fetch,
+    getState: () => state,
+    saveState,
+    broadcastState,
+    onStateMerged: () => {
+      scheduleSync();
+      syncAiredEpisodes({ silent: true }).catch((error) => console.warn('Post-WebDAV AniList sync failed:', error.message));
+    },
+    userAgent: `AniLog/${app.getVersion()} (WebDAV sync)`,
+  });
   registerIpc();
   windowLifecycle = createWindowLifecycle({
     createWindow,
     shouldKeepInTray: () => Boolean(state.settings.minimizeToTray),
     isQuitting: () => isQuitting,
   });
-  showWindow();
   createTray();
+  updateLoginItemSettings(state.settings.launchAtLogin);
+  if (!START_HIDDEN) showWindow();
   scheduleSync();
+  webDavService.start();
   syncAiredEpisodes().catch((error) => console.error('Initial sync failed:', error));
   if (EDITION.usesBangumi) {
     state.following
@@ -692,7 +754,8 @@ app.whenReady().then(() => {
   }
 });
 
-app.on('before-quit', () => { isQuitting = true; });
+app.on('before-quit', beginShutdown);
+app.on('will-quit', beginShutdown);
 // Keep the tray, scheduler and notifications alive after the renderer is released.
 app.on('window-all-closed', () => {});
 app.on('activate', showWindow);

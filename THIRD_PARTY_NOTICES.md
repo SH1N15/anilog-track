@@ -28,3 +28,12 @@ AniLog for Android uses AndroidX libraries, including AppCompat, Core, Coordinat
 - Copyright: The Android Open Source Project and AndroidX contributors
 - License: Apache License 2.0
 - License text: https://www.apache.org/licenses/LICENSE-2.0
+
+## OkHttp
+
+AniLog for Android uses OkHttp for authenticated WebDAV requests:
+
+- Project: https://github.com/square/okhttp
+- Copyright: Square, Inc. and contributors
+- License: Apache License 2.0
+- License text: https://www.apache.org/licenses/LICENSE-2.0
