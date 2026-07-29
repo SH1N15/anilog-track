@@ -1,6 +1,6 @@
 # AniLog AI 维护入口
 
-本文件是后续 AI/自动化代理进入仓库时必须先读的项目约束。完整背景、架构、数据流、构建和发布说明见 [`docs/MAINTAINER_HANDOFF.md`](docs/MAINTAINER_HANDOFF.md)。
+本文件是后续 AI/自动化代理进入仓库时必须先读的项目约束。完整背景、架构、数据流、构建、发布说明见 [`docs/MAINTAINER_HANDOFF.md`](docs/MAINTAINER_HANDOFF.md)。
 
 ## 当前状态
 

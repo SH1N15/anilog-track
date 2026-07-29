@@ -29,7 +29,7 @@ Tauri 迁移仍处于公开 beta。`electron/` 和 `android/` 是 v0.5 Electron/
 | `android/` | v0.5 Android Capacitor 实现 | 稳定版回退，保留 |
 | `scripts/` | 构建和行为回归脚本 | 共用 |
 | `release-notes/` | 各版本发布说明 | 共用 |
-| `docs/` | 迁移、发布和维护文档 | 共用 |
+| `docs/` | 迁移、发布和维护文档 | 共用 | 
 
 修改共享业务行为时，先确认逻辑属于 React、Rust 还是 Android 原生层。不要在多个层重复实现同一规则，除非旧架构回退路径也需要同步修复。
 
