@@ -8,11 +8,13 @@
 
 - `package.json` 与 `package-lock.json` 中的桌面版本号
 - `android/app/build.gradle` 中的 `versionCode` 和 `versionName`
+- Tauri 版本还需要检查 `src-tauri/tauri.conf.json` 中的 `version` 和 `bundle.android.versionCode`
 - Android 网络请求使用的 AniLog User-Agent 版本
 - README 中指向最新版 Android APK 的链接
 - `release-notes/vX.Y.Z.md` 发布说明
 
 Android 每次发布必须增加 `versionCode`。覆盖升级还要求使用与旧版本相同的发布密钥。
+Tauri 的预发布标识不会自动产生不同的 Android `versionCode`，因此 beta、rc 和正式版也必须逐次手动增加 `bundle.android.versionCode`。
 
 只发布原名版时，标准版可以继续指向上一版本；发布说明必须明确每个附件所属版本，避免用户误认为标准版也已更新。
 
