@@ -2,6 +2,8 @@
 
 感谢你改进 AniLog。提交修改前，请先在本地完成对应平台的构建和测试。
 
+开始处理代码前，请先阅读 [AI 维护入口](AGENTS.md) 和 [开发与维护交接](docs/MAINTAINER_HANDOFF.md)。其中记录了 Tauri 迁移状态、双版本隔离、任务保留、WebDAV 合并、Android 后台与签名连续性等不能破坏的约束。
+
 ## 环境要求
 
 - Node.js 22
