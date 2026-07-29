@@ -75,6 +75,8 @@ npm run dev
 npm run dev:original
 ```
 
+项目正在进行 Tauri 2 渐进迁移。新架构共享 React 界面与 Rust 核心，同时保留现有 Electron/Capacitor 发布链；当前状态、构建命令和尚需验证的项目见 [docs/TAURI_MIGRATION.md](docs/TAURI_MIGRATION.md)。
+
 完整的环境配置、构建和测试说明见 [CONTRIBUTING.md](CONTRIBUTING.md)，维护者发布版本时请参考 [docs/RELEASING.md](docs/RELEASING.md)。
 
 ## 使用说明

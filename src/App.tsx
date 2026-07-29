@@ -193,8 +193,8 @@ function App() {
         <button className="brand" onClick={() => setView('season')} aria-label={t('返回季度新番', 'Back to seasonal anime')}>
           <span className="brand-mark">A</span>
           <span>
-            <strong>{productName(language)}</strong>
-            <small>{IS_ORIGINAL_EDITION ? t('原名追番日程', 'Original-title tracker') : '追番日程'}</small>
+            <strong>AniLog</strong>
+            <small>追番日程</small>
           </span>
         </button>
 

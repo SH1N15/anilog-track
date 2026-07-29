@@ -7,7 +7,7 @@
 - Node.js 22
 - npm
 - Windows 10/11（运行和打包桌面版）
-- JDK 21、Android SDK 36.1 和对应 Build Tools（构建 Android 版）
+- JDK 17 或 21、Android SDK 36.1 和对应 Build Tools（构建 Android 版；暂不支持 JDK 25）
 
 ## 安装依赖
 
@@ -38,7 +38,27 @@ npm run dev:original
 
 原名版的中英文文案集中使用 `src/i18n.ts` 的语言工具。新增用户可见文本时，应同时提供中文和英文，并验证标准版仍固定使用中文。
 
-浏览器预览地址通常为 `http://127.0.0.1:5173/`。浏览器模式仅用于界面预览；系统托盘、开机自启和 Windows 通知只在 Electron 中生效。
+浏览器预览地址通常为 `http://127.0.0.1:5173/`。浏览器模式仅用于界面预览；系统托盘、开机自启和 Windows 通知只在 Electron 或 Tauri 原生外壳中生效。
+
+## Tauri 迁移开发
+
+Tauri 迁移仍处于验证阶段，不替代下面的 Electron/Capacitor 正式构建流程。运行两个桌面变体：
+
+```powershell
+npm run tauri:dev
+npm run tauri:dev:original
+```
+
+验证 Rust 共享核心与 Tauri 前端：
+
+```powershell
+npm run build:tauri:web
+npm run build:tauri-original:web
+cargo test --manifest-path src-tauri/Cargo.toml --features standard
+cargo check --manifest-path src-tauri/Cargo.toml --no-default-features --features original
+```
+
+完整的 Windows、Android 构建方式和迁移限制见 [docs/TAURI_MIGRATION.md](docs/TAURI_MIGRATION.md)。
 
 ## 构建 Windows 版
 

@@ -2,13 +2,14 @@ const { spawnSync } = require('node:child_process');
 const path = require('node:path');
 
 const target = process.argv[2] || 'standard';
-const edition = target === 'original' || target === 'android-original' ? 'original' : 'standard';
+const edition = target === 'original' || target === 'android-original' || target === 'tauri-original' ? 'original' : 'standard';
 const isAndroid = target === 'android' || target === 'android-original';
+const isTauri = target === 'tauri' || target === 'tauri-original';
 const environment = {
   ...process.env,
   ANILOG_EDITION: edition,
   VITE_ANILOG_EDITION: edition,
-  VITE_ANILOG_PLATFORM: isAndroid ? 'android' : 'desktop',
+  VITE_ANILOG_PLATFORM: isAndroid ? 'android' : isTauri ? 'tauri' : 'desktop',
 };
 
 function run(modulePath, args) {
