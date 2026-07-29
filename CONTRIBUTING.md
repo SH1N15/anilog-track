@@ -40,9 +40,9 @@ npm run dev:original
 
 浏览器预览地址通常为 `http://127.0.0.1:5173/`。浏览器模式仅用于界面预览；系统托盘、开机自启和 Windows 通知只在 Electron 或 Tauri 原生外壳中生效。
 
-## Tauri 迁移开发
+## Tauri 2 开发
 
-Tauri 迁移仍处于验证阶段，不替代下面的 Electron/Capacitor 正式构建流程。运行两个桌面变体：
+Tauri 2 是 v0.6 测试版及后续版本的主要开发方向。运行两个桌面变体：
 
 ```powershell
 npm run tauri:dev
@@ -62,7 +62,14 @@ cargo check --manifest-path src-tauri/Cargo.toml --no-default-features --feature
 
 ## 构建 Windows 版
 
-构建标准版、原名版或两版安装包：
+构建 Tauri 标准版和 Original NSIS 安装包：
+
+```powershell
+npm run tauri:build
+npm run tauri:build:original
+```
+
+安装包生成在 `src-tauri/target/release/bundle/nsis/`。旧 Electron 构建链暂时作为 v0.5.0 稳定版的回退路径：
 
 ```powershell
 npm run dist
@@ -77,6 +84,10 @@ npx electron-builder --win nsis --config.electronDist=node_modules/electron/dist
 ```
 
 ## 构建 Android 版
+
+Tauri Android 的标准版、Original 构建命令、NDK 要求和输出路径见 [docs/TAURI_MIGRATION.md](docs/TAURI_MIGRATION.md)。每个发布版本都必须增加 `src-tauri/tauri.conf.json` 中的 `bundle.android.versionCode`，并使用与现有正式版相同的密钥签名。
+
+旧 Capacitor 构建链暂时保留为 v0.5.0 稳定版的回退路径：
 
 首次构建前，请使用 Android Studio 安装所需 SDK，并确保 `android/local.properties` 指向本机 Android SDK。
 
