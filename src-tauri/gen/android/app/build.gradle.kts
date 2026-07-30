@@ -23,8 +23,8 @@ android {
         applicationId = if (isOriginalEdition) "io.anilog.android.original" else "io.anilog.android"
         minSdk = 24
         targetSdk = 36
-        versionCode = tauriProperties.getProperty("tauri.android.versionCode", "6").toInt()
-        versionName = tauriProperties.getProperty("tauri.android.versionName", "0.6.0-beta.2")
+        versionCode = tauriProperties.getProperty("tauri.android.versionCode", "7").toInt()
+        versionName = tauriProperties.getProperty("tauri.android.versionName", "0.6.0")
     }
     buildTypes {
         getByName("debug") {

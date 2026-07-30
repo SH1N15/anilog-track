@@ -31,23 +31,16 @@ Account-free, local-first anime schedule, notification, and episode task manager
 
 前往 [GitHub Releases](https://github.com/SH1N15/anilog-tracker/releases) 下载需要的版本：
 
-### 稳定版 v0.5.0
+### 正式版 v0.6.0
 
-- [`AniLog-Setup-0.5.0.exe`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.5.0/AniLog-Setup-0.5.0.exe)：Windows 标准版，使用 Bangumi 中文标题
-- [`AniLog-Original-Setup-0.5.0.exe`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.5.0/AniLog-Original-Setup-0.5.0.exe)：Windows 原名版，安装时可选中文或英文，不连接 Bangumi
-- [`AniLog-Android-v0.5.0.apk`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.5.0/AniLog-Android-v0.5.0.apk)：Android 标准版，使用 Bangumi 中文标题
-- [`AniLog-Original-Android-v0.5.0.apk`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.5.0/AniLog-Original-Android-v0.5.0.apk)：Android 原名版，可在设置中切换中文或英文，不连接 Bangumi
+- [`AniLog-Windows-v0.6.0-x64-setup.exe`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.6.0/AniLog-Windows-v0.6.0-x64-setup.exe)：Windows 标准版
+- [`AniLog-Original-Windows-v0.6.0-x64-setup.exe`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.6.0/AniLog-Original-Windows-v0.6.0-x64-setup.exe)：Windows 原名版
+- [`AniLog-Android-v0.6.0-arm64-v8a.apk`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.6.0/AniLog-Android-v0.6.0-arm64-v8a.apk)：Android 标准版，仅支持 arm64-v8a
+- [`AniLog-Original-Android-v0.6.0-arm64-v8a.apk`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.6.0/AniLog-Original-Android-v0.6.0-arm64-v8a.apk)：Android 原名版，仅支持 arm64-v8a
 
-### Tauri 2 测试版 v0.6.0-beta.2
+`v0.6.0` 已正式迁移到 Tauri 2，共用 React 界面与 Rust 核心，并显著降低 Windows 托盘后台占用。它会覆盖对应 edition 的旧版安装；升级前建议先启用 WebDAV 同步或备份 Windows 安装目录中的 `data` 文件夹。
 
-- [`AniLog-Windows-v0.6.0-beta.2-x64-setup.exe`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.6.0-beta.2/AniLog-Windows-v0.6.0-beta.2-x64-setup.exe)：Windows 标准版
-- [`AniLog-Original-Windows-v0.6.0-beta.2-x64-setup.exe`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.6.0-beta.2/AniLog-Original-Windows-v0.6.0-beta.2-x64-setup.exe)：Windows 原名版
-- [`AniLog-Android-v0.6.0-beta.2.apk`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.6.0-beta.2/AniLog-Android-v0.6.0-beta.2.apk)：Android 标准版
-- [`AniLog-Original-Android-v0.6.0-beta.2.apk`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.6.0-beta.2/AniLog-Original-Android-v0.6.0-beta.2.apk)：Android 原名版
-
-测试版已迁移到 Tauri 2，共用 React 界面与 Rust 核心，并显著降低 Windows 托盘后台占用。它会覆盖对应的旧版安装；测试前建议先启用 WebDAV 同步或备份 Windows 安装目录中的 `data` 文件夹。`v0.5.0` 继续作为 GitHub Latest 和稳定版。
-
-- 支持 Windows 10/11 x64，以及 Android 7.0 或更高版本
+- 支持 Windows 10/11 x64，以及使用 arm64-v8a 的 Android 7.0 或更高版本
 - 番剧日程需要网络连接；标准版的在线中文标题查询还会访问 Bangumi API 或配置的反代
 - Windows 安装包尚未进行商业代码签名，可能显示“未知发布者”提示
 - Windows 更新安装会保留安装目录下的 `data` 文件夹
@@ -88,7 +81,7 @@ npm run dev
 npm run dev:original
 ```
 
-`v0.6.0-beta.2` 是当前 Tauri 2 测试版。新架构共享 React 界面与 Rust 核心；旧 Electron/Capacitor 代码暂时保留为稳定版回退路径。当前状态、构建命令和回归重点见 [docs/TAURI_MIGRATION.md](docs/TAURI_MIGRATION.md)。
+`v0.6.0` 是当前 Tauri 2 正式版。新架构共享 React 界面与 Rust 核心；旧 Electron/Capacitor 代码暂时保留为回退路径。当前状态、构建命令和回归重点见 [docs/TAURI_MIGRATION.md](docs/TAURI_MIGRATION.md)。
 
 完整的环境配置、构建和测试说明见 [CONTRIBUTING.md](CONTRIBUTING.md)，维护者发布版本时请参考 [docs/RELEASING.md](docs/RELEASING.md)。
 

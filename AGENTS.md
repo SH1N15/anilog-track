@@ -4,10 +4,9 @@
 
 ## 当前状态
 
-- 当前迁移开发线：`codex/tauri-migration`。
-- 当前待发布 Tauri 测试版：`v0.6.0-beta.2`；发布时必须标记为 GitHub Pre-release，不要标记为 Latest。
-- `main` 上的 `v0.5.0` 仍是稳定版和 GitHub Latest。Tauri 迁移合并并稳定前，不要删除 `electron/` 或 `android/`。
-- 现行目标架构是 React + Tauri 2 + Rust，共享 Windows/Android 业务核心。
+- 当前正式版：`v0.6.0`，使用 React + Tauri 2 + Rust，共享 Windows/Android 业务核心，并标记为 GitHub Latest。
+- Android 正式附件仅发布 `arm64-v8a`；Standard 与 Original 均不得回退为 universal APK。
+- `electron/` 和 `android/` 继续作为 v0.5 回退实现保留；删除旧架构必须另行规划，不得夹带在普通修改中。
 - 开始工作前先运行 `git status --short`，保留用户已有修改，不要擅自清理或重置。
 
 ## 强约束
@@ -32,10 +31,10 @@
 - Windows 构建：`npm run tauri:build` / `npm run tauri:build:original`。
 - 改共享状态、任务、同步、通知或跨平台桥接时，必须验证两个 edition 和 Windows/Android 两端。
 - 只改文档时检查 Markdown 链接和 `git diff --check`，无需恢复依赖或重新打包。
-- 发布前阅读 [`docs/MAINTAINER_HANDOFF.md`](docs/MAINTAINER_HANDOFF.md) 和 [`docs/RELEASING.md`](docs/RELEASING.md)，并确认使用的是 Tauri beta 流程还是 v0.5 回退流程。
+- 发布前阅读 [`docs/MAINTAINER_HANDOFF.md`](docs/MAINTAINER_HANDOFF.md) 和 [`docs/RELEASING.md`](docs/RELEASING.md)，并确认使用的是 Tauri 正式流程还是 v0.5 回退流程。
 
 ## 安全边界
 
 - 不把 WebDAV 账户、应用专用密码、签名密钥及其本机路径或用户状态提交到 Git。
 - 不自动提交、推送、合并 PR、发布 Release 或标记 Latest，除非用户明确授权。
-- 构建产物可清理，但 `release/tauri-v0.6.0-beta.1` 是本机已发布安装包备份且受 Git 忽略；新发布的 `release/tauri-v0.6.0-beta.2` 也应作为本机备份保留。删除前应再次征得用户同意。
+- 构建产物可清理，但 `release/tauri-v0.6.0-beta.1`、`release/tauri-v0.6.0-beta.2` 和 `release/tauri-v0.6.0` 是本机发布安装包备份且受 Git 忽略。删除前应再次征得用户同意。

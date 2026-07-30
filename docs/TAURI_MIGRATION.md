@@ -1,6 +1,6 @@
-# Tauri 迁移说明
+# Tauri 架构与迁移说明
 
-AniLog 正在从 Electron（Windows）与 Capacitor（Android）迁移到 Tauri 2。`v0.6.0-beta.2` 是当前公开测试版；现有 `electron/`、`android/` 与 v0.5.0 构建流程暂时保留为稳定版回退路径。测试版不标记为 GitHub Latest，稳定版仍为 v0.5.0。
+AniLog 已在 `v0.6.0` 正式迁移到 Tauri 2，并以该版本作为 GitHub Latest。现有 `electron/`、`android/` 与 v0.5.0 构建流程暂时保留为回退路径，后续清理必须作为独立任务规划。
 
 ## 架构
 
@@ -76,9 +76,9 @@ npx tauri android build --debug --target aarch64 `
   --features original --apk --ci
 ```
 
-两个 Android 变体当前会写入同一个 `app-universal-debug.apk` 路径，连续构建时后一个会覆盖前一个；发布脚本必须在每次构建后立即复制并使用明确的版本文件名。
+两个 Android 变体会写入同一个 APK 输出路径，连续构建时后一个会覆盖前一个；发布脚本必须在每次构建后立即复制并使用明确的版本文件名。正式发布命令固定使用 `--target aarch64`，附件只允许包含 `arm64-v8a`。
 
-## 测试版回归重点
+## 发布回归重点
 
 - 在 Android 真机上验证首次启动、通知权限、准时调度、重启恢复、待看任务开关和厂商电池策略。
 - 使用测试 WebDAV 账户完成 Windows 与 Android 的离线修改、冲突合并和凭据恢复。
@@ -90,4 +90,4 @@ npx tauri android build --debug --target aarch64 `
 
 本机开发构建的抽样结果：隐藏启动约 19 MB 工作集，打开界面时 WebView2 进程树约 376 MB，关闭到托盘后约 30 MB。数值会随 WebView2 版本、页面内容和统计口径变化，只用于确认后台渲染器已释放，不作为正式性能承诺。
 
-在 Tauri 版本经过公开测试并准备升为稳定版前，不删除旧架构，也不替换 GitHub Releases 中 v0.5.0 的稳定版定位。
+Tauri 已成为正式架构，但现阶段仍不删除旧架构。Electron/Capacitor 的删除条件、迁移终止版本和仓库清理应另行设计与验证。

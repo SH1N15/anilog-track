@@ -2,15 +2,15 @@
 
 来源：2026-07-30 对 `v0.6.0-beta.1` Tauri 迁移的审查，以及 `v0.6.0-beta.2` 修复阶段的复核。
 
-## beta.2 已实现，待发布验证
+## beta.2 已实现并完成公开验证
 
 - **[#4] Windows 单实例**：使用 Windows 限定的官方 `tauri-plugin-single-instance`，重复启动统一调用现有窗口重建、显示与聚焦路径。标准版与 Original 的 identifier 不同，可以各运行一个实例。
 - **[#5] 新番按星期分组**：前端按本机时区使用下一次有效播出时间分组，顺序为星期一至星期日，无日程作品最后显示；保留完整列表模式。
 - **[#6] 可隐藏托盘图标**：增加仅 Tauri Windows 显示的本机设置。隐藏图标不停止后台同步与通知；再次启动会由单实例回调恢复窗口。
 - **提醒时间正则**：改用 `std::sync::LazyLock` 预编译，并增加 `00:00`、`23:59` 及非法格式测试。
-- **Android versionCode**：beta.2 基础配置递增为 `6`。Original 继承基础配置；实际包名继续由 `ANILOG_ANDROID_EDITION=original` 在 Gradle 中切换。
+- **Android versionCode**：beta.2 使用 `6`；v0.6.0 正式版递增为 `7`。Original 继承基础配置；实际包名继续由 `ANILOG_ANDROID_EDITION=original` 在 Gradle 中切换。
 
-以上项目在关闭对应 issue 前仍需完成 Windows 安装包、Android APK、重复启动、托盘隐藏恢复、版本号与签名验证。
+以上项目已在 beta.2 发布阶段完成 Windows/Android 构建、版本号与签名验证；v0.6.0 正式版继续复用相同回归门禁，并将 Android 附件固定为仅 `arm64-v8a`。
 
 ## 已核验，无需改代码
 

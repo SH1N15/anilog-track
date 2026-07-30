@@ -1,6 +1,6 @@
 {
   "name": "anilog",
-  "version": "0.6.0-beta.2",
+  "version": "0.6.0",
   "private": true,
   "description": "A local-first Windows and Android anime schedule, notification, and episode task tracker powered by AniList.",
   "author": "SH1N15",
@@ -32,8 +32,8 @@
     "tauri:build:original": "tauri build --config src-tauri/tauri.original.conf.json --features original --bundles nsis",
     "tauri:android:init": "tauri android init",
     "tauri:android:dev": "set \"ANILOG_ANDROID_EDITION=standard\"&& tauri android dev --features standard",
-    "tauri:android:build": "set \"ANILOG_ANDROID_EDITION=standard\"&& tauri android build --features standard --apk",
-    "tauri:android:build:original": "set \"ANILOG_ANDROID_EDITION=original\"&& tauri android build --config src-tauri/tauri.original.conf.json --config src-tauri/tauri.android-original.conf.json --features original --apk",
+    "tauri:android:build": "set \"ANILOG_ANDROID_EDITION=standard\"&& tauri android build --target aarch64 --features standard --apk",
+    "tauri:android:build:original": "set \"ANILOG_ANDROID_EDITION=original\"&& tauri android build --target aarch64 --config src-tauri/tauri.original.conf.json --config src-tauri/tauri.android-original.conf.json --features original --apk",
     "build:all": "npm run build && npm run build:original",
     "android:sync": "npm run build:android && cap sync android",
     "android:sync:original": "set \"ANILOG_ANDROID_EDITION=original\"&& npm run build:android-original && cap sync android",

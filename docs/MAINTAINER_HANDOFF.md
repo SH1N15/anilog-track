@@ -1,20 +1,19 @@
 # AniLog 开发与维护交接
 
-本文档面向后续维护者和 AI，记录截至 `v0.6.0-beta.2` 的项目事实、关键行为和发布约束。它不是用户使用手册，也不包含任何密码、密钥或账户信息。
+本文档面向后续维护者和 AI，记录截至 `v0.6.0` 的项目事实、关键行为和发布约束。它不是用户使用手册，也不包含任何密码、密钥或账户信息。
 
 ## 1. 项目现状
 
 AniLog 是本地优先的 Windows/Android 追番工具，提供季度新番、追番更新通知、逐集观看任务和用户自有 WebDAV 双端同步。
 
 - 仓库：`https://github.com/SH1N15/anilog-tracker`
-- Tauri 迁移分支：`codex/tauri-migration`
-- 迁移 PR：`https://github.com/SH1N15/anilog-tracker/pull/3`
-- Tauri 测试版：`v0.6.0-beta.2`，GitHub Pre-release
-- 稳定版：`v0.5.0`，仍是 GitHub Latest
-- 当前版本：`0.6.0-beta.2`
-- Android `versionCode`：`6`
+- 正式架构：React + Tauri 2 + Rust
+- 正式版：`v0.6.0`，GitHub Latest
+- 当前版本：`0.6.0`
+- Android `versionCode`：`7`
+- Android 正式附件 ABI：仅 `arm64-v8a`
 
-Tauri 迁移仍处于公开 beta。`electron/` 和 `android/` 是 v0.5 Electron/Capacitor 稳定版的回退路径，在迁移合并并经过稳定期前不能删除。
+Tauri 已成为正式架构。`electron/` 和 `android/` 是 v0.5 Electron/Capacitor 的回退路径，删除条件和迁移终止版本应另行规划，不能夹带在普通修改中。
 
 ## 2. 目录与职责
 
@@ -173,6 +172,8 @@ npm run tauri:android:build
 npm run tauri:android:build:original
 ```
 
+两条正式构建命令都固定使用 `--target aarch64`；发布 APK 必须只包含 `arm64-v8a`。
+
 修改共享状态、同步、通知、任务或桥接时，两套 edition 的 Rust 测试和两个目标平台都需要验证。只改文档时运行 `git diff --check` 和 Markdown 链接检查即可。更完整的命令见 [`../CONTRIBUTING.md`](../CONTRIBUTING.md) 与 [`TAURI_MIGRATION.md`](TAURI_MIGRATION.md)。
 
 ## 10. CI
@@ -190,7 +191,7 @@ CI 目前只对 `main` 的 push 和目标为 `main` 的 PR 触发。迁移分支
 
 ## 11. 发布约束
 
-- beta/rc 使用 GitHub Pre-release，不标记 Latest；`v0.5.0` 在迁移稳定前保持 Latest。
+- beta/rc 使用 GitHub Pre-release，不标记 Latest；正式版标记为 Latest。
 - Android 每一次对外构建都要递增 `bundle.android.versionCode`，包括 beta 到 beta。
 - Android 覆盖更新必须使用与 `v0.5.0` 相同的证书。已知发布证书 SHA-256 为 `a20feecdff2c6489f634d1c30b5eb35873ca119ffde95f6b708ca474c6dface8`，仅用于校验，不代表可恢复密钥。
 - 不在仓库中保存签名密钥、alias、密码、WebDAV 测试账户或本机密钥路径。
@@ -198,11 +199,11 @@ CI 目前只对 `main` 的 push 和目标为 `main` 的 PR 触发。迁移分支
 - 发布前逐个验证附件的 edition、包名、版本号、签名、SHA-256 和安装升级路径。
 - 发布、推送、合并 PR 和修改 Latest 都是外部状态变更，必须获得维护者明确授权。
 
-当前 [`RELEASING.md`](RELEASING.md) 主要记录 v0.5 Electron/Capacitor 稳定版流程。发布 Tauri beta 时应以本交接文档、[`TAURI_MIGRATION.md`](TAURI_MIGRATION.md) 和实际 npm scripts 为准，不要直接运行旧流程中的 `dist:all` 当作 Tauri 包。
+当前 [`RELEASING.md`](RELEASING.md) 以 Tauri 正式发布流程为主，并保留 v0.5 Electron/Capacitor 回退说明。不要运行旧流程中的 `dist:all` 当作 Tauri 包。
 
 ## 12. 已知风险与后续事项
 
-- Tauri 迁移尚未合并 `main`，需要继续收集 Windows/Android beta 反馈。
+- Tauri 已成为正式架构，仍需继续收集 Windows/Android 反馈。
 - 旧架构仍占用仓库空间，但当前有明确回退价值，不应仅为减小目录而删除。
 - Rust 与 Android AniList User-Agent 从各自构建版本生成，发布时需确认版本源同步更新。
 - `src/api.ts` 旧浏览器路径的 Bangumi resolver version 为 4，Rust 实现为 5。它们是不同实现，未经迁移分析不能强制改成相同数字。
