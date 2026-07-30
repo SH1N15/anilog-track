@@ -3,6 +3,7 @@ import {
   Bell,
   BellRing,
   CalendarDays,
+  CalendarRange,
   Check,
   CheckCircle2,
   ChevronLeft,
@@ -15,6 +16,7 @@ import {
   HardDrive,
   Inbox,
   Languages,
+  LayoutGrid,
   ListChecks,
   LoaderCircle,
   Minus,
@@ -31,14 +33,16 @@ import {
   X,
 } from 'lucide-react';
 import { api } from './api';
-import type { Anime, AppState, BangumiTitleMatch, Season, Settings as AppSettings, UiLanguage, ViewId, WatchTask, WebDavConfig } from './types';
+import type { Anime, AppState, BangumiTitleMatch, Season, SeasonViewMode, Settings as AppSettings, UiLanguage, ViewId, WatchTask, WebDavConfig } from './types';
 import { IS_ORIGINAL_EDITION, productName, titleForPreference } from './edition';
 import { localizeMessage, normalizeUiLanguage, tr } from './i18n';
 import { createStateRefreshController } from './state-refresh';
+import { IS_TAURI_APP } from './platform/tauri';
 import {
   currentSeason,
   formatAiring,
   formatLabel,
+  localAiringWeekday,
   relativeTime,
   reminderTitleOf,
   SEASONS,
@@ -55,7 +59,7 @@ const EMPTY_STATE: AppState = {
   following: [],
   tasks: [],
   bangumiTitles: {},
-  settings: { uiLanguage: 'zh-CN', pollIntervalMinutes: 5, launchAtLogin: false, minimizeToTray: true, notifyWhenAired: true, createWatchTasks: true, dailyTaskReminderEnabled: false, dailyTaskReminderTime: '20:00', bangumiApiBaseUrl: IS_ORIGINAL_EDITION ? '' : 'https://sh1n.cc.cd/v0', titlePreference: 'auto' },
+  settings: { uiLanguage: 'zh-CN', pollIntervalMinutes: 5, launchAtLogin: false, minimizeToTray: true, showTrayIcon: true, notifyWhenAired: true, createWatchTasks: true, dailyTaskReminderEnabled: false, dailyTaskReminderTime: '20:00', bangumiApiBaseUrl: IS_ORIGINAL_EDITION ? '' : 'https://sh1n.cc.cd/v0', titlePreference: 'auto' },
   lastSyncAt: 0,
   syncMetadata: { followingDeletedAt: {} },
 };
@@ -69,7 +73,7 @@ const NAV_ITEMS: Array<{ id: ViewId; label: [string, string]; icon: typeof Calen
 
 const UI_STATE_KEY = IS_ORIGINAL_EDITION ? 'anilog-original-ui-state' : 'anilog-ui-state';
 
-function loadUiState(fallback: { season: Season; year: number }): { view: ViewId; season: Season; year: number } {
+function loadUiState(fallback: { season: Season; year: number }): { view: ViewId; season: Season; year: number; seasonView: SeasonViewMode } {
   try {
     const saved = JSON.parse(localStorage.getItem(UI_STATE_KEY) || '{}');
     const views: ViewId[] = ['season', 'tasks', 'following', 'settings'];
@@ -77,9 +81,10 @@ function loadUiState(fallback: { season: Season; year: number }): { view: ViewId
       view: views.includes(saved.view) ? saved.view : 'season',
       season: SEASONS.some((item) => item.value === saved.season) ? saved.season : fallback.season,
       year: Number.isInteger(saved.year) && saved.year >= 2000 && saved.year <= 2100 ? saved.year : fallback.year,
+      seasonView: saved.seasonView === 'all' ? 'all' : 'weekday',
     };
   } catch {
-    return { view: 'season', ...fallback };
+    return { view: 'season', ...fallback, seasonView: 'weekday' };
   }
 }
 
@@ -90,6 +95,7 @@ function App() {
   const [state, setState] = useState<AppState>(EMPTY_STATE);
   const [season, setSeason] = useState<Season>(initialUi.season);
   const [year, setYear] = useState(initialUi.year);
+  const [seasonView, setSeasonView] = useState<SeasonViewMode>(initialUi.seasonView);
   const [anime, setAnime] = useState<Anime[]>([]);
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
@@ -141,8 +147,8 @@ function App() {
   }, [language]);
 
   useEffect(() => {
-    localStorage.setItem(UI_STATE_KEY, JSON.stringify({ view, season, year }));
-  }, [view, season, year]);
+    localStorage.setItem(UI_STATE_KEY, JSON.stringify({ view, season, year, seasonView }));
+  }, [view, season, year, seasonView]);
 
   const loadSeason = useCallback(async () => {
     const requestId = ++seasonRequest.current;
@@ -193,8 +199,8 @@ function App() {
         <button className="brand" onClick={() => setView('season')} aria-label={t('返回季度新番', 'Back to seasonal anime')}>
           <span className="brand-mark">A</span>
           <span>
-            <strong>{productName(language)}</strong>
-            <small>{IS_ORIGINAL_EDITION ? t('原名追番日程', 'Original-title tracker') : '追番日程'}</small>
+            <strong>AniLog</strong>
+            <small>追番日程</small>
           </span>
         </button>
 
@@ -252,12 +258,14 @@ function App() {
               error={error}
               season={season}
               year={year}
+              seasonView={seasonView}
               followedIds={new Set(state.following.map((item) => item.id))}
               titleMatches={state.bangumiTitles}
               titlePreference={state.settings.titlePreference}
               language={language}
               onSeasonChange={setSeason}
               onYearChange={setYear}
+              onSeasonViewChange={setSeasonView}
               onRetry={loadSeason}
               onToggleFollow={async (item) => setState(await api.toggleFollow(item))}
             />
@@ -298,12 +306,14 @@ function SeasonView({
   error,
   season,
   year,
+  seasonView,
   followedIds,
   titleMatches,
   titlePreference,
   language,
   onSeasonChange,
   onYearChange,
+  onSeasonViewChange,
   onRetry,
   onToggleFollow,
 }: {
@@ -312,12 +322,14 @@ function SeasonView({
   error: string;
   season: Season;
   year: number;
+  seasonView: SeasonViewMode;
   followedIds: Set<number>;
   titleMatches: Record<string, BangumiTitleMatch>;
   titlePreference: AppSettings['titlePreference'];
   language: UiLanguage;
   onSeasonChange: (season: Season) => void;
   onYearChange: (year: number) => void;
+  onSeasonViewChange: (view: SeasonViewMode) => void;
   onRetry: () => void;
   onToggleFollow: (anime: Anime) => Promise<void>;
 }) {
@@ -349,6 +361,31 @@ function SeasonView({
       return matchesQuery && matchesFormat && matchesFollowing;
     });
   }, [anime, query, format, onlyFollowing, followedIds, titleMatches]);
+
+  const weekdayGroups = useMemo(() => {
+    const groups = Array.from({ length: 8 }, () => [] as Anime[]);
+    visible.forEach((item) => groups[localAiringWeekday(item)].push(item));
+    return groups;
+  }, [visible]);
+
+  const weekdayLabels: Array<[string, string]> = [
+    ['周一', 'Monday'], ['周二', 'Tuesday'], ['周三', 'Wednesday'], ['周四', 'Thursday'],
+    ['周五', 'Friday'], ['周六', 'Saturday'], ['周日', 'Sunday'], ['播出日待定', 'TBA'],
+  ];
+
+  const renderAnimeCard = (item: Anime) => (
+    <AnimeCard
+      key={item.id}
+      anime={item}
+      titleMatch={titleMatches[String(item.id)]}
+      titlePreference={titlePreference}
+      language={language}
+      followed={followedIds.has(item.id)}
+      onVisible={requestChineseTitle}
+      onOpen={() => setSelected(item)}
+      onToggle={() => onToggleFollow(item)}
+    />
+  );
 
   const shiftYear = (delta: number) => onYearChange(Math.max(2000, Math.min(2100, year + delta)));
 
@@ -396,6 +433,14 @@ function SeasonView({
             <input type="checkbox" checked={onlyFollowing} onChange={(event) => setOnlyFollowing(event.target.checked)} />
             {t('只看已追', 'Following only')}
           </label>
+          <div className="segmented-control view-mode-control" role="group" aria-label={t('新番排列方式', 'Season layout')}>
+            <button className={seasonView === 'weekday' ? 'selected' : ''} aria-pressed={seasonView === 'weekday'} onClick={() => onSeasonViewChange('weekday')}>
+              <CalendarRange size={14} /> <span>{t('星期', 'Weekday')}</span>
+            </button>
+            <button className={seasonView === 'all' ? 'selected' : ''} aria-pressed={seasonView === 'all'} onClick={() => onSeasonViewChange('all')}>
+              <LayoutGrid size={14} /> <span>{t('全部', 'All')}</span>
+            </button>
+          </div>
         </div>
       </section>
 
@@ -408,21 +453,21 @@ function SeasonView({
       ) : visible.length === 0 ? (
         <EmptyState icon={Search} title={t('没有符合条件的番剧', 'No matching anime')} body={t('调整搜索或筛选条件后再试。', 'Try changing the search or filters.')} />
       ) : (
-        <div className="anime-grid">
-          {visible.map((item) => (
-            <AnimeCard
-              key={item.id}
-              anime={item}
-              titleMatch={titleMatches[String(item.id)]}
-              titlePreference={titlePreference}
-              language={language}
-              followed={followedIds.has(item.id)}
-              onVisible={requestChineseTitle}
-              onOpen={() => setSelected(item)}
-              onToggle={() => onToggleFollow(item)}
-            />
-          ))}
-        </div>
+        seasonView === 'all' ? (
+          <div className="anime-grid">{visible.map(renderAnimeCard)}</div>
+        ) : (
+          <div className="weekday-sections">
+            {weekdayGroups.map((items, index) => items.length > 0 && (
+              <section className="weekday-section" key={index} aria-labelledby={`weekday-${index}`}>
+                <header className="weekday-heading">
+                  <h3 id={`weekday-${index}`}>{t(...weekdayLabels[index])}</h3>
+                  <span>{t(`${items.length} 部`, `${items.length} title${items.length === 1 ? '' : 's'}`)}</span>
+                </header>
+                <div className="anime-grid">{items.map(renderAnimeCard)}</div>
+              </section>
+            ))}
+          </div>
+        )
       )}
 
       {selected && (
@@ -682,6 +727,7 @@ function SettingsView({ state, language, onChange }: { state: AppState; language
   const t = (chinese: string, english: string) => tr(language, chinese, english);
   const message = (reason: unknown, chinese: string, english: string) => reason instanceof Error ? localizeMessage(reason.message, language) : t(chinese, english);
   const isAndroid = state.runtime?.platform === 'android';
+  const isTauriDesktop = IS_TAURI_APP && state.runtime?.isDesktop === true && !isAndroid;
   const [proxyUrl, setProxyUrl] = useState(state.settings.bangumiApiBaseUrl);
   const [proxyStatus, setProxyStatus] = useState('');
   const [testingProxy, setTestingProxy] = useState(false);
@@ -924,6 +970,9 @@ function SettingsView({ state, language, onChange }: { state: AppState; language
           <SettingRow title={t('关闭时驻留托盘', 'Keep running in tray')} description={t('继续在后台同步并发送更新提醒', 'Continue syncing and sending alerts in the background')}>
             <Toggle checked={state.settings.minimizeToTray} disabled={!state.runtime?.isDesktop} onChange={(value) => onChange({ minimizeToTray: value })} />
           </SettingRow>
+          {isTauriDesktop && <SettingRow title={t('显示托盘图标', 'Show tray icon')} description={t('隐藏图标时继续在后台同步并发送提醒', 'Keep syncing and sending alerts while the icon is hidden')}>
+            <Toggle label={t('显示托盘图标', 'Show tray icon')} checked={state.settings.showTrayIcon} onChange={(value) => onChange({ showTrayIcon: value })} />
+          </SettingRow>}
         </section>
       )}
       {!isAndroid && <section className="settings-section">
@@ -956,8 +1005,8 @@ function SettingRow({ title, description, children }: { title: string; descripti
   return <div className="setting-row"><div><strong>{title}</strong><span>{description}</span></div>{children}</div>;
 }
 
-function Toggle({ checked, disabled, onChange }: { checked: boolean; disabled?: boolean; onChange: (checked: boolean) => void }) {
-  return <button className={`toggle ${checked ? 'on' : ''}`} disabled={disabled} role="switch" aria-checked={checked} onClick={() => onChange(!checked)}><span /></button>;
+function Toggle({ checked, disabled, label, onChange }: { checked: boolean; disabled?: boolean; label?: string; onChange: (checked: boolean) => void }) {
+  return <button className={`toggle ${checked ? 'on' : ''}`} disabled={disabled} role="switch" aria-checked={checked} aria-label={label} onClick={() => onChange(!checked)}><span /></button>;
 }
 
 function EmptyState({ icon: Icon, title, body, action, onAction }: { icon: typeof Search; title: string; body: string; action?: string; onAction?: () => void }) {

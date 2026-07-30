@@ -4,6 +4,7 @@ import { detectUiLanguage, normalizeUiLanguage, tr } from './i18n';
 import { reminderTitleOf } from './utils';
 import { removeOrphanedPendingTasks, removePendingTasksForAnime } from '../electron/task-retention.cjs';
 import { IS_ANDROID_APP, mobilePlugin, type MobileStatus } from './mobile';
+import { IS_TAURI_APP, tauriApi } from './platform/tauri';
 import {
   documentFromState,
   documentsEqual,
@@ -38,6 +39,7 @@ const initialState = (): AppState => ({
     pollIntervalMinutes: 5,
     launchAtLogin: false,
     minimizeToTray: true,
+    showTrayIcon: true,
     notifyWhenAired: true,
     createWatchTasks: true,
     dailyTaskReminderEnabled: false,
@@ -841,4 +843,4 @@ const browserApi: DesktopApi = {
   },
 };
 
-export const api: DesktopApi = window.animeTracker || browserApi;
+export const api: DesktopApi = IS_TAURI_APP ? tauriApi : window.animeTracker || browserApi;

@@ -1,0 +1,12 @@
+{
+  "id": "resolve-issues-and-publish-release",
+  "title": "接手项目、解决开放问题并发布最新 Windows 和 Android Release",
+  "status": "completed",
+  "complexity": "L+",
+  "risk": "high",
+  "domain": "cross-platform",
+  "currentPhase": "completed",
+  "nextAction": "归档任务",
+  "createdAt": "2026-07-30T00:00:00+08:00",
+  "branch": "codex/tauri-migration"
+}

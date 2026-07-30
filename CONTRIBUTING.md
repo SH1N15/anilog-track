@@ -2,12 +2,14 @@
 
 感谢你改进 AniLog。提交修改前，请先在本地完成对应平台的构建和测试。
 
+开始处理代码前，请先阅读 [AI 维护入口](AGENTS.md) 和 [开发与维护交接](docs/MAINTAINER_HANDOFF.md)。其中记录了 Tauri 迁移状态、双版本隔离、任务保留、WebDAV 合并、Android后台与签名连续性等不能破坏的约束。
+
 ## 环境要求
 
 - Node.js 22
 - npm
 - Windows 10/11（运行和打包桌面版）
-- JDK 21、Android SDK 36.1 和对应 Build Tools（构建 Android 版）
+- JDK 17 或 21、Android SDK 36.1 和对应 Build Tools（构建 Android 版；暂不支持 JDK 25）
 
 ## 安装依赖
 
@@ -38,11 +40,38 @@ npm run dev:original
 
 原名版的中英文文案集中使用 `src/i18n.ts` 的语言工具。新增用户可见文本时，应同时提供中文和英文，并验证标准版仍固定使用中文。
 
-浏览器预览地址通常为 `http://127.0.0.1:5173/`。浏览器模式仅用于界面预览；系统托盘、开机自启和 Windows 通知只在 Electron 中生效。
+浏览器预览地址通常为 `http://127.0.0.1:5173/`。浏览器模式仅用于界面预览；系统托盘、开机自启和 Windows 通知只在 Electron 或 Tauri 原生外壳中生效。
+
+## Tauri 2 开发
+
+Tauri 2 是 v0.6 测试版及后续版本的主要开发方向。运行两个桌面变体：
+
+```powershell
+npm run tauri:dev
+npm run tauri:dev:original
+```
+
+验证 Rust 共享核心与 Tauri 前端：
+
+```powershell
+npm run build:tauri:web
+npm run build:tauri-original:web
+cargo test --manifest-path src-tauri/Cargo.toml --features standard
+cargo check --manifest-path src-tauri/Cargo.toml --no-default-features --features original
+```
+
+完整的 Windows、Android 构建方式和迁移限制见 [docs/TAURI_MIGRATION.md](docs/TAURI_MIGRATION.md)。
 
 ## 构建 Windows 版
 
-构建标准版、原名版或两版安装包：
+构建 Tauri 标准版和 Original NSIS 安装包：
+
+```powershell
+npm run tauri:build
+npm run tauri:build:original
+```
+
+安装包生成在 `src-tauri/target/release/bundle/nsis/`。旧 Electron 构建链暂时作为 v0.5.0 稳定版的回退路径：
 
 ```powershell
 npm run dist
@@ -57,6 +86,10 @@ npx electron-builder --win nsis --config.electronDist=node_modules/electron/dist
 ```
 
 ## 构建 Android 版
+
+Tauri Android 的标准版、Original 构建命令、NDK 要求和输出路径见 [docs/TAURI_MIGRATION.md](docs/TAURI_MIGRATION.md)。每个发布版本都必须增加 `src-tauri/tauri.conf.json` 中的 `bundle.android.versionCode`，并使用与现有正式版相同的密钥签名。
+
+旧 Capacitor 构建链暂时保留为 v0.5.0 稳定版的回退路径：
 
 首次构建前，请使用 Android Studio 安装所需 SDK，并确保 `android/local.properties` 指向本机 Android SDK。
 

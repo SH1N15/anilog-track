@@ -14,3 +14,5 @@ vite.config.d.ts
 !.env.example
 .DS_Store
 Thumbs.db
+.idea/
+src-tauri/target/

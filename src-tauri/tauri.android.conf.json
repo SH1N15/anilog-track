@@ -1,0 +1,17 @@
+{
+  "identifier": "io.anilog.android",
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "create": true,
+        "visible": true
+      }
+    ]
+  },
+  "bundle": {
+    "android": {
+      "debugApplicationIdSuffix": ".debug"
+    }
+  }
+}

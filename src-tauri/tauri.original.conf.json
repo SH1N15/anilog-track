@@ -1,0 +1,20 @@
+{
+  "productName": "AniLog Original",
+  "identifier": "io.anilog.desktop.original",
+  "build": {
+    "frontendDist": "../dist/tauri-original",
+    "beforeDevCommand": "npm run dev:tauri-original:web",
+    "beforeBuildCommand": "npm run build:tauri-original:web"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "AniLog Original"
+      }
+    ]
+  },
+  "bundle": {
+    "shortDescription": "Bilingual anime schedule, notification, and watch-task tracker"
+  }
+}

@@ -31,21 +31,16 @@ Account-free, local-first anime schedule, notification, and episode task manager
 
 前往 [GitHub Releases](https://github.com/SH1N15/anilog-tracker/releases) 下载需要的版本：
 
-- [`AniLog-Setup-0.5.0.exe`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.5.0/AniLog-Setup-0.5.0.exe)：Windows 标准版，使用 Bangumi 中文标题
-- [`AniLog-Original-Setup-0.5.0.exe`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.5.0/AniLog-Original-Setup-0.5.0.exe)：Windows 原名版，安装时可选中文或英文，不连接 Bangumi
-- [`AniLog-Android-v0.5.0.apk`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.5.0/AniLog-Android-v0.5.0.apk)：Android 标准版，使用 Bangumi 中文标题
-- [`AniLog-Original-Android-v0.5.0.apk`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.5.0/AniLog-Original-Android-v0.5.0.apk)：Android 原名版，可在设置中切换中文或英文，不连接 Bangumi
+### 正式版 v0.6.0
 
-- ### Tauri 2 测试版 v0.6.0-beta.1
+- [`AniLog-Windows-v0.6.0-x64-setup.exe`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.6.0/AniLog-Windows-v0.6.0-x64-setup.exe)：Windows 标准版
+- [`AniLog-Original-Windows-v0.6.0-x64-setup.exe`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.6.0/AniLog-Original-Windows-v0.6.0-x64-setup.exe)：Windows 原名版
+- [`AniLog-Android-v0.6.0-arm64-v8a.apk`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.6.0/AniLog-Android-v0.6.0-arm64-v8a.apk)：Android 标准版，仅支持 arm64-v8a
+- [`AniLog-Original-Android-v0.6.0-arm64-v8a.apk`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.6.0/AniLog-Original-Android-v0.6.0-arm64-v8a.apk)：Android 原名版，仅支持 arm64-v8a
 
-- [`AniLog-Windows-v0.6.0-beta.1-x64-setup.exe`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.6.0-beta.1/AniLog-Windows-v0.6.0-beta.1-x64-setup.exe)：Windows 标准版
-- [`AniLog-Original-Windows-v0.6.0-beta.1-x64-setup.exe`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.6.0-beta.1/AniLog-Original-Windows-v0.6.0-beta.1-x64-setup.exe)：Windows 原名版
-- [`AniLog-Android-v0.6.0-beta.1.apk`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.6.0-beta.1/AniLog-Android-v0.6.0-beta.1.apk)：Android 标准版
-- [`AniLog-Original-Android-v0.6.0-beta.1.apk`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.6.0-beta.1/AniLog-Original-Android-v0.6.0-beta.1.apk)：Android 原名版
+`v0.6.0` 已正式迁移到 Tauri 2，共用 React 界面与 Rust 核心，并显著降低 Windows 托盘后台占用。它会覆盖对应 edition 的旧版安装；升级前建议先启用 WebDAV 同步或备份 Windows 安装目录中的 `data` 文件夹。
 
-测试版已迁移到 Tauri 2，共用 React 界面与 Rust 核心，并显著降低 Windows 托盘后台占用。它会覆盖对应的旧版安装；测试前建议先启用 WebDAV 同步或备份 Windows 安装目录中的 `data` 文件夹。`v0.5.0` 继续作为 GitHub Latest 和稳定版。
-
-- 支持 Windows 10/11 x64，以及 Android 7.0 或更高版本
+- 支持 Windows 10/11 x64，以及使用 arm64-v8a 的 Android 7.0 或更高版本
 - 番剧日程需要网络连接；标准版的在线中文标题查询还会访问 Bangumi API 或配置的反代
 - Windows 安装包尚未进行商业代码签名，可能显示“未知发布者”提示
 - Windows 更新安装会保留安装目录下的 `data` 文件夹
@@ -57,8 +52,10 @@ Windows 版将追番记录、观看任务、缓存和设置保存在 `<安装目
 ## 功能
 
 - 自动打开当前季度的新番列表，并可切换年份、季度、类型与搜索条件
+- 可按本机时区将新番按星期分组，也可切换为完整列表
 - 自主添加或取消追番，按本机时区显示下一集播出时间
 - Windows 应用可驻留系统托盘，定时检查 AniList 播出日程
+- Windows 每个版本只运行一个实例，并可选择隐藏托盘图标
 - 新一集播出后发送系统通知，并自动创建待看任务
 - 可选每日待看提醒：自定义本机提醒时间，仅有待看任务时发送一次摘要，点击通知直接打开任务列表
 - Android 使用系统后台调度校正日程，无需常驻进程；可关闭手机端的自动待看任务，仅保留通知
@@ -83,6 +80,8 @@ npm run dev
 ```powershell
 npm run dev:original
 ```
+
+`v0.6.0` 是当前 Tauri 2 正式版。新架构共享 React 界面与 Rust 核心；旧 Electron/Capacitor 代码暂时保留为回退路径。当前状态、构建命令和回归重点见 [docs/TAURI_MIGRATION.md](docs/TAURI_MIGRATION.md)。
 
 完整的环境配置、构建和测试说明见 [CONTRIBUTING.md](CONTRIBUTING.md)，维护者发布版本时请参考 [docs/RELEASING.md](docs/RELEASING.md)。
 

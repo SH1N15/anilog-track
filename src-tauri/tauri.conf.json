@@ -1,0 +1,55 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "AniLog",
+  "version": "0.6.0",
+  "identifier": "io.anilog.desktop",
+  "build": {
+    "frontendDist": "../dist/tauri-standard",
+    "devUrl": "http://127.0.0.1:5173",
+    "beforeDevCommand": "npm run dev:tauri:web",
+    "beforeBuildCommand": "npm run build:tauri:web"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "create": false,
+        "title": "AniLog",
+        "width": 1280,
+        "height": 820,
+        "minWidth": 940,
+        "minHeight": 640,
+        "resizable": true,
+        "fullscreen": false,
+        "visible": false,
+        "backgroundColor": "#f7f8f6"
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "shortDescription": "Anime schedule, notification, and watch-task tracker",
+    "publisher": "SH1N15",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "nsis": {
+        "installerIcon": "icons/icon.ico",
+        "uninstallerIcon": "icons/icon.ico"
+      }
+    },
+    "android": {
+      "versionCode": 7,
+      "debugApplicationIdSuffix": ".debug"
+    }
+  }
+}
