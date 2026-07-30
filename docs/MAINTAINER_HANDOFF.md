@@ -1,6 +1,6 @@
 # AniLog 开发与维护交接
 
-本文档面向后续维护者和 AI，记录截至 `v0.6.0-beta.1` 的项目事实、关键行为和发布约束。它不是用户使用手册，也不包含任何密码、密钥或账户信息。
+本文档面向后续维护者和 AI，记录截至 `v0.6.0-beta.2` 的项目事实、关键行为和发布约束。它不是用户使用手册，也不包含任何密码、密钥或账户信息。
 
 ## 1. 项目现状
 
@@ -9,10 +9,10 @@ AniLog 是本地优先的 Windows/Android 追番工具，提供季度新番、�
 - 仓库：`https://github.com/SH1N15/anilog-tracker`
 - Tauri 迁移分支：`codex/tauri-migration`
 - 迁移 PR：`https://github.com/SH1N15/anilog-tracker/pull/3`
-- Tauri 测试版：`v0.6.0-beta.1`，GitHub Pre-release
+- Tauri 测试版：`v0.6.0-beta.2`，GitHub Pre-release
 - 稳定版：`v0.5.0`，仍是 GitHub Latest
-- 当前版本：`0.6.0-beta.1`
-- Android `versionCode`：`5`
+- 当前版本：`0.6.0-beta.2`
+- Android `versionCode`：`6`
 
 Tauri 迁移仍处于公开 beta。`electron/` 和 `android/` 是 v0.5 Electron/Capacitor 稳定版的回退路径，在迁移合并并经过稳定期前不能删除。
 
@@ -95,6 +95,8 @@ Windows 启动后进行一次同步，本地变化会延迟合并，空闲时最
 - 左键单击托盘直接恢复单一主窗口；不应先闪现右键菜单，也不能生成两个窗口。
 - 右键单击才显示托盘菜单。
 - 点击新番通知应恢复并聚焦主窗口。
+- 标准版与 Original 分别保持单实例；重复启动应恢复已有窗口，不得重复启动后台任务。
+- 托盘图标可以隐藏；隐藏后后台同步与通知保持运行，再次启动快捷方式应恢复已有窗口。
 - 系统关机/注销时应安静退出，不弹错误。
 
 ### Android
@@ -202,7 +204,7 @@ CI 目前只对 `main` 的 push 和目标为 `main` 的 PR 触发。迁移分支
 
 - Tauri 迁移尚未合并 `main`，需要继续收集 Windows/Android beta 反馈。
 - 旧架构仍占用仓库空间，但当前有明确回退价值，不应仅为减小目录而删除。
-- `src-tauri/src/lib.rs` 的 User-Agent 仍含 `AniLog Tauri/0.5`；以后可随版本治理统一更新，但不要在无测试的文档任务中顺手修改业务代码。
+- Rust 与 Android AniList User-Agent 从各自构建版本生成，发布时需确认版本源同步更新。
 - `src/api.ts` 旧浏览器路径的 Bangumi resolver version 为 4，Rust 实现为 5。它们是不同实现，未经迁移分析不能强制改成相同数字。
 - Android 后台及时性受系统和厂商调度影响，不能承诺精确到分钟。
 - Tauri 正式替代旧架构后，需要单独制定删除 Electron/Capacitor 的条件、数据迁移终止版本和仓库清理提交，不应夹带在普通功能 PR 中。

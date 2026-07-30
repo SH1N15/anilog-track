@@ -5,7 +5,7 @@
 ## 当前状态
 
 - 当前迁移开发线：`codex/tauri-migration`。
-- 当前 Tauri 测试版：`v0.6.0-beta.1`，对应 GitHub Pre-release；不要标记为 Latest。
+- 当前待发布 Tauri 测试版：`v0.6.0-beta.2`；发布时必须标记为 GitHub Pre-release，不要标记为 Latest。
 - `main` 上的 `v0.5.0` 仍是稳定版和 GitHub Latest。Tauri 迁移合并并稳定前，不要删除 `electron/` 或 `android/`。
 - 现行目标架构是 React + Tauri 2 + Rust，共享 Windows/Android 业务核心。
 - 开始工作前先运行 `git status --short`，保留用户已有修改，不要擅自清理或重置。
@@ -38,4 +38,4 @@
 
 - 不把 WebDAV 账户、应用专用密码、签名密钥及其本机路径或用户状态提交到 Git。
 - 不自动提交、推送、合并 PR、发布 Release 或标记 Latest，除非用户明确授权。
-- 构建产物可清理，但 `release/tauri-v0.6.0-beta.1` 是本机已发布安装包备份且受 Git 忽略；删除前应再次征得用户同意。
+- 构建产物可清理，但 `release/tauri-v0.6.0-beta.1` 是本机已发布安装包备份且受 Git 忽略；新发布的 `release/tauri-v0.6.0-beta.2` 也应作为本机备份保留。删除前应再次征得用户同意。

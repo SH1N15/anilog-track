@@ -1,6 +1,6 @@
 [package]
 name = "anilog-tauri"
-version = "0.6.0-beta.1"
+version = "0.6.0-beta.2"
 description = "Local-first anime schedule, notification, and watch-task tracker"
 authors = ["SH1N15"]
 license = "MIT"
@@ -44,4 +44,5 @@ base64 = "0.22"
 keyring = { version = "3", features = ["windows-native"] }
 tauri-plugin-autostart = "2"
 tauri-winrt-notification = "0.7.3"
+tauri-plugin-single-instance = { path = "vendor/tauri-plugin-single-instance" }
 windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }

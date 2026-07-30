@@ -17,13 +17,18 @@ use std::path::{Path, PathBuf};
 #[cfg(desktop)]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 #[cfg(desktop)]
 use tauri_plugin_autostart::ManagerExt as AutostartExt;
 #[cfg(all(desktop, not(target_os = "windows")))]
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
+
+#[cfg(all(feature = "standard", feature = "original"))]
+compile_error!("Cargo features `standard` and `original` are mutually exclusive");
+#[cfg(not(any(feature = "standard", feature = "original")))]
+compile_error!("either Cargo feature `standard` or `original` must be enabled");
 
 #[cfg(target_os = "android")]
 mod mobile;
@@ -36,6 +41,10 @@ const STATE_VERSION: i64 = 2;
 const SYNC_VERSION: i64 = 1;
 const CACHE_VERSION: i64 = 1;
 const BANGUMI_RESOLVER_VERSION: i64 = 5;
+static DAILY_TASK_REMINDER_TIME_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"^([01]\d|2[0-3]):[0-5]\d$").unwrap());
+#[cfg(desktop)]
+static PENDING_WINDOW_ACTIVATION: AtomicBool = AtomicBool::new(false);
 #[cfg(not(target_os = "android"))]
 const MAX_SYNC_BYTES: usize = 5 * 1024 * 1024;
 #[cfg(not(target_os = "android"))]
@@ -95,6 +104,7 @@ fn default_state(original: bool) -> Value {
             "pollIntervalMinutes": 5,
             "launchAtLogin": false,
             "minimizeToTray": true,
+            "showTrayIcon": true,
             "notifyWhenAired": true,
             "createWatchTasks": true,
             "dailyTaskReminderEnabled": false,
@@ -270,7 +280,7 @@ fn load_context(app: &AppHandle, original: bool) -> anyhow::Result<AppContext> {
         data_dir,
         cache_dir,
         client: reqwest::Client::builder()
-            .user_agent("AniLog Tauri/0.5")
+            .user_agent(concat!("AniLog Tauri/", env!("CARGO_PKG_VERSION")))
             .build()?,
         original,
         sync_wakeup: Arc::new(tokio::sync::Notify::new()),
@@ -958,6 +968,10 @@ fn update_settings(
     let tray_language_changed = settings
         .as_object()
         .is_some_and(|patch| patch.contains_key("uiLanguage"));
+    #[cfg(desktop)]
+    let tray_visibility_changed = settings
+        .as_object()
+        .is_some_and(|patch| patch.contains_key("showTrayIcon"));
     let mut state = context.state.lock().map_err(|_| "状态锁不可用")?;
     if let Some(patch) = settings.as_object() {
         if !context.original && patch.contains_key("bangumiApiBaseUrl") {
@@ -967,6 +981,9 @@ fn update_settings(
         }
         let target = state["settings"].as_object_mut().unwrap();
         for (key, value) in patch {
+            if key == "showTrayIcon" && !value.is_boolean() {
+                continue;
+            }
             if key != "bangumiApiBaseUrl" || !context.original {
                 target.insert(key.clone(), value.clone());
             }
@@ -981,11 +998,7 @@ fn update_settings(
             target.insert("bangumiApiBaseUrl".into(), json!(""));
         }
         if let Some(time) = target.get("dailyTaskReminderTime").and_then(Value::as_str) {
-            if regex::Regex::new(r"^([01]\d|2[0-3]):[0-5]\d$")
-                .unwrap()
-                .is_match(time)
-                == false
-            {
+            if !is_valid_reminder_time(time) {
                 target.insert("dailyTaskReminderTime".into(), json!("20:00"));
             }
         }
@@ -995,6 +1008,8 @@ fn update_settings(
     }
     #[cfg(desktop)]
     let launch_at_login = value_bool(state["settings"].get("launchAtLogin"));
+    #[cfg(desktop)]
+    let tray_visible = show_tray_icon(&state["settings"]);
     drop(state);
     #[cfg(desktop)]
     {
@@ -1013,10 +1028,21 @@ fn update_settings(
     #[cfg(desktop)]
     if tray_language_changed {
         setup_tray(&app, &context).map_err(|error| error.to_string())?;
+    } else if tray_visibility_changed {
+        if let Some(tray) = app.tray_by_id("main") {
+            tray.set_visible(tray_visible)
+                .map_err(|error| error.to_string())?;
+        } else {
+            setup_tray(&app, &context).map_err(|error| error.to_string())?;
+        }
     }
     refresh_mobile_configuration(&app, &context)?;
     emit_state(&app, &context);
     Ok(context.public_state())
+}
+
+fn is_valid_reminder_time(time: &str) -> bool {
+    DAILY_TASK_REMINDER_TIME_RE.is_match(time)
 }
 
 #[tauri::command]
@@ -2209,7 +2235,10 @@ fn request_show_main_window(app: &AppHandle) {
         let _ = window.set_focus();
         return;
     }
-    let opening = app.state::<AppContext>().main_window_opening.clone();
+    let Some(context) = app.try_state::<AppContext>() else {
+        return;
+    };
+    let opening = context.main_window_opening.clone();
     if opening
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
@@ -2307,12 +2336,17 @@ fn tray_labels(original: bool, language: &str) -> TrayLabels {
 fn setup_tray(app: &AppHandle, context: &AppContext) -> anyhow::Result<()> {
     use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem};
     use tauri::tray::TrayIconBuilder;
-    let language = context
+    let (language, visible) = context
         .state
         .lock()
         .ok()
-        .map(|state| value_string(state["settings"].get("uiLanguage")))
-        .unwrap_or_else(|| "zh-CN".into());
+        .map(|state| {
+            (
+                value_string(state["settings"].get("uiLanguage")),
+                show_tray_icon(&state["settings"]),
+            )
+        })
+        .unwrap_or_else(|| ("zh-CN".into(), true));
     let labels = tray_labels(context.original, &language);
     let open = MenuItemBuilder::with_id("open", labels.open.clone()).build(app)?;
     let sync = MenuItemBuilder::with_id("sync", labels.sync.clone()).build(app)?;
@@ -2323,7 +2357,7 @@ fn setup_tray(app: &AppHandle, context: &AppContext) -> anyhow::Result<()> {
         .build()?;
     let icon = tauri::image::Image::from_bytes(include_bytes!("../../assets/tray.png"))?;
     let _ = app.remove_tray_by_id("main");
-    TrayIconBuilder::with_id("main")
+    let tray = TrayIconBuilder::with_id("main")
         .icon(icon)
         .menu(&menu)
         .show_menu_on_left_click(false)
@@ -2355,7 +2389,16 @@ fn setup_tray(app: &AppHandle, context: &AppContext) -> anyhow::Result<()> {
             _ => {}
         })
         .build(app)?;
+    tray.set_visible(visible)?;
     Ok(())
+}
+
+#[cfg(desktop)]
+fn show_tray_icon(settings: &Value) -> bool {
+    settings
+        .get("showTrayIcon")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
 }
 
 #[cfg(desktop)]
@@ -2474,7 +2517,13 @@ pub fn run() {
     let original = cfg!(feature = "original");
     #[cfg(desktop)]
     let start_hidden = std::env::args().any(|argument| argument == "--hidden");
-    let builder = tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(target_os = "windows")]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        PENDING_WINDOW_ACTIVATION.store(true, Ordering::Release);
+        request_show_main_window(app);
+    }));
+    let builder = builder
         .plugin(tauri_plugin_log::Builder::default().build())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init());
@@ -2517,6 +2566,9 @@ pub fn run() {
                     show_main_window(app.handle())?;
                 } else if let Some(window) = app.get_webview_window("main") {
                     window.destroy()?;
+                }
+                if PENDING_WINDOW_ACTIVATION.swap(false, Ordering::AcqRel) {
+                    request_show_main_window(app.handle());
                 }
             }
             start_webdav_background(app.handle().clone(), context.clone());
@@ -2697,7 +2749,19 @@ mod tests {
         assert!(migrated["seenAiringEvents"].is_array());
         assert_eq!(migrated["settings"]["pollIntervalMinutes"], 15);
         assert_eq!(migrated["settings"]["createWatchTasks"], true);
+        assert_eq!(migrated["settings"]["showTrayIcon"], true);
         assert!(migrated["syncMetadata"]["followingDeletedAt"].is_object());
+    }
+
+    #[test]
+    fn reminder_time_validation_accepts_only_padded_twenty_four_hour_values() {
+        assert!(is_valid_reminder_time("00:00"));
+        assert!(is_valid_reminder_time("20:00"));
+        assert!(is_valid_reminder_time("23:59"));
+        assert!(!is_valid_reminder_time("8:05"));
+        assert!(!is_valid_reminder_time("24:00"));
+        assert!(!is_valid_reminder_time("20:60"));
+        assert!(!is_valid_reminder_time(""));
     }
 
     #[test]
@@ -2925,6 +2989,15 @@ mod tests {
                 tooltip: "AniLog Original - Anime tracker".into(),
             }
         );
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn tray_visibility_defaults_visible_and_preserves_explicit_false() {
+        assert!(show_tray_icon(&json!({})));
+        assert!(show_tray_icon(&json!({"showTrayIcon": true})));
+        assert!(!show_tray_icon(&json!({"showTrayIcon": false})));
+        assert!(show_tray_icon(&json!({"showTrayIcon": "false"})));
     }
 
     #[cfg(target_os = "windows")]

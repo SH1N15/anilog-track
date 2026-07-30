@@ -4,6 +4,24 @@
 
 > **流程范围：** 本文主体主要记录 `v0.5.x` Electron/Capacitor 稳定版的发布链。`v0.6.0-beta.1` 起的 Tauri 2 版本仍处于迁移测试期，不能把下面的 `dist:all` 或旧 `android/` Gradle 命令当作 Tauri 发布流程。发布 Tauri beta 前先阅读 [开发与维护交接](MAINTAINER_HANDOFF.md) 和 [Tauri 迁移说明](TAURI_MIGRATION.md)，使用 `tauri:build*` / `tauri:android:build*` 命令，并将 beta 标记为 Pre-release 而非 Latest。
 
+### Tauri beta 构建
+
+Windows 两个 edition 必须串行构建，并在每次构建后用包含 edition 和版本号的文件名暂存 NSIS 安装包：
+
+```powershell
+npm run tauri:build
+npm run tauri:build:original
+```
+
+Android 必须显式使用 JDK 17 或 21。标准版和 Original 会写入同一 APK 输出路径，因此每次构建后必须立即复制暂存；Original 的实际包名由 `ANILOG_ANDROID_EDITION=original` 在 Gradle 中切换：
+
+```powershell
+npm run tauri:android:build
+npm run tauri:android:build:original
+```
+
+签名后按第 4 节的方式逐个验证包名、`versionName`、`versionCode`、证书指纹和对齐状态。Tauri beta Release 必须使用独立标签并设置 `Pre-release`，同时保持 `v0.5.0` 为 Latest。
+
 ## 1. 更新版本号
 
 发布新版本前，至少检查以下位置：

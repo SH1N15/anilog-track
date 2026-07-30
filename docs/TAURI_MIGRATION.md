@@ -1,6 +1,6 @@
 # Tauri 迁移说明
 
-AniLog 正在从 Electron（Windows）与 Capacitor（Android）迁移到 Tauri 2。`v0.6.0-beta.1` 是首个公开测试版，Windows 与 Android 的标准版、Original 已完成人工验证；现有 `electron/`、`android/` 与 v0.5.0 构建流程暂时保留为稳定版回退路径。测试版不标记为 GitHub Latest，稳定版仍为 v0.5.0。
+AniLog 正在从 Electron（Windows）与 Capacitor（Android）迁移到 Tauri 2。`v0.6.0-beta.2` 是当前公开测试版；现有 `electron/`、`android/` 与 v0.5.0 构建流程暂时保留为稳定版回退路径。测试版不标记为 GitHub Latest，稳定版仍为 v0.5.0。
 
 ## 架构
 
@@ -24,6 +24,9 @@ AniLog 正在从 Electron（Windows）与 Capacitor（Android）迁移到 Tauri 
 - Windows 隐藏启动或关闭到托盘后会销毁 WebView2，仅保留 Rust 后台进程；再次打开时按需重建界面。
 - Windows 托盘只响应一次左键抬起事件，左键不会打开右键菜单，并使用窗口重建锁防止连续点击创建重复窗口。
 - Windows 新番与每日待看通知注册激活回调；应用仍在后台运行时，点击系统通知会重建并聚焦主窗口。
+- Windows 标准版与 Original 分别保持单实例；重复启动会恢复已有窗口，不会重复启动后台任务。
+- Windows 可隐藏托盘图标，后台同步和通知保持不变；再次启动快捷方式可恢复已有窗口。
+- 新番列表可按本机星期分组，也可切换回完整列表。
 - Bangumi 请求全局串行且至少间隔 450 ms，整体不可用时暂停 10 分钟；成功中文名缓存 180 天，未匹配的未来作品缓存 1 天，已播作品缓存 7 天。
 
 ## 本地数据

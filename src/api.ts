@@ -39,6 +39,7 @@ const initialState = (): AppState => ({
     pollIntervalMinutes: 5,
     launchAtLogin: false,
     minimizeToTray: true,
+    showTrayIcon: true,
     notifyWhenAired: true,
     createWatchTasks: true,
     dailyTaskReminderEnabled: false,

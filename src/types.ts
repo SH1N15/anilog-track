@@ -1,5 +1,6 @@
 export type Season = 'WINTER' | 'SPRING' | 'SUMMER' | 'FALL';
 export type ViewId = 'season' | 'tasks' | 'following' | 'settings';
+export type SeasonViewMode = 'weekday' | 'all';
 export type TitlePreference = 'auto' | 'english' | 'romaji' | 'native';
 export type UiLanguage = 'zh-CN' | 'en-US';
 
@@ -74,6 +75,7 @@ export interface Settings {
   pollIntervalMinutes: number;
   launchAtLogin: boolean;
   minimizeToTray: boolean;
+  showTrayIcon: boolean;
   notifyWhenAired: boolean;
   createWatchTasks: boolean;
   dailyTaskReminderEnabled: boolean;

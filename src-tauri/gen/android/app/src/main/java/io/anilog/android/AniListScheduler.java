@@ -75,7 +75,7 @@ final class AniListScheduler {
         connection.setDoOutput(true);
         connection.setRequestProperty("Content-Type", "application/json");
         connection.setRequestProperty("Accept", "application/json");
-        connection.setRequestProperty("User-Agent", "AniLog-Android/0.6.0-beta.1 (https://github.com/SH1N15/anilog-tracker)");
+        connection.setRequestProperty("User-Agent", "AniLog-Android/" + BuildConfig.VERSION_NAME + " (https://github.com/SH1N15/anilog-tracker)");
         byte[] body = payload.toString().getBytes(StandardCharsets.UTF_8);
         connection.setFixedLengthStreamingMode(body.length);
         try (OutputStream output = connection.getOutputStream()) {

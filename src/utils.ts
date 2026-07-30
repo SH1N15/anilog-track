@@ -1,4 +1,4 @@
-import type { AnimeTitle, Season, UiLanguage } from './types';
+import type { Anime, AnimeTitle, Season, UiLanguage } from './types';
 import { tr } from './i18n';
 
 export const SEASONS: Array<{ value: Season; label: string; months: string }> = [
@@ -56,6 +56,23 @@ export function seasonMonths(season: Season, language: UiLanguage = 'zh-CN'): st
 
 export function seasonLabel(season: Season, year: number, language: UiLanguage = 'zh-CN'): string {
   return language === 'en-US' ? `${seasonName(season, language)} ${year}` : `${year} ${seasonName(season, language)}季`;
+}
+
+export function localAiringWeekday(anime: Anime, now = Math.floor(Date.now() / 1000)): number {
+  const fallbackAt = anime.nextAiringEpisode?.airingAt;
+  const scheduledAt = (anime.airingSchedule?.nodes || [])
+    .map((node) => node.airingAt)
+    .filter((airingAt) => Number.isFinite(airingAt) && airingAt > now)
+    .reduce<number | null>((earliest, airingAt) => earliest === null || airingAt < earliest ? airingAt : earliest, null);
+  const validFallbackAt = Number.isFinite(fallbackAt) && fallbackAt! > now ? fallbackAt! : null;
+  const airingAt = scheduledAt === null
+    ? validFallbackAt
+    : validFallbackAt === null
+      ? scheduledAt
+      : Math.min(scheduledAt, validFallbackAt);
+  if (airingAt === null) return 7;
+  const day = new Date(airingAt * 1000).getDay();
+  return day === 0 ? 6 : day - 1;
 }
 
 export function formatAiring(timestamp?: number | null, includeDate = true, language: UiLanguage = 'zh-CN'): string {

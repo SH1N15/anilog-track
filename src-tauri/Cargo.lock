@@ -95,7 +95,7 @@ dependencies = [
 
 [[package]]
 name = "anilog-tauri"
-version = "0.6.0-beta.1"
+version = "0.6.0-beta.2"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -113,6 +113,7 @@ dependencies = [
  "tauri-plugin-log",
  "tauri-plugin-notification",
  "tauri-plugin-opener",
+ "tauri-plugin-single-instance",
  "tauri-winrt-notification",
  "tokio",
  "url",
@@ -4037,6 +4038,20 @@ dependencies = [
  "thiserror 2.0.19",
  "url",
  "windows",
+ "zbus",
+]
+
+[[package]]
+name = "tauri-plugin-single-instance"
+version = "2.4.3"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tauri",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "windows-sys 0.60.2",
  "zbus",
 ]
 
