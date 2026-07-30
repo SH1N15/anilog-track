@@ -43,3 +43,11 @@
 - `git diff --check` passed.
 
 Verdict: critical findings fixed; approved for rebuilt packaging, subject to final artifact identity, signature, checksum, and release metadata verification.
+
+## Publication
+
+- CI run `30544857581` passed.
+- Commit `1e6fed4` was tagged as `v0.6.0-beta.2`.
+- GitHub Release was published as a Pre-release; `v0.5.0` remains Latest.
+- All four uploaded assets were downloaded again and matched the published/local SHA-256 values.
+- Issues #4, #5, and #6 were closed only after release verification.
