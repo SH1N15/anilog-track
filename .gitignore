@@ -16,3 +16,6 @@ vite.config.d.ts
 Thumbs.db
 .idea/
 src-tauri/target/
+/.agents
+/.codex
+/.trellis
