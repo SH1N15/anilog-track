@@ -9,7 +9,9 @@
 - Node.js 22
 - npm
 - Windows 10/11（运行和打包桌面版）
-- JDK 17 或 21、Android SDK 36.1 和对应 Build Tools（构建 Android 版；暂不支持 JDK 25）
+- JDK 17 或 21、Android SDK/compile target 36（构建 Tauri Android 版；暂不支持 JDK 25）
+
+旧 Capacitor 回退工程的 `android/app/build.gradle` 使用 Build Tools 36.1.0；这不是 Tauri 的 SDK 版本要求。
 
 ## 安装依赖
 
@@ -57,7 +59,7 @@ npm run tauri:dev:original
 npm run build:tauri:web
 npm run build:tauri-original:web
 cargo test --manifest-path src-tauri/Cargo.toml --features standard
-cargo check --manifest-path src-tauri/Cargo.toml --no-default-features --features original
+cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --features original
 ```
 
 完整的 Windows、Android 构建方式和迁移限制见 [docs/TAURI_MIGRATION.md](docs/TAURI_MIGRATION.md)。
@@ -114,9 +116,10 @@ Original Debug APK 位于 `android/app/build/outputs/apk/original/debug/app-orig
 ## 测试
 
 ```powershell
-npm run build:all
-npm run build:android
-npm run build:android-original
+npm run build:tauri:web
+npm run build:tauri-original:web
+cargo test --manifest-path src-tauri/Cargo.toml --features standard
+cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --features original
 npm run test:daily-task-reminder
 npm run test:editions
 npm run test:state-refresh
@@ -130,6 +133,8 @@ npm run test:data
 npm run test:bangumi
 npm audit --omit=dev --audit-level=high
 ```
+
+`build:all`、`build:android`、`build:android-original` 和 `dist:all` 属于 v0.5 Electron/Capacitor 回退验证；需要维护回退工程时再单独运行，不作为 Tauri v0.6.0 的主测试清单。
 
 修改共享状态、同步逻辑或跨平台接口时，应同时验证 Windows 与 Android 构建。只修改文档时无需重新打包安装程序，但应检查 Markdown 链接和命令是否正确。
 

@@ -34,6 +34,10 @@
 
 启用 CSP 需要同时覆盖 Tauri IPC、远程 AniList 图片、React 内联背景样式和 Vite 开发 WebSocket，并在 Windows/Android 两端验证。该项不与本轮三个功能 issue 混合发布，后续应单独实施和回归，且不得放宽远程脚本来源。
 
+### Original 中文产品名显示
+
+`src/edition.ts:9-10` 的 Original + `zh-CN` 产品名字符串当前显示为乱码，影响窗口标题和 `document.title`（`src/App.tsx:106-109`）。本次维护文档审计只记录该问题，未修改产品代码；修复时需单独验证中英文安装器语言和首次启动标题。
+
 ## 先前已处理
 
 - **清理散落的 preview 日志**：根目录占位日志已删除，`.gitignore` 已覆盖 `*.log`。

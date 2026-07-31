@@ -11,7 +11,7 @@ AniLog 是本地优先的 Windows/Android 追番工具，提供季度新番、�
 - 正式版：`v0.6.0`，GitHub Latest
 - 当前版本：`0.6.0`
 - Android `versionCode`：`7`
-- Android 正式附件 ABI：仅 `arm64-v8a`
+- Android 正式 Release 附件 ABI：仅 `arm64-v8a`；Debug 配置仍可能包含其他 ABI，不能将正式包限制泛化到开发包
 
 Tauri 已成为正式架构。`electron/` 和 `android/` 是 v0.5 Electron/Capacitor 的回退路径，删除条件和迁移终止版本应另行规划，不能夹带在普通修改中。
 
@@ -103,7 +103,7 @@ Windows 启动后进行一次同步，本地变化会延迟合并，空闲时最
 - 不要求应用进程常驻。
 - WorkManager 当前周期同步间隔为 6 小时。
 - AlarmManager 用于已知播出时间和每日待看提醒；这是为了可靠调度，不意味着高频访问 AniList。
-- 厂商省电策略仍可能延迟后台任务，属于平台限制。
+- WorkManager/AlarmManager 由系统持有，即使用户没有打开界面也可能执行；厂商省电策略仍可能延迟后台任务，属于平台限制。
 - Android 7.0+，`minSdk 24`。
 
 ## 7. 本地数据与迁移

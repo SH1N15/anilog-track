@@ -35,7 +35,7 @@ AniLog 已在 `v0.6.0` 正式迁移到 Tauri 2，并以该版本作为 GitHub La
 - Windows debug：Tauri 的应用数据目录。
 - Android：系统分配的应用私有数据目录。
 
-Android 的 AlarmManager 和 WorkManager 任务由系统持有，不要求应用进程常驻；WebDAV 自动同步只在应用运行期间使用上述低频策略。
+Android 的 AlarmManager 和 WorkManager 任务由系统持有，不要求应用进程常驻；系统可能在界面未打开时执行低频同步或提醒，具体时机受平台调度影响。
 
 首次启动时，Windows 会尝试迁移旧 Electron `anilog-state.json`。Android 仅在新状态为空时读取旧版 SharedPreferences 中的追番、待看任务和提醒设置；仅存在于旧 WebView localStorage 的已完成任务不能直接恢复，WebDAV 用户可从同步文件恢复完整数据。
 
@@ -49,7 +49,7 @@ npm run tauri:dev
 npm run tauri:dev:original
 
 cargo test --manifest-path src-tauri/Cargo.toml --features standard
-cargo check --manifest-path src-tauri/Cargo.toml --no-default-features --features original
+cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --features original
 ```
 
 Windows NSIS：
@@ -76,7 +76,7 @@ npx tauri android build --debug --target aarch64 `
   --features original --apk --ci
 ```
 
-两个 Android 变体会写入同一个 APK 输出路径，连续构建时后一个会覆盖前一个；发布脚本必须在每次构建后立即复制并使用明确的版本文件名。正式发布命令固定使用 `--target aarch64`，附件只允许包含 `arm64-v8a`。
+两个 Android 变体会写入同一个 APK 输出路径，连续构建时后一个会覆盖前一个；发布脚本必须在每次构建后立即复制并使用明确的版本文件名。正式发布命令固定使用 `--target aarch64`，正式 Release 附件只允许包含 `arm64-v8a`；Debug 配置可能保留多 ABI。
 
 ## 发布回归重点
 

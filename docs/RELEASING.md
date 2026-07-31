@@ -27,11 +27,13 @@ npm run tauri:android:build:original
 发布新版本前，至少检查以下位置：
 
 - `package.json` 与 `package-lock.json` 中的桌面版本号
-- `android/app/build.gradle` 中的 `versionCode` 和 `versionName`
-- Tauri 版本还需要检查 `src-tauri/tauri.conf.json` 中的 `version` 和 `bundle.android.versionCode`
+- `src-tauri/tauri.conf.json` 中的 `version` 和 `bundle.android.versionCode`
+- 生成的 `src-tauri/gen/android/tauri.properties` 与 `app/build.gradle.kts` 中最终写入的 Android 版本
 - Android 网络请求使用的 AniLog User-Agent 版本
 - README 中指向最新版 Android APK 的链接
 - `release-notes/vX.Y.Z.md` 发布说明
+
+`android/app/build.gradle` 属于 v0.5 Capacitor 回退工程，不是 Tauri 正式版的版本源。只有维护 v0.5 回退发布时才检查该文件。
 
 Android 每次发布必须增加 `versionCode`。覆盖升级还要求使用与旧版本相同的发布密钥。
 Tauri 的预发布标识不会自动产生不同的 Android `versionCode`，因此 beta、rc 和正式版也必须逐次手动增加 `bundle.android.versionCode`。
@@ -40,13 +42,16 @@ Tauri 的预发布标识不会自动产生不同的 Android `versionCode`，因�
 
 ## 2. 验证代码
 
-先安装锁定版本的依赖，再执行完整构建和测试： 
+先安装锁定版本的依赖，再执行 Tauri 正式版构建和测试：
 
 ```powershell
 npm ci
-npm run build:all
-npm run build:android
-npm run build:android-original
+npm run tauri:build
+npm run tauri:build:original
+npm run tauri:android:build
+npm run tauri:android:build:original
+cargo test --manifest-path src-tauri/Cargo.toml --features standard
+cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --features original
 npm run test:daily-task-reminder
 npm run test:editions
 npm run test:state-refresh
@@ -60,6 +65,8 @@ npm run test:data
 npm run test:bangumi
 npm audit --omit=dev --audit-level=high
 ```
+
+`build:all`、`build:android`、`build:android-original` 和 `dist:all` 仍保留给 v0.5 Electron/Capacitor 回退验证，不能作为 v0.6.0 Tauri 发布流程的替代命令。
 
 涉及 WebDAV 时，除自动测试外，建议使用测试账户完成一次 Windows 与 Android 双向同步验证。测试账户不得写入仓库。
 
@@ -100,9 +107,9 @@ npm run tauri:android:build:original
 使用 Android SDK Build Tools 验证签名、版本号和对齐状态：
 
 ```powershell
-apksigner verify --verbose --print-certs AniLog-Android-vX.Y.Z.apk
-aapt dump badging AniLog-Android-vX.Y.Z.apk
-zipalign -c -P 16 -v 4 AniLog-Android-vX.Y.Z.apk
+apksigner verify --verbose --print-certs AniLog-Android-vX.Y.Z-arm64-v8a.apk
+aapt dump badging AniLog-Android-vX.Y.Z-arm64-v8a.apk
+zipalign -c -P 16 -v 4 AniLog-Android-vX.Y.Z-arm64-v8a.apk
 ```
 
 确认 ZIP 中只存在 `lib/arm64-v8a/libanilog_lib.so`，不得包含 `armeabi-v7a`、`x86` 或 `x86_64`。同时确认签名证书指纹与上一个正式版本一致，并确认 `versionCode`、`versionName` 正确。
@@ -119,7 +126,7 @@ Get-FileHash -Algorithm SHA256 `
 
 把四个 SHA-256 值写入对应发布说明。
 
-仅发布原名版时，校验 `AniLog-Original-Setup-X.Y.Z.exe` 与 `AniLog-Original-Android-vX.Y.Z.apk` 两个文件即可。
+仅发布原名版时，校验 `AniLog-Original-Windows-vX.Y.Z-x64-setup.exe` 与 `AniLog-Original-Android-vX.Y.Z-arm64-v8a.apk` 两个文件即可。
 
 ## 6. 提交并发布
 
