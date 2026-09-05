@@ -128,6 +128,8 @@ export interface AppState {
   bangumiTitles: Record<string, BangumiTitleMatch>;
   lastSyncAt: number;
   syncMetadata: SyncMetadata;
+  bangumiSyncSettings?: BangumiSyncSettings;
+  bangumiSyncStatus?: BangumiSyncStatus;
   runtime?: {
     isDesktop: boolean;
     notificationsSupported: boolean;
@@ -183,3 +185,94 @@ declare global {
     animeTracker?: DesktopApi;
   }
 }
+
+// —— Bangumi 标准版迁移（Phase 0 schema 冻结）——
+export type BangumiConflictPolicy = 'latest' | 'local-first' | 'bangumi-first';
+export type BangumiMappingMethod = 'local' | 'external' | 'title-year' | 'manual';
+export type BangumiMappingConfidence = 'high' | 'medium' | 'low';
+export type BangumiEpisodeType = 'regular' | 'special' | 'movie' | 'ova' | 'unknown';
+export type BangumiLastChangedBy = 'local' | 'bangumi' | 'webdav';
+
+export interface BangumiSyncSettings {
+  apiBaseUrl: string;
+  syncEnabled: boolean;          // 默认 false
+  pullCollections: boolean;      // 默认 true
+  pushLocalChanges: boolean;     // 默认 false
+  pushCompletedEpisodes: boolean;// 默认 false
+  pullExternalStatus: boolean;   // 默认 true
+  conflictPolicy: BangumiConflictPolicy;
+  preferredBroadcastSites: string[]; // 默认 ["bangumi","ani_one","ani_one_asia","gamer","unext"]
+}
+
+export interface BangumiMapping {
+  method: BangumiMappingMethod;
+  confidence: BangumiMappingConfidence;
+  updatedAt: number; // 秒级时间戳（与 Rust 侧冻结单位一致；syncUpdatedAt 才用毫秒）
+}
+
+export interface BangumiAiringInfo {
+  nextEpisode?: number | null;
+  nextAiringAt?: number | null; // 秒级时间戳；四级来源解析后的结果
+}
+
+export interface BangumiSubjectRecord {
+  subjectId: number;      // 主键
+  source: 'bangumi';
+  title: string;
+  titleOriginal?: string | null;
+  titleRomaji?: string | null;
+  coverImage: string;
+  format?: string | null;
+  episodes?: number | null;
+  airing?: BangumiAiringInfo | null;
+  bangumiStatus?: string | null;  // wish/doing/done/on_hold/dropped
+  rating?: number | null;         // 个人评分 0-10
+  watchedEpisode?: number | null;
+  anilistId?: number | null;      // 兼容字段，可空
+  mapping?: BangumiMapping | null;
+  mappingPending?: boolean;       // 迁移中间态
+  lastPulledFromBangumiAt?: number | null;
+  lastPushedToBangumiAt?: number | null;
+  lastPulledPayloadHash?: string | null;
+  lastPushedPayloadHash?: string | null;
+  lastChangedBy?: BangumiLastChangedBy;
+  syncUpdatedAt?: number;
+}
+
+export interface BangumiEpisodeRecord {
+  id: string;              // "bgm-episode-{episodeId}" 或兼容旧 "{animeId}-{episode}"
+  subjectId?: number | null;      // 迁移中间态可为 null（与 Rust Option<i64> 一致）
+  episodeId?: number | null;      // 旧任务为 null
+  episodeNumber?: number | null;
+  episodeSortKey: string;         // 不假设整数
+  episodeType: BangumiEpisodeType;
+  title?: string | null;
+  status: 'pending' | 'completed';
+  completedAt?: number | null;
+  createdAt?: number;
+  animeId?: number | null;        // 旧任务兼容（AniList id）
+  airingAt?: number | null;
+  syncUpdatedAt?: number;
+  lastChangedBy?: BangumiLastChangedBy;
+}
+
+export interface BangumiSyncStatus { // 本地-only，绝不进坚果云文档
+  lastFullSyncAt?: number | null;
+  lastWebDavSyncAt?: number | null;
+  lastBangumiSyncAt?: number | null;
+  lastScheduleSyncAt?: number | null;
+  lastSyncError?: string | null;
+}
+
+export interface BangumiUserSummary {
+  id: number;
+  username: string;
+  nickname: string;
+  avatarUrl?: string | null;
+}
+
+// Phase 2 计划（主键迁移，当前不改动现有字段）：
+//   FollowedAnime 将新增可选字段 anilistId?: number | null、source?: 'anilist' | 'bangumi'、
+//   mapping?: BangumiMapping | null、subjectId?: number（迁移后作为主键来源）。
+//   WatchTask 将新增可选字段 episodeId?: number | null、episodeSortKey?: string、
+//   episodeType?: BangumiEpisodeType、subjectId?: number，并与 BangumiEpisodeRecord 对齐。
