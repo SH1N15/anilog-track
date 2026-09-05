@@ -1,0 +1,30 @@
+[
+  {
+    "id": 354529,
+    "type": 2,
+    "name": "Re:ゼロから始める異世界生活",
+    "name_cn": "Re:从零开始的异世界生活",
+    "images": {
+      "large": "https://lain.bgm.tv/pic/cover/l/1a/8e/124690_28X18.jpg",
+      "common": "https://lain.bgm.tv/pic/cover/c/1a/8e/124690_28X18.jpg",
+      "medium": "https://lain.bgm.tv/pic/cover/m/1a/8e/124690_28X18.jpg",
+      "small": "https://lain.bgm.tv/pic/cover/s/1a/8e/124690_28X18.jpg",
+      "grid": "https://lain.bgm.tv/pic/cover/g/1a/8e/124690_28X18.jpg"
+    },
+    "relation": "续集"
+  },
+  {
+    "id": 309685,
+    "type": 2,
+    "name": "リ:ゼロから始める異世界生活 2nd season 記憶の回廊",
+    "name_cn": "Re:从零开始的异世界生活 2nd season 记忆的回忆",
+    "images": {
+      "large": "https://lain.bgm.tv/pic/cover/l/2b/9f/309685_3Yx10.jpg",
+      "common": "https://lain.bgm.tv/pic/cover/c/2b/9f/309685_3Yx10.jpg",
+      "medium": "https://lain.bgm.tv/pic/cover/m/2b/9f/309685_3Yx10.jpg",
+      "small": "https://lain.bgm.tv/pic/cover/s/2b/9f/309685_3Yx10.jpg",
+      "grid": "https://lain.bgm.tv/pic/cover/g/2b/9f/309685_3Yx10.jpg"
+    },
+    "relation": "前传"
+  }
+]

@@ -1,0 +1,154 @@
+{
+  "version": 2,
+  "following": [
+    {
+      "id": 21355,
+      "title": {
+        "native": "Re:ゼロから始める異世界生活",
+        "romaji": "Re:ZERO -Starting Life in Another World-",
+        "english": "Re:ZERO -Starting Life in Another World-"
+      },
+      "displayTitle": "Re:ゼロから始める異世界生活",
+      "titleSource": "anilist",
+      "bangumiId": 354529,
+      "source": "bangumi",
+      "anilistId": 21355,
+      "mapping": {
+        "method": "external",
+        "confidence": "high",
+        "updatedAt": 1770000000000
+      },
+      "coverImage": "https://s4.anilist.co/file/anilistcdn/media/anime/cover/large/bx21355-8X7AYxNZvOaL.jpg",
+      "format": "TV",
+      "episodes": 25,
+      "seasonYear": 2016,
+      "startDate": { "year": 2016, "month": 4, "day": 4 },
+      "nextAiringEpisode": {
+        "episode": 13,
+        "airingAt": 1782298800,
+        "timeUntilAiring": 432000
+      },
+      "siteUrl": "https://anilist.co/anime/21355",
+      "followedAt": 1770000000000,
+      "syncUpdatedAt": 1770000000000
+    },
+    {
+      "id": 21,
+      "title": {
+        "native": "ONE PIECE",
+        "romaji": "ONE PIECE",
+        "english": "ONE PIECE"
+      },
+      "displayTitle": "ONE PIECE",
+      "titleSource": "anilist",
+      "coverImage": "https://s4.anilist.co/file/anilistcdn/media/anime/cover/large/nx21-aaeaeBZZlb0H.jpg",
+      "format": "TV",
+      "episodes": null,
+      "seasonYear": 1999,
+      "startDate": { "year": 1999, "month": 10, "day": 20 },
+      "nextAiringEpisode": null,
+      "siteUrl": "https://anilist.co/anime/21",
+      "followedAt": 1769000000000,
+      "syncUpdatedAt": 1769000000000
+    }
+  ],
+  "tasks": [
+    {
+      "id": "21355-1",
+      "animeId": 21355,
+      "animeTitle": "Re:ゼロから始める異世界生活",
+      "coverImage": "https://s4.anilist.co/file/anilistcdn/media/anime/cover/large/bx21355-8X7AYxNZvOaL.jpg",
+      "episode": 1,
+      "airingAt": 1782298800,
+      "status": "pending",
+      "createdAt": 1770000000,
+      "completedAt": null,
+      "syncUpdatedAt": 1770000000000
+    },
+    {
+      "id": "21355-2",
+      "animeId": 21355,
+      "animeTitle": "Re:ゼロから始める異世界生活",
+      "coverImage": "https://s4.anilist.co/file/anilistcdn/media/anime/cover/large/bx21355-8X7AYxNZvOaL.jpg",
+      "episode": 2,
+      "airingAt": 1782385200,
+      "status": "completed",
+      "createdAt": 1770000000,
+      "completedAt": 1770086400,
+      "syncUpdatedAt": 1770086400000
+    },
+    {
+      "id": "21-1",
+      "animeId": 21,
+      "animeTitle": "ONE PIECE",
+      "coverImage": "https://s4.anilist.co/file/anilistcdn/media/anime/cover/large/nx21-aaeaeBZZlb0H.jpg",
+      "episode": 1,
+      "airingAt": 940363200,
+      "status": "completed",
+      "createdAt": 1769000000,
+      "completedAt": 1769100000,
+      "syncUpdatedAt": 1769100000000
+    },
+    {
+      "id": "bgm-episode-98765",
+      "subjectId": 45678,
+      "episodeId": 98765,
+      "episodeNumber": 4,
+      "episodeSortKey": "4",
+      "episodeType": "regular",
+      "title": "第4話",
+      "status": "completed",
+      "completedAt": 1785312000,
+      "syncUpdatedAt": 1785312000000
+    }
+  ],
+  "seenAiringEvents": ["21355-1", "21355-2", "21-1"],
+  "bangumiTitles": {
+    "21355": {
+      "animeId": 21355,
+      "status": "matched",
+      "subjectId": 354529,
+      "name": "Re:ゼロから始める異世界生活",
+      "nameCn": "Re:从零开始的异世界生活",
+      "confidence": 92,
+      "source": "tauri-title",
+      "checkedAt": 1770000000,
+      "resolverVersion": 5
+    }
+  },
+  "settings": {
+    "uiLanguage": "zh-CN",
+    "pollIntervalMinutes": 5,
+    "launchAtLogin": false,
+    "minimizeToTray": true,
+    "showTrayIcon": true,
+    "notifyWhenAired": true,
+    "createWatchTasks": true,
+    "dailyTaskReminderEnabled": false,
+    "dailyTaskReminderTime": "20:00",
+    "bangumiApiBaseUrl": "https://sh1n.cc.cd/v0",
+    "titlePreference": "auto"
+  },
+  "bangumi": {
+    "apiBaseUrl": "",
+    "syncEnabled": false,
+    "pullCollections": true,
+    "pushLocalChanges": false,
+    "pushCompletedEpisodes": false,
+    "pullExternalStatus": true,
+    "conflictPolicy": "latest",
+    "preferredBroadcastSites": ["bangumi", "ani_one", "ani_one_asia", "gamer", "unext"]
+  },
+  "bangumiSyncStatus": {
+    "lastFullSyncAt": 1785300000,
+    "lastWebDavSyncAt": 1785290000,
+    "lastBangumiSyncAt": 1785300000,
+    "lastScheduleSyncAt": 1785299000,
+    "lastSyncError": null
+  },
+  "lastSyncAt": 1785300000,
+  "lastTaskReminderDate": "",
+  "syncMetadata": {
+    "followingDeletedAt": { "21": 1770000000000 }
+  }
+}

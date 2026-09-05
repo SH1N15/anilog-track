@@ -1,0 +1,52 @@
+[
+  {
+    "id": 12345,
+    "name": "エミリア",
+    "name_cn": "爱蜜莉雅",
+    "summary": "半精灵少女，拥有银色长发与紫色眼瞳。",
+    "type": 1,
+    "relation": "主角",
+    "images": {
+      "large": "https://lain.bgm.tv/pic/crt/l/00/00/12345_crt_Ab12C.jpg",
+      "medium": "https://lain.bgm.tv/pic/crt/m/00/00/12345_crt_Ab12C.jpg",
+      "small": "https://lain.bgm.tv/pic/crt/s/00/00/12345_crt_Ab12C.jpg",
+      "grid": "https://lain.bgm.tv/pic/crt/g/00/00/12345_crt_Ab12C.jpg"
+    },
+    "actors": [
+      {
+        "id": 6789,
+        "name": "高橋李依",
+        "type": 1,
+        "career": ["seiyu"],
+        "short_summary": "",
+        "locked": false,
+        "images": null
+      }
+    ]
+  },
+  {
+    "id": 12346,
+    "name": "レム",
+    "name_cn": "雷姆",
+    "summary": "罗兹瓦尔宅邸的双子女仆之一，蓝发短发少女。",
+    "type": 1,
+    "relation": "配角",
+    "images": {
+      "large": "https://lain.bgm.tv/pic/crt/l/00/00/12346_crt_Dd34E.jpg",
+      "medium": "https://lain.bgm.tv/pic/crt/m/00/00/12346_crt_Dd34E.jpg",
+      "small": "https://lain.bgm.tv/pic/crt/s/00/00/12346_crt_Dd34E.jpg",
+      "grid": "https://lain.bgm.tv/pic/crt/g/00/00/12346_crt_Dd34E.jpg"
+    },
+    "actors": [
+      {
+        "id": 6790,
+        "name": "水瀬いのり",
+        "type": 1,
+        "career": ["seiyu"],
+        "short_summary": "",
+        "locked": false,
+        "images": null
+      }
+    ]
+  }
+]

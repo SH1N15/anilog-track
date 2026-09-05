@@ -1,0 +1,55 @@
+{
+  "total": 3,
+  "limit": 100,
+  "offset": 0,
+  "data": [
+    {
+      "id": 98765,
+      "type": 0,
+      "name": "第4話",
+      "name_cn": "第4话",
+      "sort": 4,
+      "ep": 4,
+      "airdate": "2026-07-29",
+      "duration": "24m",
+      "desc": "昴再次回到起点，这一次他决定直面强欲。",
+      "disc": 0,
+      "subject_id": 45678,
+      "comment": 42,
+      "status": "Air",
+      "duration_seconds": 1440
+    },
+    {
+      "id": 98766,
+      "type": 1,
+      "name": "SP",
+      "name_cn": "特别篇",
+      "sort": 25,
+      "ep": 0,
+      "airdate": "",
+      "duration": "24m",
+      "desc": "",
+      "disc": 0,
+      "subject_id": 45678,
+      "comment": 3,
+      "status": "NA",
+      "duration_seconds": 1440
+    },
+    {
+      "id": 98767,
+      "type": 0,
+      "name": "第5話",
+      "name_cn": "第5话",
+      "sort": 5,
+      "ep": 5,
+      "airdate": "2026-08-05",
+      "duration": "24m",
+      "desc": "",
+      "disc": 0,
+      "subject_id": 45678,
+      "comment": 0,
+      "status": "Today",
+      "duration_seconds": 1440
+    }
+  ]
+}

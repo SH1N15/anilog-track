@@ -1,0 +1,31 @@
+{
+  "total": 2,
+  "limit": 30,
+  "offset": 0,
+  "data": [
+    {
+      "subject_id": 45678,
+      "subject_type": 2,
+      "rate": 8,
+      "type": 3,
+      "comment": "每周准时追，第3章节奏依然在线。",
+      "tags": ["2026夏", "追番中"],
+      "ep_status": 3,
+      "vol_status": 0,
+      "updated_at": "2026-08-01T12:00:00+08:00",
+      "private": false
+    },
+    {
+      "subject_id": 99999,
+      "subject_type": 2,
+      "rate": 0,
+      "type": 5,
+      "comment": "",
+      "tags": [],
+      "ep_status": 1,
+      "vol_status": 0,
+      "updated_at": "2026-07-20T21:30:00+08:00",
+      "private": false
+    }
+  ]
+}

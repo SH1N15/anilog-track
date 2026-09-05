@@ -1,0 +1,84 @@
+[
+  {
+    "weekday": { "id": 1, "en": "Mon", "cn": "星期一", "ja": "月耀日" },
+    "items": [
+      {
+        "id": 45678,
+        "name": "リ:ゼロから始める異世界生活 第3章",
+        "name_cn": "Re:从零开始的异世界生活 第3章",
+        "air_date": "2026-07-08",
+        "air_weekday": 1,
+        "images": {
+          "common": "https://lain.bgm.tv/pic/cover/c/00/00/45678_pL3cR.jpg"
+        },
+        "eps": 16,
+        "eps_count": 16,
+        "rating": { "total": 1234, "score": 8.2 },
+        "rank": 210,
+        "collection": { "wish": 500, "collect": 320, "doing": 2800, "on_hold": 45, "dropped": 12 },
+        "url": "https://bgm.tv/subject/45678",
+        "type": 2,
+        "summary": "菜月昴在第三次死亡回归后重新站起来的物语。"
+      },
+      {
+        "id": 45679,
+        "name": "サンプル月曜アニメ A",
+        "name_cn": "示例周一动画A",
+        "air_date": "2026-07-06",
+        "air_weekday": 1,
+        "images": {
+          "common": "https://lain.bgm.tv/pic/cover/c/00/00/45679_s3NqT.jpg"
+        },
+        "eps": 12,
+        "eps_count": 12,
+        "rating": { "total": 456, "score": 7.1 },
+        "rank": 1500,
+        "collection": { "wish": 220, "collect": 90, "doing": 1500, "on_hold": 20, "dropped": 8 },
+        "url": "https://bgm.tv/subject/45679",
+        "type": 2,
+        "summary": "合成测试条目，用于周一分组。"
+      }
+    ]
+  },
+  {
+    "weekday": { "id": 2, "en": "Tue", "cn": "星期二", "ja": "火耀日" },
+    "items": [
+      {
+        "id": 45680,
+        "name": "サンプル火曜アニメ B",
+        "name_cn": "示例周二动画B",
+        "air_date": "2026-07-07",
+        "air_weekday": 2,
+        "images": {
+          "common": "https://lain.bgm.tv/pic/cover/c/00/00/45680_kW9fZ.jpg"
+        },
+        "eps": 24,
+        "eps_count": 24,
+        "rating": { "total": 789, "score": 7.9 },
+        "rank": 640,
+        "collection": { "wish": 310, "collect": 150, "doing": 1900, "on_hold": 25, "dropped": 10 },
+        "url": "https://bgm.tv/subject/45680",
+        "type": 2,
+        "summary": "合成测试条目，用于周二分组。"
+      },
+      {
+        "id": 45681,
+        "name": "サンプル火曜アニメ C",
+        "name_cn": "示例周二动画C",
+        "air_date": "2026-07-07",
+        "air_weekday": 2,
+        "images": {
+          "common": "https://lain.bgm.tv/pic/cover/c/00/00/45681_dT2vL.jpg"
+        },
+        "eps": 13,
+        "eps_count": 13,
+        "rating": { "total": 230, "score": 6.5 },
+        "rank": 3200,
+        "collection": { "wish": 120, "collect": 60, "doing": 800, "on_hold": 15, "dropped": 5 },
+        "url": "https://bgm.tv/subject/45681",
+        "type": 2,
+        "summary": "合成测试条目，用于周二分组。"
+      }
+    ]
+  }
+]

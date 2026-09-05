@@ -30,6 +30,11 @@ compile_error!("Cargo features `standard` and `original` are mutually exclusive"
 #[cfg(not(any(feature = "standard", feature = "original")))]
 compile_error!("either Cargo feature `standard` or `original` must be enabled");
 
+// Bangumi 标准版核心模块（契约 C2）：仅 standard edition 编译，
+// Original 产物中不存在任何 Bangumi 代码。
+#[cfg(feature = "standard")]
+pub mod bangumi;
+
 #[cfg(target_os = "android")]
 mod mobile;
 
@@ -93,7 +98,7 @@ fn value_bool(value: Option<&Value>) -> bool {
 }
 
 fn default_state(original: bool) -> Value {
-    json!({
+    let state = json!({
         "version": STATE_VERSION,
         "following": [],
         "tasks": [],
@@ -115,7 +120,25 @@ fn default_state(original: bool) -> Value {
         "lastSyncAt": now_seconds(),
         "lastTaskReminderDate": "",
         "syncMetadata": { "followingDeletedAt": {} }
-    })
+    });
+    // Bangumi 设置块挂在顶层、与 settings 并列（schema 冻结决定）：
+    // 仅 standard 版写入；merge_defaults 依赖 default_state 的键集合自动补齐
+    // 旧 v2 状态缺失的 bangumi 块，Original 因此永不补该键。
+    #[cfg(feature = "standard")]
+    let state = {
+        let mut state = state;
+        if !original {
+            if let Some(object) = state.as_object_mut() {
+                object.insert(
+                    "bangumi".into(),
+                    serde_json::to_value(bangumi::BangumiSyncSettings::default())
+                        .unwrap_or_else(|_| json!({})),
+                );
+            }
+        }
+        state
+    };
+    state
 }
 
 fn merge_defaults(mut loaded: Value, original: bool) -> Value {
@@ -1332,12 +1355,48 @@ fn offline_format_matches(anime_format: &str, candidate_format: &str) -> bool {
     )
 }
 
-fn offline_bangumi_match(map: &Value, anime: &Value, checked_at: i64) -> Option<Value> {
-    let mapped = map.get(value_i64(anime.get("id")).to_string())?;
-    let candidates = mapped
-        .as_array()
+// Look up a single subject entry directly by its Bangumi subject id in the
+// offline map (v2 `bySubject`). Returns a copy of the stored entry, which
+// carries `b/a/c/t/d/f/begin/broadcast/sites`. Consumed by the online-rebind
+// path in Phase 2; exposed now so the mapping contract is unit tested.
+#[allow(dead_code)]
+pub(crate) fn offline_bangumi_subject(map: &Value, subject_id: i64) -> Option<Value> {
+    map.get("bySubject")?
+        .get(&subject_id.to_string())
         .cloned()
-        .unwrap_or_else(|| vec![mapped.clone()]);
+}
+
+// Collect the bySubject candidates associated with an AniList id. The v2 map
+// keys candidates by subject id and only records one representative per
+// anilist id in `anilistIndex`, so recover every subject entry whose `a`
+// (associated anilist id) matches to preserve the previous multi-candidate
+// ranking behaviour. Falls back to the representative index entry when the
+// scan finds no direct `a` match.
+fn offline_anilist_candidates(map: &Value, anilist_id: i64) -> Vec<Value> {
+    let Some(by_subject) = map.get("bySubject").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let mut candidates: Vec<Value> = by_subject
+        .values()
+        .filter(|entry| value_i64(entry.get("a")) == anilist_id)
+        .cloned()
+        .collect();
+    if candidates.is_empty() {
+        if let Some(subject_id) = map
+            .get("anilistIndex")
+            .and_then(|index| index.get(anilist_id.to_string()))
+            .and_then(Value::as_i64)
+        {
+            if let Some(entry) = by_subject.get(&subject_id.to_string()) {
+                candidates.push(entry.clone());
+            }
+        }
+    }
+    candidates
+}
+
+fn offline_bangumi_match(map: &Value, anime: &Value, checked_at: i64) -> Option<Value> {
+    let candidates = offline_anilist_candidates(map, value_i64(anime.get("id")));
     if candidates.is_empty() {
         return None;
     }
@@ -2796,12 +2855,152 @@ mod tests {
         assert_eq!(default_state(true)["settings"]["bangumiApiBaseUrl"], "");
     }
 
+    // 回归锁定（schema §9）：Bangumi 设置块等 additive 字段绝不进坚果云文档，
+    // document_from_state 输出恰好 {version, updatedAt, following, tasks,
+    // followingDeletedAt} 五键。
+    #[cfg(feature = "standard")]
+    #[test]
+    fn document_from_state_excludes_bangumi_block_and_device_fields() {
+        let mut state = default_state(false);
+        state["bangumi"] = json!({"syncEnabled": true, "apiBaseUrl": "https://proxy.example.com/v0"});
+        state["bangumiTitles"]["1"] = json!({"status": "matched", "nameCn": "中文"});
+        state["seenAiringEvents"] = json!(["1-1"]);
+        state["lastSyncAt"] = json!(123);
+        state["settings"]["pollIntervalMinutes"] = json!(15);
+
+        let document = document_from_state(&mut state);
+
+        let mut keys: Vec<&str> = document
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "following",
+                "followingDeletedAt",
+                "tasks",
+                "updatedAt",
+                "version"
+            ]
+        );
+        assert_eq!(document["version"], SYNC_VERSION);
+    }
+
+    #[cfg(feature = "standard")]
+    #[test]
+    fn default_state_writes_bangumi_block_only_for_standard() {
+        let standard = default_state(false);
+        let keys: Vec<String> = standard["bangumi"]
+            .as_object()
+            .expect("standard default state must carry a bangumi block")
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(keys.len(), 8);
+        assert_eq!(standard["bangumi"]["conflictPolicy"], "latest");
+
+        let original = default_state(true);
+        assert!(original.get("bangumi").is_none());
+    }
+
+    #[cfg(feature = "standard")]
+    fn embedded_bangumi_map() -> Value {
+        serde_json::from_str(include_str!(concat!(env!("OUT_DIR"), "/bangumi-map.json")))
+            .expect("parse embedded bangumi map")
+    }
+
+    #[cfg(feature = "standard")]
+    #[test]
+    fn embedded_bangumi_map_is_version_2() {
+        let map = embedded_bangumi_map();
+        assert_eq!(map["version"], 2);
+        assert!(map["bySubject"].is_object());
+        assert!(map["anilistIndex"].is_object());
+        assert!(!map["bySubject"].as_object().unwrap().is_empty());
+        assert!(!map["anilistIndex"].as_object().unwrap().is_empty());
+    }
+
+    #[cfg(feature = "standard")]
+    #[test]
+    fn embedded_bangumi_map_carries_schedule_metadata() {
+        let map = embedded_bangumi_map();
+        let by_subject = map["bySubject"].as_object().unwrap();
+        let mut iso_parsed = 0;
+        let mut recurrence = 0;
+        for entry in by_subject.values() {
+            // Item-level begin must be a parseable ISO8601 timestamp.
+            if let Some(begin) = entry["begin"].as_str() {
+                let normalized = begin.replace('Z', "+00:00");
+                assert!(
+                    chrono::DateTime::parse_from_rfc3339(&normalized).is_ok(),
+                    "begin not ISO8601: {begin}"
+                );
+                iso_parsed += 1;
+            }
+            // A broadcast (item-level or any site) is a "R/..." recurrence.
+            let site_bc = entry["sites"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|site| site["broadcast"].as_str());
+            let has_recurrence = entry["broadcast"]
+                .as_str()
+                .into_iter()
+                .chain(site_bc)
+                .any(|value| value.starts_with("R/"));
+            if has_recurrence {
+                recurrence += 1;
+            }
+            // Every site begin/broadcast that is present is ISO8601 / "R/" form.
+            if let Some(sites) = entry["sites"].as_array() {
+                for site in sites {
+                    if let Some(begin) = site["begin"].as_str() {
+                        let normalized = begin.replace('Z', "+00:00");
+                        assert!(
+                            chrono::DateTime::parse_from_rfc3339(&normalized).is_ok(),
+                            "site begin not ISO8601: {begin}"
+                        );
+                    }
+                    if let Some(broadcast) = site["broadcast"].as_str() {
+                        assert!(
+                            broadcast.starts_with("R/"),
+                            "site broadcast not a recurrence: {broadcast}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            iso_parsed > by_subject.len() / 2,
+            "majority of entries should carry begin; got {iso_parsed} of {}",
+            by_subject.len()
+        );
+        assert!(recurrence > 0, "expected some broadcast recurrences");
+    }
+
+    #[cfg(feature = "standard")]
+    #[test]
+    fn offline_bangumi_subject_resolves_by_subject_id() {
+        let map = embedded_bangumi_map();
+        // Re:Zero's Bangumi subject id is 140001; direct lookup must return the
+        // entry and it must agree with the anilistIndex mapping.
+        let subject_id = value_i64(map["anilistIndex"].get("21355"));
+        assert!(subject_id > 0);
+        let entry = offline_bangumi_subject(&map, subject_id).expect("subject entry");
+        assert_eq!(value_i64(entry.get("b")), subject_id);
+        assert_eq!(value_i64(entry.get("a")), 21355);
+        assert_eq!(value_string(entry.get("c")), "Re：从零开始的异世界生活");
+        assert!(offline_bangumi_subject(&map, -1).is_none());
+    }
+
     #[cfg(feature = "standard")]
     #[test]
     fn embedded_bangumi_data_resolves_anilist_ids_without_network() {
-        let map: Value =
-            serde_json::from_str(include_str!(concat!(env!("OUT_DIR"), "/bangumi-map.json")))
-                .unwrap();
+        let map = embedded_bangumi_map();
         let anime = json!({
             "id": 21355,
             "title": {
@@ -2818,6 +3017,18 @@ mod tests {
         assert_eq!(matched["status"], "matched");
         assert_eq!(matched["nameCn"], "Re：从零开始的异世界生活");
         assert_eq!(matched["source"], "bangumi-data-anilist-id");
+    }
+
+    #[cfg(feature = "original")]
+    #[test]
+    fn original_embedded_bangumi_map_is_empty_version_2() {
+        let map: Value =
+            serde_json::from_str(include_str!(concat!(env!("OUT_DIR"), "/bangumi-map.json")))
+                .expect("parse embedded bangumi map");
+        assert_eq!(map["version"], 2);
+        assert_eq!(map["bySubject"].as_object().map_or(0, |m| m.len()), 0);
+        assert_eq!(map["anilistIndex"].as_object().map_or(0, |m| m.len()), 0);
+        assert!(offline_bangumi_subject(&map, 1).is_none());
     }
 
     #[test]

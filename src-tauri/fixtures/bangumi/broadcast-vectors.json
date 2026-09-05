@@ -1,0 +1,58 @@
+{
+  "comment": "Golden vectors for broadcast/next-airing resolution. Convention: RFC5545 rule 'R/<start>/P7D' emits occurrences every 7 days from the <start> instant (exact UTC arithmetic, weekday-agnostic). The expected value is the FIRST occurrence strictly after nowLocalISO, then re-expressed in the same wall-clock timezone offset as nowLocalISO. All expected values were computed explicitly in UTC then written down. All data is synthetic.",
+  "vectors": [
+    {
+      "name": "weekly-rfc5545-utc",
+      "begin": "2026-07-08T13:00:22Z",
+      "broadcast": "R/2026-07-08T13:00:22.000Z/P7D",
+      "nowLocalISO": "2026-07-20T00:00:00+08:00",
+      "expectedNextLocal": "2026-07-22T21:00:22+08:00",
+      "note": "UTC start 13:00:22Z -> next Wed-cycle after ref (UTC 2026-07-19T16:00:00Z) is 2026-07-22T13:00:22Z, rendered in the reference timezone +08:00."
+    },
+    {
+      "name": "movie-begin-only-no-broadcast",
+      "begin": "2026-09-12T10:30:00Z",
+      "broadcast": null,
+      "nowLocalISO": "2026-09-01T00:00:00+08:00",
+      "expectedNextLocal": "2026-09-12T18:30:00+08:00",
+      "note": "No broadcast rule: treat begin as a one-shot airing. 2026-09-12T10:30:00Z converted to +08:00."
+    },
+    {
+      "name": "fallback-to-site-ani-one",
+      "begin": null,
+      "broadcast": null,
+      "sites": [
+        { "site": "gamer", "id": "10551", "begin": null, "broadcast": null },
+        { "site": "ani_one", "id": "G8W68WD7Z", "begin": "2026-07-08T21:00:00+08:00", "broadcast": "R/2026-07-08T21:00:00.000+08:00/P7D" }
+      ],
+      "preferredSites": ["bangumi", "ani_one", "gamer"],
+      "nowLocalISO": "2026-07-19T00:00:00+08:00",
+      "expectedNextLocal": "2026-07-22T21:00:00+08:00",
+      "note": "Item has no begin/broadcast; selected site ani_one (present in preferredSites) supplies the rule. Next 7-day occurrence after ref is 2026-07-22T21:00:00+08:00."
+    },
+    {
+      "name": "cross-year-boundary",
+      "begin": "2026-12-30T15:00:00Z",
+      "broadcast": "R/2026-12-30T15:00:00.000Z/P7D",
+      "nowLocalISO": "2026-12-31T00:00:00+08:00",
+      "expectedNextLocal": "2027-01-06T23:00:00+08:00",
+      "note": "Reference UTC 2026-12-30T16:00:00Z is after the first occurrence; next cycle is 2027-01-06T15:00:00Z which crosses the year, rendered +08:00."
+    },
+    {
+      "name": "begin-with-milliseconds",
+      "begin": "2026-07-08T13:00:22.480Z",
+      "broadcast": "R/2026-07-08T13:00:22.480Z/P7D",
+      "nowLocalISO": "2026-07-19T00:00:00+08:00",
+      "expectedNextLocal": "2026-07-22T21:00:22.480+08:00",
+      "note": "Sub-second milliseconds preserved through the 7-day arithmetic: 2026-07-22T13:00:22.480Z -> +08:00."
+    },
+    {
+      "name": "begin-non-utc-offset-jst",
+      "begin": "2026-07-08T22:00:00+09:00",
+      "broadcast": "R/2026-07-08T22:00:00.000+09:00/P7D",
+      "nowLocalISO": "2026-07-19T00:00:00+08:00",
+      "expectedNextLocal": "2026-07-22T21:00:00+08:00",
+      "note": "Start given in +09:00 (JST) = 13:00Z; next cycle 2026-07-22T13:00:00Z re-expressed in reference tz +08:00."
+    }
+  ]
+}

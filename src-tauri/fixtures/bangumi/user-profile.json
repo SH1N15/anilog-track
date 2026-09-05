@@ -1,0 +1,15 @@
+{
+  "id": 876543,
+  "username": "anilog_dev",
+  "nickname": "阿罗",
+  "user_group": 10,
+  "avatar": {
+    "large": "https://lain.bgm.tv/pic/user/l/000/87/65/876543.jpg?r=1700000000",
+    "medium": "https://lain.bgm.tv/pic/user/m/000/87/65/876543.jpg?r=1700000000",
+    "small": "https://lain.bgm.tv/pic/user/s/000/87/65/876543.jpg?r=1700000000"
+  },
+  "sign": "",
+  "email": "anilog@example.invalid",
+  "reg_time": "2020-01-01T08:00:00+08:00",
+  "time_offset": 8
+}

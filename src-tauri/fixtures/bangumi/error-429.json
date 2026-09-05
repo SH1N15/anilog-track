@@ -1,0 +1,5 @@
+{
+  "title": "Too Many Requests",
+  "description": "请求过于频繁，请稍后再试并遵守 Retry-After",
+  "details": "rate limit exceeded"
+}

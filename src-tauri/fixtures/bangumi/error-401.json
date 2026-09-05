@@ -1,0 +1,5 @@
+{
+  "title": "Unauthorized",
+  "description": "需要有效的 Access Token 才能访问该资源",
+  "details": "authorization required"
+}

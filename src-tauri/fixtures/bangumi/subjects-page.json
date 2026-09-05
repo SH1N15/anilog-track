@@ -1,0 +1,96 @@
+{
+  "total": 2,
+  "limit": 50,
+  "offset": 0,
+  "data": [
+    {
+      "id": 45678,
+      "type": 2,
+      "name": "リ:ゼロから始める異世界生活 第3章",
+      "name_cn": "Re:从零开始的异世界生活 第3章",
+      "summary": "第三次死亡回归之后，菜月昴再次赌上性命的物语。",
+      "series": false,
+      "nsfw": false,
+      "locked": false,
+      "date": "2026-07-08",
+      "platform": "TV",
+      "images": {
+        "large": "https://lain.bgm.tv/pic/cover/l/00/00/45678_pL3cR.jpg",
+        "common": "https://lain.bgm.tv/pic/cover/c/00/00/45678_pL3cR.jpg",
+        "medium": "https://lain.bgm.tv/pic/cover/m/00/00/45678_pL3cR.jpg",
+        "small": "https://lain.bgm.tv/pic/cover/s/00/00/45678_pL3cR.jpg",
+        "grid": "https://lain.bgm.tv/pic/cover/g/00/00/45678_pL3cR.jpg"
+      },
+      "infobox": [
+        { "key": "简体中文名", "value": "Re:从零开始的异世界生活 第3章" },
+        { "key": "放送开始", "value": "2026年7月8日" },
+        { "key": "放送星期", "value": "星期三" },
+        { "key": "播放电视台", "value": "TOKYO MX" }
+      ],
+      "volumes": 0,
+      "eps": 16,
+      "total_episodes": 16,
+      "rating": {
+        "rank": 210,
+        "total": 1234,
+        "count": { "1": 2, "2": 3, "3": 5, "4": 12, "5": 30, "6": 95, "7": 260, "8": 420, "9": 280, "10": 127 },
+        "score": 8.2
+      },
+      "collection": {
+        "wish": 500,
+        "collect": 320,
+        "doing": 2800,
+        "on_hold": 45,
+        "dropped": 12
+      },
+      "meta_tags": ["2026年7月", "TV动画"],
+      "tags": [
+        { "name": "Re:Zero", "count": 100, "total_count": 4200 },
+        { "name": "2026年7月", "count": 88, "total_count": 15600 }
+      ]
+    },
+    {
+      "id": 45682,
+      "type": 2,
+      "name": "サンプルアニメ 2026年夏",
+      "name_cn": "示例动画 2026年夏",
+      "summary": "用于分页 fixture 的第二条合成记录。",
+      "series": false,
+      "nsfw": false,
+      "locked": false,
+      "date": "2026-07-10",
+      "platform": "TV",
+      "images": {
+        "large": "https://lain.bgm.tv/pic/cover/l/00/00/45682_kW9fZ.jpg",
+        "common": "https://lain.bgm.tv/pic/cover/c/00/00/45682_kW9fZ.jpg",
+        "medium": "https://lain.bgm.tv/pic/cover/m/00/00/45682_kW9fZ.jpg",
+        "small": "https://lain.bgm.tv/pic/cover/s/00/00/45682_kW9fZ.jpg",
+        "grid": "https://lain.bgm.tv/pic/cover/g/00/00/45682_kW9fZ.jpg"
+      },
+      "infobox": [
+        { "key": "简体中文名", "value": "示例动画 2026年夏" },
+        { "key": "放送开始", "value": "2026年7月10日" }
+      ],
+      "volumes": 0,
+      "eps": 12,
+      "total_episodes": 12,
+      "rating": {
+        "rank": 1500,
+        "total": 234,
+        "count": { "1": 0, "2": 1, "3": 4, "4": 8, "5": 20, "6": 55, "7": 78, "8": 44, "9": 18, "10": 6 },
+        "score": 7.0
+      },
+      "collection": {
+        "wish": 220,
+        "collect": 90,
+        "doing": 1500,
+        "on_hold": 20,
+        "dropped": 8
+      },
+      "meta_tags": ["2026年7月"],
+      "tags": [
+        { "name": "2026年7月", "count": 42, "total_count": 15600 }
+      ]
+    }
+  ]
+}

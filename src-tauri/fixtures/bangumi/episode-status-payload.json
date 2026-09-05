@@ -1,0 +1,15 @@
+{
+  "singleEpisodePut": {
+    "endpoint": "PUT /v0/users/-/collections/-/episodes/{episode_id}",
+    "body": {
+      "type": 2
+    }
+  },
+  "batchEpisodesPatch": {
+    "endpoint": "PATCH /v0/users/-/collections/{subject_id}/episodes",
+    "body": {
+      "episode_id": [98765, 98766],
+      "type": 2
+    }
+  }
+}
