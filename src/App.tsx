@@ -6,6 +6,7 @@ import {
   CalendarRange,
   Check,
   CheckCircle2,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
   Circle,
@@ -109,6 +110,24 @@ function followingGroupOf(item: FollowedAnime): 'doing' | 'wish' | 'on_hold' | '
   return 'doing';
 }
 const BANGUMI_RATING_OPTIONS = Array.from({ length: 11 }, (_, value) => value);
+// 问题 4：状态分组折叠记忆（独立 key，按 edition 区分，沿用 anilog-ui-state 的读写模式）。
+const FOLLOW_GROUPS_KEY = IS_ORIGINAL_EDITION ? 'anilog-original-follow-groups' : 'anilog-follow-groups';
+type FollowingGroupKey = 'doing' | 'wish' | 'on_hold' | 'done';
+// 默认：在看展开，想看/搁置/看完收起。
+const FOLLOW_GROUPS_DEFAULT_COLLAPSED: Record<FollowingGroupKey, boolean> = { doing: false, wish: true, on_hold: true, done: true };
+
+function loadCollapsedGroups(): Record<FollowingGroupKey, boolean> {
+  try {
+    const saved = JSON.parse(localStorage.getItem(FOLLOW_GROUPS_KEY) || '{}');
+    const next = { ...FOLLOW_GROUPS_DEFAULT_COLLAPSED };
+    (Object.keys(FOLLOW_GROUPS_DEFAULT_COLLAPSED) as FollowingGroupKey[]).forEach((key) => {
+      if (typeof saved[key] === 'boolean') next[key] = saved[key];
+    });
+    return next;
+  } catch {
+    return { ...FOLLOW_GROUPS_DEFAULT_COLLAPSED };
+  }
+}
 // Bangumi SubjectCollectionType（1 wish / 2 done / 3 doing / 4 on_hold / 5 dropped）→ 建议列表展示名。
 const BANGUMI_SUGGESTION_TYPE_LABELS: Record<number, string> = { 1: '想看', 2: '看过', 3: '在看', 4: '搁置', 5: '弃番' };
 
@@ -258,7 +277,34 @@ function App() {
   };
 
   // 问题 2/4：回调稳定化 + 跨键追番索引（id / anilistId / bangumiId 任一命中即视为已追）。
-  const toggleFollowAnime = useCallback(async (item: Anime) => setState(await api.toggleFollow(item)), []);
+  // 问题 2：卡片开关的即时反馈（顶栏同步消息）与请求期间防连点；成功/失败都会落到 lastSyncMessage。
+  const [followBusyKeys, setFollowBusyKeys] = useState<ReadonlySet<number>>(new Set());
+  const toggleFollowAnime = useCallback(async (item: Anime) => {
+    const busyKeys = new Set<number>([item.id]);
+    if (typeof item.bangumiSubjectId === 'number') busyKeys.add(item.bangumiSubjectId);
+    if (typeof item.anilistId === 'number') busyKeys.add(item.anilistId);
+    setFollowBusyKeys((prev) => new Set([...prev, ...busyKeys]));
+    try {
+      const next = await api.toggleFollow(item);
+      setState(next);
+      const title = titleOf(item.title, language);
+      const followedNow = next.following.some((entry) => entry.id === item.id
+        || entry.anilistId === item.id
+        || (typeof item.bangumiSubjectId === 'number' && entry.bangumiId === item.bangumiSubjectId)
+        || (typeof item.anilistId === 'number' && entry.anilistId === item.anilistId));
+      setLastSyncMessage(followedNow
+        ? t(`已加入追番《${title}》`, `Following “${title}”`)
+        : t(`已取消追番《${title}》`, `Unfollowed “${title}”`));
+    } catch (reason) {
+      setLastSyncMessage(reason instanceof Error ? localizeMessage(reason.message, language) : t('追番操作失败', 'Follow action failed'));
+    } finally {
+      setFollowBusyKeys((prev) => {
+        const rest = new Set(prev);
+        busyKeys.forEach((key) => rest.delete(key));
+        return rest;
+      });
+    }
+  }, [language]);
   const followedKeys = useMemo(() => {
     const keys = new Set<number>();
     state.following.forEach((item) => {
@@ -359,6 +405,7 @@ function App() {
               year={year}
               seasonView={seasonView}
               followedKeys={followedKeys}
+              followBusyKeys={followBusyKeys}
               titleMatches={state.bangumiTitles}
               titlePreference={state.settings.titlePreference}
               language={language}
@@ -385,15 +432,21 @@ function App() {
                   ? t(`取消追番后将移除 ${pendingTaskCount} 个待看任务，已完成记录会保留。`, `Unfollowing will remove ${pendingTaskCount} pending task${pendingTaskCount === 1 ? '' : 's'}. Completed history will be kept.`)
                   : t('取消追番后，已完成记录会保留。', 'Completed history will be kept after unfollowing.');
                 if (!window.confirm(t(`确认取消追番《${followed.displayTitle}》吗？\n\n${taskNotice}`, `Unfollow “${followed.displayTitle}”?\n\n${taskNotice}`))) return;
-                if (source) setState(await api.toggleFollow(source));
-                // Bangumi 条目可能不在当前季度列表里；fabricate 的对象需带全标识字段（id 可为 subjectId）。
-                else setState(await api.toggleFollow({
-                  ...followed,
-                  coverImage: { medium: followed.coverImage },
-                  source: followed.source || 'anilist',
-                  bangumiSubjectId: followed.bangumiId ?? (followed.source === 'bangumi' ? followed.id : null),
-                  anilistId: followed.anilistId ?? null,
-                }));
+                // 问题 2：失败也要落到顶栏消息（未处理 rejection 会让卡片停留在陈旧状态）。
+                try {
+                  if (source) setState(await api.toggleFollow(source));
+                  // Bangumi 条目可能不在当前季度列表里；fabricate 的对象需带全标识字段（id 可为 subjectId）。
+                  else setState(await api.toggleFollow({
+                    ...followed,
+                    coverImage: { medium: followed.coverImage },
+                    source: followed.source || 'anilist',
+                    bangumiSubjectId: followed.bangumiId ?? (followed.source === 'bangumi' ? followed.id : null),
+                    anilistId: followed.anilistId ?? null,
+                  }));
+                  setLastSyncMessage(t(`已取消追番《${followed.displayTitle}》`, `Unfollowed “${followed.displayTitle}”`));
+                } catch (reason) {
+                  setLastSyncMessage(reason instanceof Error ? localizeMessage(reason.message, language) : t('取消追番失败', 'Unfollow failed'));
+                }
               }}
               onConfirmMapping={async (animeId, subjectId) => {
                 if (api.bangumiConfirmMapping) setState(await api.bangumiConfirmMapping({ animeId, subjectId }));
@@ -453,6 +506,7 @@ function SeasonView({
   year,
   seasonView,
   followedKeys,
+  followBusyKeys,
   titleMatches,
   titlePreference,
   language,
@@ -470,6 +524,7 @@ function SeasonView({
   year: number;
   seasonView: SeasonViewMode;
   followedKeys: Set<number>;
+  followBusyKeys: ReadonlySet<number>;
   titleMatches: Record<string, BangumiTitleMatch>;
   titlePreference: AppSettings['titlePreference'];
   language: UiLanguage;
@@ -538,6 +593,7 @@ function SeasonView({
       titlePreference={titlePreference}
       language={language}
       followed={isFollowed(item)}
+      followBusy={followBusyKeys.has(item.id)}
       onVisible={requestChineseTitle}
       onOpen={openAnime}
       onToggle={toggleFollowCard}
@@ -660,6 +716,7 @@ const AnimeCard = memo(function AnimeCard({
   titlePreference,
   language,
   followed,
+  followBusy,
   onOpen,
   onToggle,
   onVisible,
@@ -669,6 +726,7 @@ const AnimeCard = memo(function AnimeCard({
   titlePreference: AppSettings['titlePreference'];
   language: UiLanguage;
   followed: boolean;
+  followBusy: boolean;
   onOpen: (anime: Anime) => void;
   onToggle: (anime: Anime) => void;
   onVisible: (anime: Anime) => void;
@@ -717,7 +775,7 @@ const AnimeCard = memo(function AnimeCard({
           <Clock3 size={15} />
           <span>{next ? t(`第 ${next.episode} 集 · ${formatAiring(next.airingAt, true, language)}`, `Episode ${next.episode} · ${formatAiring(next.airingAt, true, language)}`) : anime.status === 'FINISHED' ? t('本季已完结', 'Finished') : t('更新时间待定', 'Schedule TBA')}</span>
         </div>
-        <button className={`follow-button ${followed ? 'followed' : ''}`} onClick={() => onToggle(anime)}>
+        <button className={`follow-button ${followed ? 'followed' : ''}`} disabled={followBusy} onClick={() => onToggle(anime)}>
           {followed ? <Check size={17} /> : <Bell size={17} />}
           {followed ? t('已加入追番', 'Following') : t('加入追番', 'Follow')}
         </button>
@@ -950,7 +1008,19 @@ function FollowingView({
   const [statusBusyId, setStatusBusyId] = useState<number | null>(null);
   const [resolutions, setResolutions] = useState<Record<number, BangumiMappingResolution>>({});
   const requestedMappings = useRef(new Set<number>());
+  // 问题 4：状态分组折叠（在看默认展开，其余默认收起；跨会话记忆在 localStorage）。
+  const [collapsedGroups, setCollapsedGroups] = useState<Record<FollowingGroupKey, boolean>>(loadCollapsedGroups);
   const pendingItems = items.filter((item) => item.mappingPending === true);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(FOLLOW_GROUPS_KEY, JSON.stringify(collapsedGroups));
+    } catch { /* 存储不可用时忽略，仅影响跨会话记忆 */ }
+  }, [collapsedGroups]);
+
+  const toggleGroupCollapse = (key: FollowingGroupKey) => {
+    setCollapsedGroups((prev) => ({ ...prev, [key]: !prev[key] }));
+  };
 
   // Phase 3：Bangumi 条目的行内评分变更；subjectId 取 bangumiId，Bangumi 来源条目回落主键 id。
   const handleSetRating = async (item: FollowedAnime, subjectId: number, value: string) => {
@@ -1030,6 +1100,9 @@ function FollowingView({
     }))
     .filter((group) => group.items.length > 0);
 
+  // 问题 1：追踪中 = bangumiStatus 为空或 doing（wish/on_hold/done 不自动建任务；dropped 本就不在列表）。
+  const trackingCount = items.filter((item) => followingGroupOf(item) === 'doing').length;
+
   const renderFollowingRow = (item: FollowedAnime) => {
     // Phase 3：standard 下 Bangumi 条目（source='bangumi' 或带 bangumiId）提供行内评分、状态徽章与状态下拉。
     const bangumiSubjectId = !IS_ORIGINAL_EDITION && (item.source === 'bangumi' || typeof item.bangumiId === 'number')
@@ -1097,6 +1170,7 @@ function FollowingView({
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 4, fontSize: 12 }}>
             <label style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
               <select
+                className="entry-select status-select"
                 value={item.bangumiStatus || 'doing'}
                 disabled={statusBusyId === item.id}
                 aria-label={t(`调整 ${item.displayTitle} 的状态`, `Set status for ${item.displayTitle}`)}
@@ -1108,6 +1182,7 @@ function FollowingView({
             <label style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
               <Star size={13} />
               <select
+                className="entry-select rating-select"
                 value={item.rating == null ? '' : String(item.rating)}
                 disabled={ratingBusyId === item.id}
                 aria-label={t(`评分 ${item.displayTitle}`, `Rate ${item.displayTitle}`)}
@@ -1138,23 +1213,38 @@ function FollowingView({
   return (
     <>
       <section className="section-heading compact">
-        <div><div className="eyebrow"><BellRing size={14} /> {t('自动跟踪', 'Automatic tracking')}</div><h2>{t('正在追的番剧', 'Currently following')}</h2><p>{t(`${items.length} 部作品会在播出后自动创建观看任务。`, `${items.length} title${items.length === 1 ? '' : 's'} will create watch tasks after airing.`)}</p></div>
+        {/* 问题 1：头部计数只算「追踪中」条目（bangumiStatus 为空或 doing；wish/on_hold/done 不自动建任务）。 */}
+        <div><div className="eyebrow"><BellRing size={14} /> {t('自动跟踪', 'Automatic tracking')}</div><h2>{t('正在追的番剧', 'Currently following')}</h2><p>{t(`${trackingCount} 部作品会在播出后自动创建观看任务。`, `${trackingCount} actively tracked title${trackingCount === 1 ? '' : 's'} will create watch tasks after airing.`)}</p></div>
         <button className="secondary-button" onClick={onOpenTasks}><ListChecks size={17} /> {t('查看任务', 'View tasks')}</button>
       </section>
       {items.length === 0 || groups.length === 0 ? (
         <EmptyState icon={Bell} title={t('还没有添加追番', 'Nothing followed yet')} body={t('到季度新番中选择作品，更新提醒会自动开启。', 'Choose a title from Seasonal Anime to enable update alerts.')} />
       ) : (
-        groups.map((group) => (
-          <section key={group.key} className="following-group" aria-label={t(...group.label)}>
-            <header className="following-group-heading">
-              <h3>{t(...group.label)}</h3>
-              <span>{t(`${group.items.length} 部`, `${group.items.length} title${group.items.length === 1 ? '' : 's'}`)}</span>
-            </header>
-            <div className="following-list">
-              {group.items.map(renderFollowingRow)}
-            </div>
-          </section>
-        ))
+        groups.map((group) => {
+          const collapsed = collapsedGroups[group.key];
+          return (
+            <section key={group.key} className="following-group" aria-label={t(...group.label)}>
+              <header className="following-group-heading">
+                <button
+                  type="button"
+                  className="following-group-toggle"
+                  aria-expanded={!collapsed}
+                  aria-label={t(`折叠或展开 ${t(...group.label)} 分组`, `Collapse or expand ${t(...group.label)} group`)}
+                  onClick={() => toggleGroupCollapse(group.key)}
+                >
+                  <ChevronDown size={15} className={collapsed ? 'following-group-chevron collapsed' : 'following-group-chevron'} />
+                  <span className="following-group-title">{t(...group.label)}</span>
+                </button>
+                <span className="following-group-count">{t(`${group.items.length} 部`, `${group.items.length} title${group.items.length === 1 ? '' : 's'}`)}</span>
+              </header>
+              {!collapsed && (
+                <div className="following-list">
+                  {group.items.map(renderFollowingRow)}
+                </div>
+              )}
+            </section>
+          );
+        })
       )}
       {dialogItem && (
         <MappingDialog

@@ -107,8 +107,9 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
 .airing-line svg { margin-top: 1px; flex: 0 0 auto; color: var(--coral); }
 .airing-line span { display: -webkit-box; overflow: hidden; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
 .follow-button { width: 100%; height: 34px; margin-top: 9px; border: 1px solid #cdd9d1; color: var(--green-dark); background: #eef6f1; font-size: 11px; }
-.follow-button:hover { background: #e3f1e8; }
+.follow-button:hover:not(:disabled) { background: #e3f1e8; }
 .follow-button.followed { color: #fff; border-color: var(--green); background: var(--green); }
+.follow-button:disabled { opacity: .6; cursor: default; }
 
 .anime-skeleton { aspect-ratio: 5 / 9; overflow: hidden; border: 1px solid var(--line); border-radius: 7px; background: #fff; }
 .anime-skeleton span { display: block; width: 100%; aspect-ratio: 5 / 7; background: #e4e7e4; }
@@ -153,11 +154,37 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
 .task-summary small { color: #939a96; font-size: 9px; }
 .task-tabs { flex: 0 0 auto; }
 .task-list, .following-list { display: grid; gap: 8px; }
-/* Bangumi 状态分组小节标题（轻量样式，不折叠） */
-.following-group-heading { min-width: 0; display: flex; align-items: baseline; justify-content: space-between; gap: 16px; margin: 18px 0 13px; padding-bottom: 8px; border-bottom: 1px solid var(--line); }
-.following-group-heading h3 { margin: 0; color: var(--ink); font-size: 16px; line-height: 1.3; }
-.following-group-heading span { flex: 0 0 auto; color: var(--muted); font-size: 10px; }
+/* Bangumi 状态分组小节标题（问题 4：可折叠，chevron 指示展开/收起；收起时组头仍显示数量） */
+.following-group-heading { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 16px; margin: 18px 0 13px; padding-bottom: 8px; border-bottom: 1px solid var(--line); }
+.following-group-toggle { min-width: 0; display: flex; align-items: center; gap: 6px; padding: 0; border: 0; color: inherit; background: none; cursor: pointer; text-align: left; }
+.following-group-title { overflow: hidden; color: var(--ink); font-size: 16px; font-weight: 700; line-height: 1.3; text-overflow: ellipsis; white-space: nowrap; }
+.following-group-toggle:hover .following-group-title { color: var(--green); }
+.following-group-chevron { flex: 0 0 auto; color: var(--muted); transition: transform .18s ease; }
+.following-group-chevron.collapsed { transform: rotate(-90deg); }
+.following-group-count { flex: 0 0 auto; color: var(--muted); font-size: 10px; }
 .following-group + .following-group { margin-top: 22px; }
+/* 问题 3：我的追番行内状态/评分下拉（原生 select 仅做外观；高度与行内铅笔按钮对齐） */
+.entry-select {
+  height: 27px;
+  padding: 0 24px 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: #4f5853;
+  background-color: #fff;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%2369716c' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 9px center;
+  appearance: none;
+  -webkit-appearance: none;
+  font-size: 11px;
+  cursor: pointer;
+  transition: border-color .15s ease, background-color .15s ease;
+}
+.entry-select:hover { border-color: #b7cbbd; background-color: #f7f9f7; }
+.entry-select:focus { border-color: #91b59e; outline: 2px solid #c8dfd0; outline-offset: 1px; }
+.entry-select:disabled { opacity: .5; cursor: default; }
+.entry-select.status-select { width: 96px; }
+.entry-select.rating-select { width: 88px; padding-left: 8px; }
 /* 完结评分横幅（finale-completed 事件） */
 .finale-banner { min-width: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 10px 16px; margin-bottom: 18px; padding: 12px 16px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
 .finale-banner .finale-copy { min-width: 0; flex: 1; display: grid; gap: 2px; }

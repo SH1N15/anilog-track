@@ -668,6 +668,16 @@ fn mark_following_deleted(state: &mut Value, anime_id: i64) {
     state["syncMetadata"]["followingDeletedAt"][anime_id.to_string()] = json!(now_millis());
 }
 
+/// 该 id 是否存在未过期的删除墓碑（跨键重追复活判定用；与写回引擎内的
+/// tombstone_exists 同语义）。
+#[cfg(feature = "standard")]
+fn following_tombstone_exists(state: &Value, anime_id: i64) -> bool {
+    value_i64(
+        state["syncMetadata"]["followingDeletedAt"]
+            .get(&anime_id.to_string()),
+    ) > 0
+}
+
 /// 「最近取消追番队列」（Phase 3 任务 3，顶层 `pendingBangumiUnfollows`）：
 /// standard 版取消追番 Bangumi 来源条目时由 [`remove_following`] 写入
 /// `{subjectId, at}`，供 `push_local_changes` 写回 `PATCH type=5`；
@@ -1518,6 +1528,27 @@ fn canonicalize_cross_key_tasks(state: &mut Value, map: &Value, original: bool) 
     changed_any
 }
 
+/// 验收第 4 轮问题 1（存量清理，幂等）：删除 pending 且 airingAt > now 的
+/// 任务——从未播出的集不应该是待看任务（此前离线锚点与 AniList 冲突时
+/// 曾为未来集建过任务）。删除后该集播出时 sync 会按调度重建；已完成任务
+/// 永不删除（观看历史保留）。挂载于 reconcile_following_entries（合并→清理
+/// →上传顺序已就绪），云端脏数据由 document_from_state 重建上传愈合。
+#[cfg(feature = "standard")]
+fn purge_unaired_pending_tasks(state: &mut Value, now: i64) -> bool {
+    let Some(tasks) = state
+        .get_mut("tasks")
+        .and_then(|tasks| tasks.as_array_mut())
+    else {
+        return false;
+    };
+    let before = tasks.len();
+    tasks.retain(|task| {
+        !(value_string(task.get("status")) == "pending"
+            && value_i64(task.get("airingAt")) > now)
+    });
+    before != tasks.len()
+}
+
 /// 问题 B 总入口（standard only）：跨键合并 + 既有单条自动映射。
 /// 返回是否发生任何状态变更（following/tasks/syncMetadata 任一）。
 /// 挂载点：load_context 尾部（升级原 auto_map_following 调用）与每次
@@ -1540,6 +1571,9 @@ fn reconcile_following_entries(state: &mut Value, map: &Value, original: bool) -
     // 优先且语义字段不丢历史、变更时间戳提到 now 保证上传后其他设备采纳），
     // 并吸收原防重语义（有观看历史的重复 pending 被删、completed 永不删除）。
     canonicalize_cross_key_tasks(state, map, original);
+    // 验收第 4 轮问题 1：从未播出（airingAt > now）的 pending 任务清理，
+    // 幂等；original 分支已在函数头返回，不会执行到这里。
+    purge_unaired_pending_tasks(state, now_seconds());
     let after = (
         state.get("following").cloned().unwrap_or(Value::Null),
         state.get("tasks").cloned().unwrap_or(Value::Null),
@@ -2764,18 +2798,76 @@ fn mark_following_local_change(state: &mut Value, subject_id: i64) {
     }
 }
 
+/// 跨键重追守卫的身份解析（standard）：返回该作品已知的
+/// (subjectId=S, anilistId=A) 身份对（缺失侧为 0）。Bangumi 卡片以卡片值优先，
+/// anilistId 缺失时经离线映射兜底（bySubject[S].a 直查或 anilistIndex 反查）；
+/// AniList 卡片先查 following 内的显式 anilistId 绑定，再离线映射反查
+/// （anilistIndex / bySubject 扫描，多义不认）。仅用于「取消后重追」的复活与
+/// 取消队列撤销判定，不做任何状态修改。
+#[cfg(feature = "standard")]
+fn resolve_work_identities(state: &Value, anime: &Value, map: &Value) -> (i64, i64) {
+    let id = value_i64(anime.get("id"));
+    if value_string(anime.get("source")) == "bangumi" && id > 0 {
+        let subject_id = if value_i64(anime.get("bangumiSubjectId")) > 0 {
+            value_i64(anime.get("bangumiSubjectId"))
+        } else {
+            id
+        };
+        let mut anilist_id = value_i64(anime.get("anilistId"));
+        if anilist_id <= 0 {
+            anilist_id = map
+                .get("bySubject")
+                .and_then(|by_subject| by_subject.get(subject_id.to_string()))
+                .map(|entry| value_i64(entry.get("a")))
+                .unwrap_or(0);
+        }
+        if anilist_id <= 0 {
+            anilist_id = anilist_index_reverse(map, subject_id);
+        }
+        if anilist_id == subject_id {
+            anilist_id = 0;
+        }
+        (subject_id, anilist_id)
+    } else if id > 0 {
+        let bound = state["following"].as_array().and_then(|items| {
+            items
+                .iter()
+                .find(|item| {
+                    value_string(item.get("source")) == "bangumi"
+                        && value_i64(item.get("anilistId")) == id
+                })
+                .map(|item| value_i64(item.get("id")))
+        });
+        let subject_id = bound
+            .filter(|subject_id| *subject_id > 0 && *subject_id != id)
+            .or_else(|| offline_mapped_subject_id(map, id).filter(|subject_id| *subject_id != id))
+            .unwrap_or(0);
+        (subject_id, id)
+    } else {
+        (0, 0)
+    }
+}
+
 /// 问题 C（P0 追番判重）：standard 版追番新增路径。跨键守卫保证同一部番绝不
 /// 出现两条追番记录：
 /// - follow Bangumi 卡片（subjectId=S, anilistId=A）而存在 id==A 的 anilist 键
 ///   条目 → apply_mapping 转正（旧 id 墓碑 + pending 任务重键）而非新增；
 /// - follow Bangumi 卡片而 id==S 条目已存在 → 只补字段不重复新增；
 /// - follow AniList 卡片（id=A）而存在 anilistId==A 的 bangumi 条目 → 该条目
-///   绑定 manual/high 后直接复用，不新增第二条。
+///   绑定 manual/high 后直接复用，不新增第二条；
+/// - 跨键重追复活（数据安全）：目标作品的旧身份存在墓碑且 following 已无该
+///   条目（用户取消后从另一侧卡片重追）→ 不新增另一条键，而是复活原键条目
+///   （bangumi_following_entry 构造 + manual/high + lastChangedBy=local）并清
+///   墓碑；否则 S 墓碑与 pendingBangumiUnfollows 残留会让写回引擎把刚重追的
+///   番在 Bangumi 侧 PATCH 成 type=5「抛弃」，且墓碑阻止复活语义。
+/// 无论走哪条路径，最后都从 pendingBangumiUnfollows 移除该作品的全部身份
+/// 队列项——重新追番即撤销未推送的取消意图。
 #[cfg(feature = "standard")]
-fn add_following_entry_standard(state: &mut Value, anime: &Value) {
+fn add_following_entry_standard(state: &mut Value, anime: &Value, map: &Value) {
     let id = value_i64(anime.get("id"));
     let preference = value_string(state["settings"].get("titlePreference"));
     let language = value_string(state["settings"].get("uiLanguage"));
+    let (identity_subject, identity_anilist) = resolve_work_identities(state, anime, map);
     if value_string(anime.get("source")) == "bangumi" && id > 0 {
         let mut entry = bangumi_following_entry(anime, &preference, &language);
         let subject_id = value_i64(entry.get("id"));
@@ -2820,48 +2912,96 @@ fn add_following_entry_standard(state: &mut Value, anime: &Value) {
             entry["lastChangedBy"] = json!("local");
             state["following"].as_array_mut().unwrap().push(entry);
             mark_following_changed(state, subject_id);
+            // 对称复活：旧 AniList 键条目此前被用户取消（A 墓碑残留）→ 重追
+            // 即撤销删除意图，一并清 A 墓碑，防止残留墓碑阻止复活语义。
+            if identity_anilist > 0 && following_tombstone_exists(state, identity_anilist) {
+                mark_following_changed(state, identity_anilist);
+            }
         }
     } else {
-        // AniList 卡片：存在同作品的 bangumi 键条目（anilistId==id）→ 转正
-        // 绑定 manual/high，不新增。
-        let existing_bangumi_id = state["following"].as_array().and_then(|items| {
-            items
-                .iter()
-                .find(|item| {
-                    value_string(item.get("source")) == "bangumi"
-                        && value_i64(item.get("anilistId")) == id
-                })
-                .map(|item| value_i64(item.get("id")))
-        });
-        if let Some(entry_id) = existing_bangumi_id.filter(|entry_id| *entry_id > 0) {
-            if let Some(entry) = state["following"].as_array_mut().and_then(|items| {
+        // 跨键重追复活守卫：A 卡片对应作品存在 S 墓碑且 following 已无 S 条目
+        // （用户取消 bangumi 条目后从 AniList 卡片重追）→ 不新增 A 键条目，
+        // 复活 S 键条目并清墓碑。
+        let revival = identity_subject > 0
+            && !state["following"].as_array().is_some_and(|items| {
                 items
-                    .iter_mut()
-                    .find(|item| value_i64(item.get("id")) == entry_id)
-            }) {
-                entry["mapping"] =
-                    json!({"method": "manual", "confidence": "high", "updatedAt": now_seconds()});
-                entry["mappingPending"] = json!(false);
-                entry["syncUpdatedAt"] = json!(now_millis());
-                entry["lastChangedBy"] = json!("local");
+                    .iter()
+                    .any(|item| value_i64(item.get("id")) == identity_subject)
+            })
+            && following_tombstone_exists(state, identity_subject);
+        if revival {
+            let mut card = anime.clone();
+            card["id"] = json!(identity_subject);
+            card["bangumiSubjectId"] = json!(identity_subject);
+            card["source"] = json!("bangumi");
+            card["anilistId"] = json!(identity_anilist);
+            // 离线映射有 Bangumi 元数据 → 补 name_cn（displayTitle 优先中文名）。
+            if let Some(subject) = offline_bangumi_subject(map, identity_subject) {
+                let name_cn = value_string(subject.get("c"));
+                if !name_cn.is_empty() {
+                    card["nameCn"] = json!(name_cn);
+                }
             }
-            mark_following_changed(state, entry_id);
-        } else {
-            let entry = anilist_following_entry(state, anime, false);
+            let mut entry = bangumi_following_entry(&card, &preference, &language);
+            entry["lastChangedBy"] = json!("local");
             state["following"].as_array_mut().unwrap().push(entry);
-            mark_following_changed(state, id);
+            // mark_following_changed 语义：清 S 墓碑（复活）。
+            mark_following_changed(state, identity_subject);
+            // A 键若也残留墓碑（该作品曾以 A 键被取消）一并清除。
+            if identity_anilist > 0 && following_tombstone_exists(state, identity_anilist) {
+                mark_following_changed(state, identity_anilist);
+            }
+        } else {
+            // AniList 卡片：存在同作品的 bangumi 键条目（anilistId==id）→ 转正
+            // 绑定 manual/high，不新增。
+            let existing_bangumi_id = state["following"].as_array().and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| {
+                        value_string(item.get("source")) == "bangumi"
+                            && value_i64(item.get("anilistId")) == id
+                    })
+                    .map(|item| value_i64(item.get("id")))
+            });
+            if let Some(entry_id) = existing_bangumi_id.filter(|entry_id| *entry_id > 0) {
+                if let Some(entry) = state["following"].as_array_mut().and_then(|items| {
+                    items
+                        .iter_mut()
+                        .find(|item| value_i64(item.get("id")) == entry_id)
+                }) {
+                    entry["mapping"] =
+                        json!({"method": "manual", "confidence": "high", "updatedAt": now_seconds()});
+                    entry["mappingPending"] = json!(false);
+                    entry["syncUpdatedAt"] = json!(now_millis());
+                    entry["lastChangedBy"] = json!("local");
+                }
+                mark_following_changed(state, entry_id);
+            } else {
+                let entry = anilist_following_entry(state, anime, false);
+                state["following"].as_array_mut().unwrap().push(entry);
+                mark_following_changed(state, id);
+            }
         }
+    }
+    // 无论走哪条路径：用户重新追番即撤销未推送的取消意图——从
+    // pendingBangumiUnfollows 移除该作品的全部身份队列项（S 与 A），绝不留
+    // 残留队列让写回引擎把刚重追的番 PATCH 成 type=5。
+    remove_pending_bangumi_unfollow(state, identity_subject);
+    if identity_anilist > 0 {
+        remove_pending_bangumi_unfollow(state, identity_anilist);
     }
 }
 
-/// 追番新增入口（toggle_follow 的加路径）：standard 走跨键守卫路径，
-/// original 保持原行为完全不变。
-fn add_following_entry(state: &mut Value, anime: &Value, original: bool) {
+/// 追番新增入口（toggle_follow 的加路径）：standard 走跨键守卫路径（含跨键
+/// 重追复活），original 保持原行为完全不变。
+fn add_following_entry(state: &mut Value, anime: &Value, original: bool, offline_map: &Value) {
     #[cfg(feature = "standard")]
     if !original {
-        add_following_entry_standard(state, anime);
+        add_following_entry_standard(state, anime, offline_map);
         return;
     }
+    #[cfg(not(feature = "standard"))]
+    let _ = offline_map;
     let id = value_i64(anime.get("id"));
     let entry = anilist_following_entry(state, anime, original);
     state["following"].as_array_mut().unwrap().push(entry);
@@ -2877,7 +3017,7 @@ fn toggle_follow(
     let id = value_i64(anime.get("id"));
     let mut state = context.state.lock().map_err(|_| "状态锁不可用")?;
     if !remove_following(&mut state, id) {
-        add_following_entry(&mut state, &anime, context.original);
+        add_following_entry(&mut state, &anime, context.original, &context.offline_bangumi);
     }
     drop(state);
     context.save_state().map_err(|error| error.to_string())?;
@@ -3276,6 +3416,12 @@ fn apply_airing_schedules(state: &mut Value, schedules: &[Value], now: i64) -> A
             .and_then(|media| media.get("nextAiringEpisode"))
             .cloned()
             .unwrap_or(Value::Null);
+        // 验收第 4 轮问题 1（防御）：AIRING_QUERY 窗口上沿是 `to: now+1`，
+        // 未来集（airingAt > now）不进 seenAiringEvents、不建任务（产品契约
+        // "新一集播出时创建任务"）；上方 nextAiringEpisode 展示更新保留。
+        if airing_at > now {
+            continue;
+        }
         // 主键迁移后 bangumi 来源条目的任务以 subjectId 为键，避免被
         // merge_document_into_state 视为孤儿 pending 任务丢弃；AniList 播出
         // 调度的 mediaId 仍是 AniList id（上面已按 anilistId 匹配条目）。
@@ -3369,14 +3515,19 @@ fn apply_airing_schedules(state: &mut Value, schedules: &[Value], now: i64) -> A
 /// 规则：
 /// - episode 从 1 计（规则起点 = 选站后的 broadcast start / begin），超过条目
 ///   eps 截断（eps 未知时以防失控上限 1000 期兜底）；
-/// - 窗口为 [起点, now+1]（与 AIRING_QUERY 的 `to: now+1` 一致）；下一未来期
-///   写入每个调度的 media.nextAiringEpisode（全部播完 → null）；
+/// - 只生成已播出的集（airingAt <= now；验收第 4 轮问题 1a：去掉 now+1 的
+///   未来集，产品契约是"新一集播出时创建任务"）；下一未来期写入每个调度的
+///   media.nextAiringEpisode（全部播完 → null）；
+/// - 权威边界钳制（验收第 4 轮问题 1b）：following 条目带 AniList 权威
+///   nextAiringEpisode（季度链已覆盖）时，episode >= nextAiringEpisode.episode
+///   的集不生成（AniList 认为未播的不建）——离线 bangumi-data 锚点与 AniList
+///   冲突时任务生成被钳制；无 AniList 数据维持 eps 钳制；
 /// - 只有 begin 无 broadcast（电影/一次性）→ 单期，begin 已播则无下一期；
 /// - 离线映射缺条目或全无播出数据 → 不生成任何调度（第四级：无数据→无任务）。
 #[cfg(all(feature = "standard", not(target_os = "android")))]
 fn bangumi_offline_schedules(state: &Value, map: &Value, now: i64) -> Vec<Value> {
     let preferred = preferred_broadcast_sites(state);
-    let window_end = now + 1;
+    let window_end = now;
     /// eps 未知的逐期推算上限（防异常数据导致无界循环）。
     const MAX_EPISODES_WITHOUT_EPS: i64 = 1_000;
     let mut schedules = Vec::new();
@@ -3392,6 +3543,13 @@ fn bangumi_offline_schedules(state: &Value, map: &Value, now: i64) -> Vec<Value>
             continue;
         };
         let eps = value_i64(entry.get("episodes"));
+        // 验收第 4 轮问题 1b：AniList 权威边界（季度链已用 AniList 权威值覆盖
+        // following 条目的 nextAiringEpisode）。存在时只生成 episode < 该值的集。
+        let anilist_next_episode = entry
+            .get("nextAiringEpisode")
+            .and_then(|next| next.get("episode"))
+            .and_then(Value::as_i64)
+            .filter(|episode| *episode > 0);
         let begin = subject.get("begin").and_then(Value::as_str);
         let broadcast = subject.get("broadcast").and_then(Value::as_str);
         let sites = offline_broadcast_sites(&subject);
@@ -3413,6 +3571,9 @@ fn bangumi_offline_schedules(state: &Value, map: &Value, now: i64) -> Vec<Value>
                     if episode > MAX_EPISODES_WITHOUT_EPS {
                         break;
                     }
+                    if anilist_next_episode.is_some_and(|limit| episode >= limit) {
+                        break;
+                    }
                     if occurrence.timestamp() > window_end {
                         next = Some((episode, occurrence.timestamp()));
                         break;
@@ -3427,26 +3588,33 @@ fn bangumi_offline_schedules(state: &Value, map: &Value, now: i64) -> Vec<Value>
             }
         } else if let Some(start) = selected_begin.and_then(bangumi::parse_instant) {
             // 一次性播出（电影/OVA/无周期数据）：只有第 1 期。
-            if start.timestamp() > window_end {
-                next = Some((1, start.timestamp()));
-            } else {
-                occurrences.push((1, start.timestamp()));
+            if anilist_next_episode.is_none_or(|limit| limit > 1) {
+                if start.timestamp() > window_end {
+                    next = Some((1, start.timestamp()));
+                } else {
+                    occurrences.push((1, start.timestamp()));
+                }
             }
         }
         if occurrences.is_empty() {
-            // 窗口内无已播期（未开播/全部数据在窗口外）→ 不生成调度，
-            // nextAiringEpisode 交由季度映射（map_subjects_to_anime）维护。
+            // 窗口内无已播期（未开播/全部数据在窗口外/被 AniList 权威边界
+            // 全部钳掉）→ 不生成调度，nextAiringEpisode 交由季度映射维护。
             continue;
         }
-        let next_json = next
-            .map(|(episode, airing_at)| {
-                json!({
-                    "episode": episode,
-                    "airingAt": airing_at,
-                    "timeUntilAiring": (airing_at - now).max(0)
+        // 权威钳制生效时 media.nextAiringEpisode 维持 AniList 值（离线推算的
+        // "下一期"可能已被钳掉；apply_airing_schedules 会原样回写条目）。
+        let next_json = match entry.get("nextAiringEpisode") {
+            Some(authoritative) if authoritative.is_object() => authoritative.clone(),
+            _ => next
+                .map(|(episode, airing_at)| {
+                    json!({
+                        "episode": episode,
+                        "airingAt": airing_at,
+                        "timeUntilAiring": (airing_at - now).max(0)
+                    })
                 })
-            })
-            .unwrap_or(Value::Null);
+                .unwrap_or(Value::Null),
+        };
         for (episode, airing_at) in occurrences {
             schedules.push(json!({
                 "mediaId": subject_id,
@@ -4461,6 +4629,10 @@ mod bangumi_sync {
     const COLLECTION_MAX_PAGES: usize = 20;
     /// 收藏列表分页大小。
     const COLLECTION_PAGE_LIMIT: u32 = 50;
+    /// 集数列表缓存 TTL（schema §7：12-24h，取 24h）。
+    const EPISODES_CACHE_TTL_SECONDS: i64 = 24 * 3_600;
+    /// 集数列表单页上限（官方上限 200；≤1 页足够覆盖观看任务场景）。
+    const EPISODES_PAGE_LIMIT: u32 = 200;
 
     /// 读取顶层 `bangumi` 设置块（缺失/损坏时回落默认值）。
     pub(super) fn sync_settings(state: &Value) -> BangumiSyncSettings {
@@ -4526,6 +4698,23 @@ mod bangumi_sync {
                     || value_i64(item.get("bangumiId")) == subject_id
             })
         })
+    }
+
+    /// 进度推送候选任务（验收第 4 轮问题 2 抽取）：completed、非拉取来源
+    /// （lastChangedBy != bangumi，防循环）、未推送过（无 lastPushedToBangumiAt）。
+    fn push_candidate_task(task: &Value) -> bool {
+        value_string(task.get("status")) == "completed"
+            && task.get("lastChangedBy").and_then(Value::as_str) != Some("bangumi")
+            && !task
+                .get("lastPushedToBangumiAt")
+                .is_some_and(Value::is_number)
+    }
+
+    /// 任务是否已绑定有效 Bangumi episodeId。
+    fn task_has_episode_id(task: &Value) -> bool {
+        task.get("episodeId")
+            .and_then(Value::as_i64)
+            .is_some_and(|id| id > 0)
     }
 
     fn tombstone_exists(state: &Value, subject_id: i64) -> bool {
@@ -4969,6 +5158,90 @@ mod bangumi_sync {
         })
     }
 
+    /// sort 数值 → 任务集数键（整数）：round 相等且 |sort - ep| < 0.25 才映射
+    /// （验收第 4 轮问题 2：SP 等特殊集的 sort "4.5" 不得错配第 4 或第 5 集）。
+    pub(super) fn episode_sort_key(sort: f64) -> Option<i64> {
+        let rounded = sort.round();
+        if rounded > 0.0 && (sort - rounded).abs() < 0.25 {
+            Some(rounded as i64)
+        } else {
+            None
+        }
+    }
+
+    /// 集数记录 → {任务集数: episode_id}；同键冲突取更贴近整数的记录。
+    pub(super) fn episode_id_map(episodes: &[bangumi::BangumiEpisode]) -> BTreeMap<i64, i64> {
+        let mut best: BTreeMap<i64, (i64, f64)> = BTreeMap::new();
+        for episode in episodes {
+            if episode.id <= 0 {
+                continue;
+            }
+            let Some(sort) = episode.sort else {
+                continue;
+            };
+            let Some(key) = episode_sort_key(sort) else {
+                continue;
+            };
+            let distance = (sort - key as f64).abs();
+            match best.get(&key) {
+                Some((_, existing)) if *existing <= distance => {}
+                _ => {
+                    best.insert(key, (episode.id, distance));
+                }
+            }
+        }
+        best.into_iter().map(|(key, (id, _))| (key, id)).collect()
+    }
+
+    /// 验收第 4 轮问题 2：解析条目的 Bangumi episodeId 映射（任务集数 →
+    /// episode_id）。`GET /v0/episodes?subject_id=S&limit=200`（公开端点，
+    /// 经 HttpBangumiClient 全局 Semaphore 限流）；缓存
+    /// `bangumi-cache/episodes-{id}.json` TTL 24h，网络失败回落旧缓存
+    /// （stale），连缓存都没有 → Err（调用方跳过该条目本轮进度写回）。
+    pub(super) async fn resolve_subject_episode_ids(
+        http: &HttpBangumiClient,
+        cache_dir: &std::path::Path,
+        subject_id: i64,
+        now: i64,
+    ) -> Result<BTreeMap<i64, i64>, String> {
+        if subject_id <= 0 {
+            return Err("无效的 subjectId".to_string());
+        }
+        let cache_path = cache_dir.join(format!("episodes-{subject_id}.json"));
+        let read_cache = |max_age: i64| -> Option<bangumi::Paged<bangumi::BangumiEpisode>> {
+            let raw = std::fs::read_to_string(&cache_path).ok()?;
+            let value: Value = serde_json::from_str(&raw).ok()?;
+            let fetched_at = value.get("fetchedAt").and_then(Value::as_i64)?;
+            if now.saturating_sub(fetched_at) > max_age {
+                return None;
+            }
+            serde_json::from_value(value.get("paged").cloned().unwrap_or(Value::Null)).ok()
+        };
+        if let Some(paged) = read_cache(EPISODES_CACHE_TTL_SECONDS) {
+            return Ok(episode_id_map(&paged.data));
+        }
+        match http
+            .get_subject_episodes(subject_id, EPISODES_PAGE_LIMIT, 0)
+            .await
+        {
+            Ok(paged) => {
+                if let Some(directory) = cache_path.parent() {
+                    let _ = std::fs::create_dir_all(directory);
+                }
+                let payload = json!({
+                    "fetchedAt": now,
+                    "paged": serde_json::to_value(&paged).unwrap_or(Value::Null),
+                });
+                let _ = std::fs::write(&cache_path, payload.to_string());
+                Ok(episode_id_map(&paged.data))
+            }
+            Err(error) => match read_cache(i64::MAX) {
+                Some(paged) => Ok(episode_id_map(&paged.data)),
+                None => Err(super::bangumi_commands::request_error_message(error)),
+            },
+        }
+    }
+
     /// 任务 3：写回引擎。前置：Token 且 pushLocalChanges（进度另需
     /// pushCompletedEpisodes）。写前 hash 幂等：H_local == lastPushedPayloadHash
     /// 跳过；lastChangedBy=="bangumi" 跳过（防循环）。成功后更新
@@ -4980,6 +5253,7 @@ mod bangumi_sync {
         tokens: &dyn BangumiTokenStore,
         username_cache: &Mutex<Option<String>>,
         state: &Mutex<Value>,
+        cache_dir: &std::path::Path,
     ) -> BangumiSyncReport {
         let mut report = BangumiSyncReport::default();
         let settings = {
@@ -4993,6 +5267,59 @@ mod bangumi_sync {
             Ok(Some(token)) if !token.trim().is_empty() => token,
             _ => return report, // skipped：无 Token
         };
+
+        // 第 0 步（验收第 4 轮问题 2）：episodeId 解析与绑定。本地任务从不绑
+        // Bangumi episodeId（集数列表从未拉取），进度推送此前永远空转；此处
+        // 对涉事条目拉取集数列表（24h 缓存），把待推送完成任务的 episodeId
+        // 补上（任务级 lastPushedToBangumiAt 语义不变）。解析失败 → 该条目
+        // 本轮跳过进度写回（记 errors，不阻断其他条目）。
+        if settings.push_completed_episodes {
+            let targets: Vec<i64> = {
+                let guard = state.lock().expect("state lock");
+                let mut subjects = std::collections::BTreeSet::new();
+                for task in guard["tasks"].as_array().into_iter().flatten() {
+                    if push_candidate_task(task) && !task_has_episode_id(task) {
+                        let subject_id = value_i64(task.get("subjectId"));
+                        if subject_id > 0 {
+                            subjects.insert(subject_id);
+                        }
+                    }
+                }
+                subjects.into_iter().collect()
+            };
+            let mut resolved: BTreeMap<i64, BTreeMap<i64, i64>> = BTreeMap::new();
+            for subject_id in targets {
+                match resolve_subject_episode_ids(http, cache_dir, subject_id, now_seconds())
+                    .await
+                {
+                    Ok(mapping) => {
+                        resolved.insert(subject_id, mapping);
+                    }
+                    Err(message) => report
+                        .errors
+                        .push(format!("解析集数列表失败（{subject_id}）：{message}")),
+                }
+            }
+            if !resolved.is_empty() {
+                let mut guard = state.lock().expect("state lock");
+                let bound_at = now_millis();
+                for task in guard["tasks"].as_array_mut().into_iter().flatten() {
+                    if !(push_candidate_task(task) && !task_has_episode_id(task)) {
+                        continue;
+                    }
+                    let subject_id = value_i64(task.get("subjectId"));
+                    let episode = value_i64(task.get("episode"));
+                    if let Some(episode_id) = resolved
+                        .get(&subject_id)
+                        .and_then(|mapping| mapping.get(&episode))
+                        .copied()
+                    {
+                        task["episodeId"] = json!(episode_id);
+                        task["syncUpdatedAt"] = json!(bound_at);
+                    }
+                }
+            }
+        }
 
         // 第 1 步（锁内）：快照写回计划。
         struct CollectionPush {
@@ -5060,15 +5387,7 @@ mod bangumi_sync {
             if settings.push_completed_episodes {
                 let mut grouped: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
                 for task in guard["tasks"].as_array().into_iter().flatten() {
-                    if value_string(task.get("status")) != "completed" {
-                        continue;
-                    }
-                    // 拉取来的完成（lastChangedBy=bangumi）不上传。
-                    if task.get("lastChangedBy").and_then(Value::as_str) == Some("bangumi") {
-                        continue;
-                    }
-                    // hash 幂等：已推送过的单集不再上传。
-                    if task.get("lastPushedToBangumiAt").is_some_and(Value::is_number) {
+                    if !push_candidate_task(task) {
                         continue;
                     }
                     let subject_id = task
@@ -5398,12 +5717,14 @@ async fn run_full_bangumi_sync_core(
         if pull_touched {
             context.save_state().map_err(|error| error.to_string())?;
         }
-        // 5) 写回（按开关）。
+        // 5) 写回（按开关）。cache_dir 供进度写回的集数列表缓存
+        // （bangumi-cache/episodes-{id}.json）。
         let push_report = bangumi_sync::push_local_changes(
             &http,
             context.bangumi_tokens.as_ref(),
             &context.bangumi_username_cache,
             &context.state,
+            &bangumi_cache_dir(context),
         )
         .await;
         report.pushed += push_report.pushed;
@@ -9479,6 +9800,18 @@ mod tests {
         requests.iter().filter(|request| request.method != "GET").count()
     }
 
+    /// 验收第 4 轮问题 2 测试辅助：每用例独立的集数缓存目录（防测试间缓存
+    /// 串扰），返回前清空残留。
+    #[cfg(feature = "standard")]
+    fn episodes_cache_dir(tag: &str) -> std::path::PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "anilog-test-episodes-cache-{}-{tag}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        directory
+    }
+
     #[cfg(feature = "standard")]
     #[test]
     fn bangumi_sync_hash_idempotent_second_run_zero_writes() {
@@ -9541,8 +9874,9 @@ mod tests {
         let first = rt.block_on(bangumi_sync::run_bangumi_collection_sync(
             &client, &tokens, &username_cache, &state, &offline,
         ));
+        let episodes_cache = episodes_cache_dir("hash-idempotent");
         let push1 = rt.block_on(bangumi_sync::push_local_changes(
-            &client, &tokens, &username_cache, &state,
+            &client, &tokens, &username_cache, &state, &episodes_cache,
         ));
         let writes_first = write_count(&server.requests());
         assert!(writes_first >= 1, "first sync must write the local change");
@@ -9588,7 +9922,7 @@ mod tests {
             &client, &tokens, &username_cache, &state, &offline,
         ));
         let push2 = rt.block_on(bangumi_sync::push_local_changes(
-            &client, &tokens, &username_cache, &state,
+            &client, &tokens, &username_cache, &state, &episodes_cache,
         ));
         let writes_second = write_count(&server.requests());
         assert_eq!(writes_second, writes_first, "second sync must not write");
@@ -9804,14 +10138,16 @@ mod tests {
             .build()
             .expect("tokio test runtime");
 
+        let episodes_cache = episodes_cache_dir("pull-push-loop");
+
         // 防循环：拉取来的变更（lastChangedBy=bangumi）在写回阶段零请求。
         let pull = rt.block_on(bangumi_sync::run_bangumi_collection_sync(
             &client, &tokens, &username_cache, &state, &offline,
         ));
         assert_eq!(pull.followed, 1);
         let push = rt.block_on(bangumi_sync::push_local_changes(
-                &client, &tokens, &username_cache, &state,
-            ));
+            &client, &tokens, &username_cache, &state, &episodes_cache,
+        ));
         assert_eq!(push.pushed, 0, "pull-driven changes must not push back");
         assert_eq!(write_count(&server.requests()), 0);
 
@@ -9824,8 +10160,8 @@ mod tests {
                 .push(bangumi_following(77777, json!({})));
         }
         let push = rt.block_on(bangumi_sync::push_local_changes(
-                &client, &tokens, &username_cache, &state,
-            ));
+            &client, &tokens, &username_cache, &state, &episodes_cache,
+        ));
         assert_eq!(push.pushed, 1);
         let post = server
             .requests()
@@ -9848,8 +10184,8 @@ mod tests {
             guard["following"][index]["lastChangedBy"] = json!("local");
         }
         let push = rt.block_on(bangumi_sync::push_local_changes(
-                &client, &tokens, &username_cache, &state,
-            ));
+            &client, &tokens, &username_cache, &state, &episodes_cache,
+        ));
         assert_eq!(push.pushed, 1);
         let patch = server
             .requests()
@@ -9872,8 +10208,8 @@ mod tests {
                     .any(|item| value_i64(item.get("subjectId")) == 77777)));
         }
         let push = rt.block_on(bangumi_sync::push_local_changes(
-                &client, &tokens, &username_cache, &state,
-            ));
+            &client, &tokens, &username_cache, &state, &episodes_cache,
+        ));
         assert_eq!(push.pushed, 1);
         let dropped = server
             .requests()
@@ -9896,11 +10232,17 @@ mod tests {
 
     #[cfg(feature = "standard")]
     #[test]
-    fn bangumi_push_completed_episodes_batch_is_hash_idempotent() {
+    fn bangumi_push_completed_episodes_binds_episode_ids_then_batch_is_idempotent() {
         use crate::bangumi::test_support::MockBangumiServer;
 
+        // subject-episodes.json：id 98765(sort 4) / 98766(sort 25, SP) /
+        // 98767(sort 5)——sort 25 用于锁定小数/特殊集不错配整数集数。
+        let episodes = include_str!("../fixtures/bangumi/subject-episodes.json").to_string();
         let server = MockBangumiServer::spawn(Arc::new(
             move |_method, target, _headers, _request_body| {
+                if target.starts_with("/v0/episodes?subject_id=45678") {
+                    return (200, vec![], episodes.clone());
+                }
                 if target == "/v0/users/-/collections/45678/episodes" {
                     return (204, vec![], String::new());
                 }
@@ -9911,19 +10253,20 @@ mod tests {
         state["bangumi"]["pushLocalChanges"] = json!(false);
         state["bangumi"]["pushCompletedEpisodes"] = json!(false);
         state["tasks"] = json!([
-            // 本地完成的任务（episodeId/subjectId 齐备）→ 可上传。
-            {"id": "45678-2", "animeId": 45678, "animeTitle": "示例", "episode": 2,
+            // 本地完成、缺 episodeId → 经集数列表解析绑定（episode 5 → sort 5
+            // → 98767），随批量 PATCH 上传。
+            {"id": "45678-5", "animeId": 45678, "animeTitle": "示例", "episode": 5,
              "airingAt": 10, "status": "completed", "createdAt": 10, "completedAt": 20,
-             "syncUpdatedAt": 1, "subjectId": 45678, "episodeId": 98765},
-            // 拉取来的完成（lastChangedBy=bangumi）→ 不上传。
-            {"id": "45678-3", "animeId": 45678, "animeTitle": "示例", "episode": 3,
-             "airingAt": 10, "status": "completed", "createdAt": 10, "completedAt": 20,
-             "syncUpdatedAt": 1, "subjectId": 45678, "episodeId": 98766,
-             "lastChangedBy": "bangumi"},
-            // 缺 episodeId（未映射）→ 不上传。
+             "syncUpdatedAt": 1, "subjectId": 45678, "episodeId": null},
+            // 已带 episodeId → 不覆盖、照常上传（98765）。
             {"id": "45678-4", "animeId": 45678, "animeTitle": "示例", "episode": 4,
              "airingAt": 10, "status": "completed", "createdAt": 10, "completedAt": 20,
-             "syncUpdatedAt": 1, "subjectId": 45678, "episodeId": null}
+             "syncUpdatedAt": 1, "subjectId": 45678, "episodeId": 98765},
+            // 拉取来的完成（lastChangedBy=bangumi）→ 不绑定也不上传。
+            {"id": "45678-3", "animeId": 45678, "animeTitle": "示例", "episode": 3,
+             "airingAt": 10, "status": "completed", "createdAt": 10, "completedAt": 20,
+             "syncUpdatedAt": 1, "subjectId": 45678, "episodeId": null,
+             "lastChangedBy": "bangumi"}
         ]);
         let state = std::sync::Mutex::new(state);
         let tokens = bangumi::MemoryTokenStore::new();
@@ -9931,48 +10274,306 @@ mod tests {
         let username_cache = std::sync::Mutex::new(None);
         let client =
             bangumi::HttpBangumiClient::with_base(bangumi_test_base(&server.url())).unwrap();
+        let episodes_cache = episodes_cache_dir("episode-bind");
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("tokio test runtime");
 
-        // pushCompletedEpisodes=false：不上传。
+        // pushCompletedEpisodes=false：不解析、不上传，零请求。
         let report = rt.block_on(bangumi_sync::push_local_changes(
-                &client, &tokens, &username_cache, &state,
-            ));
+            &client, &tokens, &username_cache, &state, &episodes_cache,
+        ));
         assert_eq!(report.pushed, 0);
+        assert!(report.errors.is_empty());
         assert_eq!(server.requests().len(), 0);
 
-        // 开启后：聚合同 subject 批量 PATCH（episode_id 数组 + type=2），
-        // 只含本地完成且带 episodeId 的那一集。
+        // 开启后：先经集数列表解析绑定 episode 5 → 98767，再聚合同 subject
+        // 批量 PATCH（episode_id 数组 + type=2）。
         state.lock().unwrap()["bangumi"]["pushCompletedEpisodes"] = json!(true);
         let report = rt.block_on(bangumi_sync::push_local_changes(
-                &client, &tokens, &username_cache, &state,
-            ));
+            &client, &tokens, &username_cache, &state, &episodes_cache,
+        ));
         assert_eq!(report.pushed, 1);
-        let request = &server.requests()[0];
-        assert_eq!(request.method, "PATCH");
-        assert_eq!(request.target, "/v0/users/-/collections/45678/episodes");
-        let payload: Value = serde_json::from_str(&request.body).unwrap();
-        assert_eq!(payload["episode_id"], json!([98765]));
-        assert_eq!(payload["type"], 2);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let episodes_gets = server
+            .requests()
+            .iter()
+            .filter(|request| {
+                request.method == "GET" && request.target.starts_with("/v0/episodes?")
+            })
+            .count();
+        assert_eq!(episodes_gets, 1, "episodes list fetched exactly once");
         {
             let guard = state.lock().unwrap();
-            let pushed = guard["tasks"]
+            let bound = guard["tasks"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .find(|task| value_string(task.get("id")) == "45678-2")
+                .find(|task| value_string(task.get("id")) == "45678-5")
                 .unwrap();
-            assert!(pushed.get("lastPushedToBangumiAt").is_some_and(Value::is_number));
+            assert_eq!(bound["episodeId"], json!(98767), "episode 5 → sort 5");
+            assert!(bound.get("lastPushedToBangumiAt").is_some_and(Value::is_number));
+            // 拉取来源任务不绑定、不推送。
+            let pulled = guard["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|task| value_string(task.get("id")) == "45678-3")
+                .unwrap();
+            assert!(pulled["episodeId"].is_null());
         }
+        let request = server
+            .requests()
+            .into_iter()
+            .find(|request| {
+                request.method == "PATCH"
+                    && request.target == "/v0/users/-/collections/45678/episodes"
+            })
+            .expect("batch PATCH");
+        let payload: Value = serde_json::from_str(&request.body).unwrap();
+        let mut pushed_ids = payload["episode_id"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_i64)
+            .collect::<Vec<_>>();
+        pushed_ids.sort_unstable();
+        assert_eq!(pushed_ids, vec![98765, 98767]);
+        assert_eq!(payload["type"], 2);
 
-        // hash 幂等：再次推送零请求（lastPushedToBangumiAt 标记）。
+        // hash 幂等：再次推送零请求（无新候选任务）。
         let report = rt.block_on(bangumi_sync::push_local_changes(
-                &client, &tokens, &username_cache, &state,
-            ));
+            &client, &tokens, &username_cache, &state, &episodes_cache,
+        ));
         assert_eq!(report.pushed, 0);
-        assert_eq!(server.requests().len(), 1);
+        assert_eq!(server.requests().len(), 2, "1 GET episodes + 1 PATCH");
+
+        // 缓存命中：新完成集数 4（无 episodeId 的新任务）→ 解析走 24h 缓存，
+        // 零新增 GET，仅新增一次批量 PATCH。
+        {
+            let mut guard = state.lock().unwrap();
+            guard["tasks"].as_array_mut().unwrap().push(json!({
+                "id": "45678-6", "animeId": 45678, "animeTitle": "示例", "episode": 4,
+                "airingAt": 10, "status": "completed", "createdAt": 30, "completedAt": 40,
+                "syncUpdatedAt": 1, "subjectId": 45678, "episodeId": null
+            }));
+        }
+        let report = rt.block_on(bangumi_sync::push_local_changes(
+            &client, &tokens, &username_cache, &state, &episodes_cache,
+        ));
+        assert_eq!(report.pushed, 1, "new completion pushed via cached mapping");
+        assert_eq!(server.requests().len(), 3);
+        let episodes_gets = server
+            .requests()
+            .iter()
+            .filter(|request| {
+                request.method == "GET" && request.target.starts_with("/v0/episodes?")
+            })
+            .count();
+        assert_eq!(episodes_gets, 1, "second resolve must hit the 24h cache");
+    }
+
+    #[cfg(feature = "standard")]
+    #[test]
+    fn bangumi_push_completed_episodes_skips_subject_on_resolution_failure() {
+        use crate::bangumi::test_support::MockBangumiServer;
+
+        // 45678 集数列表拉取失败（500）→ 该条目本轮跳过进度写回（记 errors）；
+        // 55555 正常解析（episode 4 → sort 4 → 98765）→ 不阻断其他条目。
+        let episodes = include_str!("../fixtures/bangumi/subject-episodes.json").to_string();
+        let server = MockBangumiServer::spawn(Arc::new(
+            move |_method, target, _headers, _request_body| {
+                if target.starts_with("/v0/episodes?subject_id=55555") {
+                    return (200, vec![], episodes.clone());
+                }
+                if target.starts_with("/v0/episodes?subject_id=45678") {
+                    return (500, vec![], "{}".into());
+                }
+                if target == "/v0/users/-/collections/55555/episodes" {
+                    return (204, vec![], String::new());
+                }
+                (404, vec![], "{}".into())
+            },
+        ));
+        let mut state = phase3_state("https://unused.example.com/v0");
+        state["bangumi"]["pushLocalChanges"] = json!(false);
+        state["tasks"] = json!([
+            {"id": "45678-2", "animeId": 45678, "animeTitle": "示例", "episode": 2,
+             "airingAt": 10, "status": "completed", "createdAt": 10, "completedAt": 20,
+             "syncUpdatedAt": 1, "subjectId": 45678, "episodeId": null},
+            {"id": "55555-4", "animeId": 55555, "animeTitle": "示例", "episode": 4,
+             "airingAt": 10, "status": "completed", "createdAt": 10, "completedAt": 20,
+             "syncUpdatedAt": 1, "subjectId": 55555, "episodeId": null}
+        ]);
+        let state = std::sync::Mutex::new(state);
+        let tokens = bangumi::MemoryTokenStore::new();
+        tokens.store("resolve-fail-token").unwrap();
+        let username_cache = std::sync::Mutex::new(None);
+        let client =
+            bangumi::HttpBangumiClient::with_base(bangumi_test_base(&server.url())).unwrap();
+        let episodes_cache = episodes_cache_dir("resolve-failure");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio test runtime");
+
+        let report = rt.block_on(bangumi_sync::push_local_changes(
+            &client, &tokens, &username_cache, &state, &episodes_cache,
+        ));
+        assert_eq!(report.pushed, 1, "55555 must still push");
+        assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+        assert!(report.errors[0].contains("45678"), "{:?}", report.errors);
+        let guard = state.lock().unwrap();
+        let skipped = guard["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|task| value_string(task.get("id")) == "45678-2")
+            .unwrap();
+        assert!(skipped["episodeId"].is_null(), "unresolved task untouched");
+        let bound = guard["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|task| value_string(task.get("id")) == "55555-4")
+            .unwrap();
+        assert_eq!(bound["episodeId"], json!(98765));
+        let patch = server
+            .requests()
+            .into_iter()
+            .find(|request| request.method == "PATCH")
+            .expect("PATCH for resolvable subject");
+        assert_eq!(request_target_subject(&patch.target), 55555);
+    }
+
+    /// PATCH 目标 `/v0/users/-/collections/{sid}/episodes` 的 sid 提取（测试辅助）。
+    #[cfg(feature = "standard")]
+    fn request_target_subject(target: &str) -> i64 {
+        target
+            .trim_start_matches("/v0/users/-/collections/")
+            .split('/')
+            .next()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// 验收第 4 轮问题 2：sort → 任务集数匹配规则。整数 sort 直接匹配；
+    /// 小数 sort（SP "4.5"）不得错配相邻整数；同键冲突取更贴近整数的记录。
+    #[cfg(feature = "standard")]
+    #[test]
+    fn episode_id_map_matches_integer_sorts_only() {
+        let episodes = vec![
+            bangumi::BangumiEpisode { id: 1, sort: Some(4.0), ..Default::default() },
+            bangumi::BangumiEpisode { id: 2, sort: Some(4.5), ..Default::default() },
+            bangumi::BangumiEpisode { id: 3, sort: Some(5.0), ..Default::default() },
+            bangumi::BangumiEpisode { id: 4, sort: Some(25.0), ..Default::default() },
+            bangumi::BangumiEpisode { id: 5, sort: Some(4.9), ..Default::default() },
+            bangumi::BangumiEpisode { id: 6, sort: None, ..Default::default() },
+            bangumi::BangumiEpisode { id: 7, sort: Some(0.0), ..Default::default() },
+        ];
+        let map = bangumi_sync::episode_id_map(&episodes);
+        assert_eq!(map.get(&4), Some(&1), "整数 sort 直接匹配");
+        assert_eq!(map.get(&5), Some(&3), "同键冲突取更贴近整数的记录（5.0 胜 4.9）");
+        assert_eq!(map.get(&25), Some(&4), "SP 25 只匹配 25");
+        assert!(!map.contains_key(&2));
+        assert_eq!(map.len(), 3, "4.5 / 无 sort / 0.0 不映射");
+    }
+
+    /// 验收第 4 轮问题 1b：离线锚点与 AniList 权威冲突时，任务生成被钳制——
+    /// 只生成 episode < AniList nextAiringEpisode.episode 的已播集；无 AniList
+    /// 数据时维持离线推算（含 airingAt == now 边界、未来集不生成）。
+    #[cfg(all(feature = "standard", not(target_os = "android")))]
+    #[test]
+    fn bangumi_offline_schedules_clamp_to_anilist_next_episode() {
+        let mut state = default_state(false);
+        // eps 未知 → 无 eps 钳制，仅权威边界生效。
+        state["following"] = json!([{
+            "id": 45678, "source": "bangumi", "displayTitle": "示例",
+            "followedAt": 0, "syncUpdatedAt": 1
+        }]);
+        state["tasks"] = json!([]);
+        state["seenAiringEvents"] = json!([]);
+        let map = json!({"bySubject": {
+            "45678": offline_entry(
+                21355,
+                json!("2026-04-01T13:00:22Z"),
+                json!("R/2026-04-01T13:00:22.000Z/P7D"),
+                Value::Null
+            )
+        }});
+        // begin + 20 整周 → 第 21 期恰在 now（边界内）。
+        let now = at("2026-08-19T13:00:22+00:00");
+
+        // AniList 权威下一期 = 16（认为 16-21 未播）→ 只生成 1..15，
+        // media.nextAiringEpisode 维持 AniList 权威值。
+        let authoritative = json!({
+            "episode": 16,
+            "airingAt": at("2026-09-09T13:00:22+00:00"),
+            "timeUntilAiring": 100
+        });
+        state["following"][0]["nextAiringEpisode"] = authoritative.clone();
+        let schedules = bangumi_offline_schedules(&state, &map, now);
+        let episodes: Vec<i64> = schedules
+            .iter()
+            .map(|schedule| value_i64(schedule.get("episode")))
+            .collect();
+        assert_eq!(episodes, (1..=15).collect::<Vec<_>>());
+        assert_eq!(schedules[0]["media"]["nextAiringEpisode"], authoritative);
+
+        // 无 AniList 数据（null）→ 离线推算不受钳制：1..=21 全部生成
+        // （第 21 期 airingAt == now 边界内），未来集 22 只进 nextAiringEpisode。
+        state["following"][0]["nextAiringEpisode"] = Value::Null;
+        let schedules = bangumi_offline_schedules(&state, &map, now);
+        assert_eq!(schedules.len(), 21);
+        assert_eq!(schedules[20]["episode"], 21);
+        assert_eq!(schedules[20]["airingAt"], now);
+        assert_eq!(schedules[20]["media"]["nextAiringEpisode"]["episode"], 22);
+    }
+
+    /// 验收第 4 轮问题 1（存量清理）：reconcile_following_entries 删除
+    /// pending 且 airingAt > now 的任务（从未播出的集不应是待看任务），
+    /// 已完成任务与已播出任务保留，且幂等。
+    #[cfg(feature = "standard")]
+    #[test]
+    fn reconcile_purges_unaired_pending_tasks_and_is_idempotent() {
+        let mut state = default_state(false);
+        state["following"] = json!([{
+            "id": 45678, "source": "bangumi", "displayTitle": "示例",
+            "followedAt": 0, "syncUpdatedAt": 1
+        }]);
+        let now = now_seconds();
+        let future = now + 3_600;
+        let past = now - 3_600;
+        state["tasks"] = json!([
+            // 未播出的 pending（污染形态）→ 清理。
+            {"id": "45678-23", "animeId": 45678, "episode": 23, "airingAt": future,
+             "status": "pending", "createdAt": 1, "completedAt": Value::Null, "syncUpdatedAt": 1},
+            // 已播出的 pending → 保留。
+            {"id": "45678-22", "animeId": 45678, "episode": 22, "airingAt": past,
+             "status": "pending", "createdAt": 1, "completedAt": Value::Null, "syncUpdatedAt": 1},
+            // 未来 airingAt 的 completed → 观看历史，永不删除。
+            {"id": "45678-21", "animeId": 45678, "episode": 21, "airingAt": future,
+             "status": "completed", "createdAt": 1, "completedAt": 2, "syncUpdatedAt": 1},
+            // 无 airingAt 的 pending（无播出信息）→ 不误删。
+            {"id": "45678-20", "animeId": 45678, "episode": 20,
+             "status": "pending", "createdAt": 1, "completedAt": Value::Null, "syncUpdatedAt": 1}
+        ]);
+        let map = json!({"bySubject": {}, "anilistIndex": {}});
+
+        assert!(reconcile_following_entries(&mut state, &map, false));
+        let ids: Vec<String> = state["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|task| value_string(task.get("id")))
+            .collect();
+        assert_eq!(ids, vec!["45678-22", "45678-21", "45678-20"]);
+
+        // 幂等：再次 reconcile 任务集不再变化。
+        let before = state["tasks"].clone();
+        reconcile_following_entries(&mut state, &map, false);
+        assert_eq!(state["tasks"], before);
     }
 
     #[cfg(feature = "standard")]
@@ -10522,6 +11123,12 @@ mod tests {
         })
     }
 
+    /// 离线映射空底座（跨键守卫测试用：无映射 → 行为与旧版一致）。
+    #[cfg(feature = "standard")]
+    fn empty_offline_map() -> Value {
+        json!({"bySubject": {}, "anilistIndex": {}})
+    }
+
     #[cfg(feature = "standard")]
     #[test]
     fn reconcile_merges_cross_key_duplicate_into_bangumi_entry() {
@@ -10691,7 +11298,7 @@ mod tests {
             "format": "TV", "episodes": 12, "seasonYear": 2026
         });
 
-        add_following_entry_standard(&mut state, &anime);
+        add_following_entry_standard(&mut state, &anime, &empty_offline_map());
 
         let following = state["following"].as_array().unwrap();
         assert_eq!(following.len(), 1);
@@ -10735,7 +11342,7 @@ mod tests {
             "format": "TV", "episodes": 12, "seasonYear": 2026
         });
 
-        add_following_entry_standard(&mut state, &anime);
+        add_following_entry_standard(&mut state, &anime, &empty_offline_map());
 
         let following = state["following"].as_array().unwrap();
         assert_eq!(following.len(), 1);
@@ -10770,7 +11377,7 @@ mod tests {
             "format": "TV", "episodes": 12, "seasonYear": 2026
         });
 
-        add_following_entry_standard(&mut state, &anime);
+        add_following_entry_standard(&mut state, &anime, &empty_offline_map());
 
         let following = state["following"].as_array().unwrap();
         assert_eq!(following.len(), 1);
@@ -10793,12 +11400,203 @@ mod tests {
             "format": "TV", "episodes": 12, "seasonYear": 2026
         });
 
-        add_following_entry_standard(&mut state, &anime);
+        add_following_entry_standard(&mut state, &anime, &empty_offline_map());
 
         let following = state["following"].as_array().unwrap();
         assert_eq!(following.len(), 1);
         assert_eq!(following[0]["id"], 45678);
         assert_eq!(following[0]["displayTitle"], "示例动画");
+    }
+
+    // -- 跨键重追复活（取消后从另一侧卡片重追，墓碑/取消队列不得残留）--------
+
+    #[cfg(feature = "standard")]
+    #[test]
+    fn refollow_via_anilist_card_revives_tombstoned_bangumi_entry() {
+        // 主场景：bangumi S 取消（墓碑+取消队列）→ 从 AniList 卡片 A 重追
+        // → 复活 S 键条目、清墓碑、撤销取消队列；绝不新增 A 键第二条。
+        let map = cross_key_map();
+        let mut state = default_state(false);
+        state["following"] = json!([bangumi_following(45678, json!({"anilistId": 21355}))]);
+        assert!(remove_following(&mut state, 45678));
+        assert!(following_tombstone_exists(&state, 45678));
+        assert!(queue_contains_subject(&state, 45678));
+
+        let anilist_card = json!({
+            "id": 21355,
+            "title": {"native": "無職転生 III", "romaji": "Mushoku Tensei III", "english": null},
+            "coverImage": {"medium": "https://anilist.example/cover.jpg"},
+            "format": "TV", "episodes": 12, "seasonYear": 2026
+        });
+        add_following_entry_standard(&mut state, &anilist_card, &map);
+
+        let following = state["following"].as_array().unwrap();
+        assert_eq!(following.len(), 1, "复活为单条 S 键条目");
+        assert_eq!(following[0]["id"], 45678);
+        assert_eq!(following[0]["source"], "bangumi");
+        assert_eq!(following[0]["anilistId"], 21355);
+        assert_eq!(following[0]["mapping"]["method"], "manual");
+        assert_eq!(following[0]["mapping"]["confidence"], "high");
+        assert_eq!(following[0]["lastChangedBy"], "local");
+        assert_eq!(following[0]["displayTitle"], "无职转生 III");
+        // S 墓碑清除（复活语义），取消队列撤销。
+        assert!(!following_tombstone_exists(&state, 45678));
+        assert!(!queue_contains_subject(&state, 45678));
+
+        // 幂等：同一卡片再次重追（条目已存在）不新增、不走复活。
+        add_following_entry_standard(&mut state, &anilist_card, &map);
+        assert_eq!(state["following"].as_array().unwrap().len(), 1);
+        assert_eq!(state["following"][0]["id"], 45678);
+    }
+
+    #[cfg(feature = "standard")]
+    #[test]
+    fn refollow_via_bangumi_card_revives_cancelled_anilist_entry() {
+        // 对称场景：anilist A 取消（A 墓碑）→ 从 bangumi 卡片 S 重追 → 单条
+        // S 键复活，A 墓碑一并清除（重追即撤销删除意图）。
+        let map = cross_key_map();
+        let mut state = default_state(false);
+        state["following"] = json!([{
+            "id": 21355, "source": "anilist", "anilistId": null, "mapping": null,
+            "mappingPending": false,
+            "title": {"romaji": "Mushoku Tensei III", "english": null, "native": null},
+            "displayTitle": "Mushoku Tensei III",
+            "followedAt": 1_000, "syncUpdatedAt": 1_000
+        }]);
+        assert!(remove_following(&mut state, 21355));
+        assert!(following_tombstone_exists(&state, 21355));
+
+        let bangumi_card = json!({
+            "id": 45678, "source": "bangumi", "anilistId": 21355, "bangumiSubjectId": 45678,
+            "nameCn": "无职转生 III",
+            "title": {"native": "無職転生 III", "romaji": "Mushoku Tensei III", "english": null},
+            "coverImage": {"medium": "https://lain.bgm.tv/pic/cover/m/45678.jpg"},
+            "format": "TV", "episodes": 12, "seasonYear": 2026
+        });
+        add_following_entry_standard(&mut state, &bangumi_card, &map);
+
+        let following = state["following"].as_array().unwrap();
+        assert_eq!(following.len(), 1);
+        assert_eq!(following[0]["id"], 45678);
+        assert_eq!(following[0]["source"], "bangumi");
+        assert_eq!(following[0]["lastChangedBy"], "local");
+        assert!(!following_tombstone_exists(&state, 21355), "A 墓碑清除");
+        assert!(!following_tombstone_exists(&state, 45678));
+    }
+
+    #[cfg(feature = "standard")]
+    #[test]
+    fn refollow_same_card_keeps_single_entry_and_revokes_queue() {
+        // 无墓碑残留的普通重追回归（先取消后立刻重追同卡）：单条、墓碑清除、
+        // 取消队列即时撤销；S 从未存在时 AniList 卡片重追仍是普通 A 键新增。
+        let map = cross_key_map();
+        // 1) bangumi 卡片同卡重追。
+        let mut state = default_state(false);
+        state["following"] = json!([bangumi_following(45678, json!({}))]);
+        assert!(remove_following(&mut state, 45678));
+        let bangumi_card = json!({
+            "id": 45678, "source": "bangumi", "anilistId": null, "bangumiSubjectId": 45678,
+            "nameCn": "无职转生 III",
+            "title": {"native": "無職転生 III", "romaji": "Mushoku Tensei III", "english": null},
+            "coverImage": {"medium": "https://lain.bgm.tv/pic/cover/m/45678.jpg"},
+            "format": "TV", "episodes": 12, "seasonYear": 2026
+        });
+        add_following_entry_standard(&mut state, &bangumi_card, &map);
+        assert_eq!(state["following"].as_array().unwrap().len(), 1);
+        assert_eq!(state["following"][0]["id"], 45678);
+        assert!(!following_tombstone_exists(&state, 45678));
+        assert!(!queue_contains_subject(&state, 45678));
+
+        // 2) AniList 卡片重追（S 有映射但从未被追过、无墓碑）→ 普通 A 键新增。
+        let mut state = default_state(false);
+        let anilist_card = json!({
+            "id": 21355,
+            "title": {"native": "無職転生 III", "romaji": "Mushoku Tensei III", "english": null},
+            "coverImage": {"medium": "https://anilist.example/cover.jpg"},
+            "format": "TV", "episodes": 12, "seasonYear": 2026
+        });
+        add_following_entry_standard(&mut state, &anilist_card, &map);
+        let following = state["following"].as_array().unwrap();
+        assert_eq!(following.len(), 1);
+        assert_eq!(following[0]["id"], 21355);
+        assert_eq!(following[0]["source"], "anilist");
+    }
+
+    #[cfg(feature = "standard")]
+    fn queue_contains_subject(state: &Value, subject_id: i64) -> bool {
+        state
+            .get("pendingBangumiUnfollows")
+            .and_then(Value::as_array)
+            .is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|item| value_i64(item.get("subjectId")) == subject_id)
+            })
+    }
+
+    #[cfg(feature = "standard")]
+    #[test]
+    fn push_after_cross_key_refollow_writes_type3_not_type5() {
+        // 写回门禁：S 取消（墓碑+队列）→ AniList 卡片 A 重追复活 S 条目后，
+        // push_local_changes 对 S 走 type=3（doing）而非 type=5（抛弃）。
+        use crate::bangumi::test_support::MockBangumiServer;
+
+        let profile = include_str!("../fixtures/bangumi/user-profile.json").to_string();
+        let server = MockBangumiServer::spawn(Arc::new(
+            move |method, target, _headers, _body| {
+                if target == "/v0/me" {
+                    return (200, vec![], profile.clone());
+                }
+                if target.starts_with("/v0/users/anilog_dev/collections/45678") {
+                    // 远端无收藏记录 → 探测 404 → POST 创建。
+                    return (404, vec![], "{}".into());
+                }
+                if method == "POST" && target == "/v0/users/-/collections/45678" {
+                    return (204, vec![], String::new());
+                }
+                (404, vec![], "{}".into())
+            },
+        ));
+        let mut state = phase3_state("https://unused.example.com/v0");
+        state["following"] = json!([bangumi_following(45678, json!({"anilistId": 21355}))]);
+        assert!(remove_following(&mut state, 45678));
+        let anilist_card = json!({
+            "id": 21355,
+            "title": {"native": "無職転生 III", "romaji": "Mushoku Tensei III", "english": null},
+            "coverImage": {"medium": "https://anilist.example/cover.jpg"},
+            "format": "TV", "episodes": 12, "seasonYear": 2026
+        });
+        add_following_entry_standard(&mut state, &anilist_card, &cross_key_map());
+        assert_eq!(state["following"][0]["id"], 45678);
+        assert!(!queue_contains_subject(&state, 45678));
+
+        let state = std::sync::Mutex::new(state);
+        let tokens = bangumi::MemoryTokenStore::new();
+        tokens.store("refollow-token").unwrap();
+        let username_cache = std::sync::Mutex::new(None);
+        let client =
+            bangumi::HttpBangumiClient::with_base(bangumi_test_base(&server.url())).unwrap();
+        let episodes_cache = episodes_cache_dir("cross-key-refollow");
+        let push = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio test runtime")
+            .block_on(bangumi_sync::push_local_changes(
+                &client, &tokens, &username_cache, &state, &episodes_cache,
+            ));
+        assert!(push.errors.is_empty(), "{:?}", push.errors);
+        assert_eq!(push.pushed, 1);
+        let requests = server.requests();
+        // 写回必须是 type=3（复活条目按 doing 处理），绝不允许残留队列的 type=5。
+        assert!(requests.iter().all(|request| !request.body.contains("\"type\":5")));
+        let created = requests
+            .into_iter()
+            .find(|request| {
+                request.method == "POST" && request.target == "/v0/users/-/collections/45678"
+            })
+            .expect("POST create for revived entry");
+        let payload: Value = serde_json::from_str(&created.body).unwrap();
+        assert_eq!(payload["type"], 3);
     }
 
     // -- 问题 D：AniList 补充覆盖 / 完结钳制 / 月度并行 -----------------------
@@ -11138,7 +11936,7 @@ mod tests {
             "coverImage": {"medium": "https://lain.bgm.tv/pic/cover/m/1.jpg"},
             "episodes": 25
         });
-        add_following_entry_standard(&mut state, &anime);
+        add_following_entry_standard(&mut state, &anime, &empty_offline_map());
         assert_eq!(state["following"][0]["lastChangedBy"], "local");
 
         // 2) AniList 卡片 follow，但同作品 bangumi 键条目已存在 → 转正。
@@ -11148,7 +11946,7 @@ mod tests {
             "displayTitle": "旧标题", "followedAt": 1, "syncUpdatedAt": 1
         }]);
         let anilist_card = json!({"id": 21355, "title": {"english": "Re:Zero"}, "episodes": 25});
-        add_following_entry_standard(&mut state, &anilist_card);
+        add_following_entry_standard(&mut state, &anilist_card, &empty_offline_map());
         assert_eq!(state["following"].as_array().unwrap().len(), 1);
         assert_eq!(state["following"][0]["lastChangedBy"], "local");
 
@@ -11158,7 +11956,7 @@ mod tests {
             "id": 21355, "source": "anilist", "displayTitle": "旧键",
             "followedAt": 1, "syncUpdatedAt": 1
         }]);
-        add_following_entry_standard(&mut state, &anime);
+        add_following_entry_standard(&mut state, &anime, &empty_offline_map());
         assert_eq!(state["following"].as_array().unwrap().len(), 1);
         assert_eq!(state["following"][0]["id"], 140001);
         assert_eq!(state["following"][0]["lastChangedBy"], "local");
@@ -11907,7 +12705,11 @@ mod tests {
             .expect("tokio test runtime");
 
         let report = rt.block_on(bangumi_sync::push_local_changes(
-            &client, &tokens, &username_cache, &state,
+            &client,
+            &tokens,
+            &username_cache,
+            &state,
+            &episodes_cache_dir("collection-type"),
         ));
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(report.pushed, 4);
