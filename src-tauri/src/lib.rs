@@ -1823,6 +1823,10 @@ fn map_subjects_to_anime(
 fn get_state(_app: AppHandle, context: State<'_, AppContext>) -> Result<Value, String> {
     #[cfg(target_os = "android")]
     mobile::consume_events(&_app, &context).map_err(|error| error.to_string())?;
+    // Phase 4 任务 2：Android 前台过期检查（进程内标志 + single-flight 防重复，
+    // spawn 后台补偿、不阻塞返回；original edition 不编译此行，桌面零变化）。
+    #[cfg(all(feature = "standard", target_os = "android"))]
+    maybe_spawn_foreground_sync(&_app, &context);
     Ok(context.public_state())
 }
 
@@ -4095,52 +4099,114 @@ fn merge_bangumi_sync_status(state: &mut Value, patch: bangumi::BangumiSyncStatu
     }
 }
 
+/// Phase 4 拆分（LOCAL 方案 §7.4）：Bangumi 全量同步的作用域判定（纯函数，
+/// 测试锁定 skipped 语义）。坚果云合并与播出数据刷新**无条件**执行，Bangumi
+/// 开关/Token 只决定 Bangumi 网络段（步骤 3-5）是否运行——Android 前台过期
+/// 补偿跨进程靠 lastFullSyncAt 更新自然节流，skipped 路径也必须刷新本地
+/// 数据并落状态（否则每次前台都会重复触发补偿）。
+#[cfg(feature = "standard")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BangumiSyncScope {
+    /// 开关开启且 Token 就绪：七步全量。
+    Full,
+    /// 开关关闭或无 Token：坚果云 + 播出数据照常，仅跳过 Bangumi 网络段。
+    LocalOnly {
+        /// 用户可读的跳过原因（不包含任何凭据信息）。
+        reason: &'static str,
+    },
+}
+
+#[cfg(feature = "standard")]
+fn bangumi_sync_scope(sync_enabled: bool, has_token: bool) -> BangumiSyncScope {
+    if !sync_enabled {
+        BangumiSyncScope::LocalOnly {
+            reason: "Bangumi 同步未启用",
+        }
+    } else if !has_token {
+        BangumiSyncScope::LocalOnly {
+            reason: "尚未保存 Bangumi Token",
+        }
+    } else {
+        BangumiSyncScope::Full
+    }
+}
+
 /// Phase 3 任务 4：`bangumi_sync_now` 完整同步（LOCAL 方案 §7.3 七步）：
 /// 1) 坚果云同步 2) 主数据轻刷新 3) 收藏拉取合并 4) 合并（引擎内落账）
 /// 5) 写回（按开关）6) 唤醒 WebDAV 上传 7) 重排 + 同步状态更新。
+/// Phase 4 拆分：步骤 1/2/6/7 无条件执行（skipped 语义见 [`BangumiSyncScope`]），
+/// Bangumi 开关/Token 只门控步骤 3-5。
 /// 错误摘要只含用户可读文案（BangumiApiError Display 经测试锁定不含
 /// Token/Authorization），截断 300 字符。
 #[cfg(feature = "standard")]
 async fn run_full_bangumi_sync(app: &AppHandle, context: &AppContext) -> Result<Value, String> {
-    let mut report = bangumi::BangumiSyncReport::default();
-    let mut error_summary: Vec<String> = Vec::new();
-    let settings = {
+    let sync_enabled = {
         let state = context.state.lock().map_err(|_| "状态锁不可用")?;
-        bangumi_sync::sync_settings(&state)
+        bangumi_sync::sync_settings(&state).sync_enabled
     };
-    let zero_report = || serde_json::to_value(bangumi::BangumiSyncReport::default()).unwrap_or_default();
-    if !settings.sync_enabled {
-        return Ok(json!({"ok": true, "message": "Bangumi 同步未启用", "report": zero_report()}));
-    }
     let has_token = context
         .bangumi_tokens
         .load()
         .ok()
         .flatten()
         .is_some_and(|token| !token.trim().is_empty());
-    if !has_token {
-        return Ok(json!({"ok": true, "message": "尚未保存 Bangumi Token", "report": zero_report()}));
-    }
-
-    // 1) 坚果云同步（三字段业务数据先合流）。
-    match perform_platform_webdav_sync(app, context).await {
-        Ok(_) => {
-            let mut state = context.state.lock().map_err(|_| "状态锁不可用")?;
-            merge_bangumi_sync_status(
-                &mut state,
-                bangumi::BangumiSyncStatus {
-                    last_web_dav_sync_at: Some(now_seconds()),
-                    ..bangumi::BangumiSyncStatus::default()
-                },
-            );
-        }
-        Err(error) => error_summary.push(format!("坚果云同步失败：{error}")),
-    }
-    // 2) 主数据轻刷新（播出调度 / 任务）。
+    let scope = bangumi_sync_scope(sync_enabled, has_token);
+    // LocalOnly 且 WebDAV 未启用时静默跳过坚果云步骤：不给未使用坚果云的
+    // 用户写 lastSyncError（否则前台错误重试兜底会无意义地反复触发）。
+    // Full 作用域保持 Phase 3 行为：始终尝试，失败计入错误摘要。
+    let webdav = if scope == BangumiSyncScope::Full || webdav_is_enabled(app, context) {
+        Some(perform_platform_webdav_sync(app, context))
+    } else {
+        None
+    };
+    // 2) 主数据轻刷新：Android 桥为同步调用（错误忽略，保持 Phase 3 `let _`
+    //    语义，经 async 块延迟到步骤 2 位置执行）；桌面复用 sync_now_inner。
     #[cfg(target_os = "android")]
-    let _ = mobile::sync_native(app, context);
+    let schedule = async move {
+        let _ = mobile::sync_native(app, context);
+        Ok::<Value, String>(json!({}))
+    };
     #[cfg(not(target_os = "android"))]
-    if let Err(error) = sync_now_inner(app, context).await {
+    let schedule = sync_now_inner(app, context);
+    let payload = run_full_bangumi_sync_core(context, scope, webdav, schedule).await?;
+    refresh_mobile_configuration(app, context)?;
+    emit_state(app, context);
+    Ok(payload)
+}
+
+/// Phase 4 拆分：七步编排核心。`webdav` / `schedule` 两个步骤 future 由调用方
+/// 注入（生产 = 平台实现；测试 = 记录型闭包），其余五步直接驱动 `context`，
+/// 使"无 Token → 坚果云步骤仍执行"可离线回归测试（无需 AppHandle）。
+#[cfg(feature = "standard")]
+async fn run_full_bangumi_sync_core(
+    context: &AppContext,
+    scope: BangumiSyncScope,
+    webdav: Option<impl std::future::Future<Output = anyhow::Result<Value>>>,
+    schedule: impl std::future::Future<Output = Result<Value, String>>,
+) -> Result<Value, String> {
+    let mut report = bangumi::BangumiSyncReport::default();
+    let mut error_summary: Vec<String> = Vec::new();
+    // 1) 坚果云同步（三字段业务数据先合流）。Phase 4：不受 Bangumi 开关/Token
+    //    门控；webdav=None 表示本机未启用坚果云（仅 LocalOnly 场景），静默跳过。
+    let webdav_ran = webdav.is_some();
+    if let Some(webdav) = webdav {
+        match webdav.await {
+            Ok(_) => {
+                let mut state = context.state.lock().map_err(|_| "状态锁不可用")?;
+                merge_bangumi_sync_status(
+                    &mut state,
+                    bangumi::BangumiSyncStatus {
+                        last_web_dav_sync_at: Some(now_seconds()),
+                        ..bangumi::BangumiSyncStatus::default()
+                    },
+                );
+            }
+            Err(error) => error_summary.push(format!("坚果云同步失败：{error}")),
+        }
+    }
+    // 2) 主数据轻刷新（播出调度 / 任务）——schedule future 由调用方注入
+    //    （Android = mobile 桥；桌面 = sync_now_inner）。
+    if let Err(error) = schedule.await {
         error_summary.push(format!("主数据刷新失败：{error}"));
     }
     {
@@ -4153,56 +4219,60 @@ async fn run_full_bangumi_sync(app: &AppHandle, context: &AppContext) -> Result<
             },
         );
     }
-    // 3+4) 收藏拉取合并（引擎内落账）。
-    let base = {
-        let state = context.state.lock().map_err(|_| "状态锁不可用")?;
-        bangumi_base_urls(&state)
-    };
-    let http = bangumi::HttpBangumiClient::new(context.client.clone(), base);
-    let pull_report = bangumi_sync::run_bangumi_collection_sync(
-        &http,
-        context.bangumi_tokens.as_ref(),
-        &context.bangumi_username_cache,
-        &context.state,
-        &context.offline_bangumi,
-    )
-    .await;
-    report.pulled = pull_report.pulled;
-    report.followed = pull_report.followed;
-    report.unfollowed = pull_report.unfollowed;
-    report.completed_tasks = pull_report.completed_tasks;
-    report.suggestions = pull_report.suggestions;
-    report.conflicts = pull_report.conflicts;
-    for error in &pull_report.errors {
-        report.errors.push(error.clone());
-    }
-    error_summary.extend(pull_report.errors.iter().cloned());
-    let pull_touched = pull_report.followed > 0
-        || pull_report.unfollowed > 0
-        || pull_report.completed_tasks > 0
-        || !pull_report.errors.is_empty();
-    if pull_touched {
-        context.save_state().map_err(|error| error.to_string())?;
-    }
-    // 5) 写回（按开关）。
-    let push_report = bangumi_sync::push_local_changes(
-        &http,
-        context.bangumi_tokens.as_ref(),
-        &context.bangumi_username_cache,
-        &context.state,
-    )
-    .await;
-    report.pushed += push_report.pushed;
-    for error in &push_report.errors {
-        report.errors.push(error.clone());
-    }
-    error_summary.extend(push_report.errors.iter().cloned());
-    if push_report.pushed > 0 {
-        context.save_state().map_err(|error| error.to_string())?;
+    // 3+4) 收藏拉取合并（引擎内落账）+ 5) 写回——仅 Full 作用域执行
+    // （Phase 4 拆分：开关关闭/无 Token 时跳过 Bangumi 网络段）。
+    if scope == BangumiSyncScope::Full {
+        let base = {
+            let state = context.state.lock().map_err(|_| "状态锁不可用")?;
+            bangumi_base_urls(&state)
+        };
+        let http = bangumi::HttpBangumiClient::new(context.client.clone(), base);
+        let pull_report = bangumi_sync::run_bangumi_collection_sync(
+            &http,
+            context.bangumi_tokens.as_ref(),
+            &context.bangumi_username_cache,
+            &context.state,
+            &context.offline_bangumi,
+        )
+        .await;
+        report.pulled = pull_report.pulled;
+        report.followed = pull_report.followed;
+        report.unfollowed = pull_report.unfollowed;
+        report.completed_tasks = pull_report.completed_tasks;
+        report.suggestions = pull_report.suggestions;
+        report.conflicts = pull_report.conflicts;
+        for error in &pull_report.errors {
+            report.errors.push(error.clone());
+        }
+        error_summary.extend(pull_report.errors.iter().cloned());
+        let pull_touched = pull_report.followed > 0
+            || pull_report.unfollowed > 0
+            || pull_report.completed_tasks > 0
+            || !pull_report.errors.is_empty();
+        if pull_touched {
+            context.save_state().map_err(|error| error.to_string())?;
+        }
+        // 5) 写回（按开关）。
+        let push_report = bangumi_sync::push_local_changes(
+            &http,
+            context.bangumi_tokens.as_ref(),
+            &context.bangumi_username_cache,
+            &context.state,
+        )
+        .await;
+        report.pushed += push_report.pushed;
+        for error in &push_report.errors {
+            report.errors.push(error.clone());
+        }
+        error_summary.extend(push_report.errors.iter().cloned());
+        if push_report.pushed > 0 {
+            context.save_state().map_err(|error| error.to_string())?;
+        }
     }
     // 6) 唤醒 WebDAV 后台上传合并后的三字段文档。
     context.webdav_wakeup.notify_one();
-    // 7) 重排 + 同步状态更新。
+    // 7) 重排 + 同步状态更新（成功/失败/skipped 都更新 lastFullSyncAt，
+    //    供 Android 前台过期补偿跨进程节流）。
     {
         let mut state = context.state.lock().map_err(|_| "状态锁不可用")?;
         let joined = error_summary.join("；");
@@ -4221,16 +4291,174 @@ async fn run_full_bangumi_sync(app: &AppHandle, context: &AppContext) -> Result<
         );
     }
     context.save_state().map_err(|error| error.to_string())?;
-    refresh_mobile_configuration(app, context)?;
-    emit_state(app, context);
     let ok = report.errors.is_empty();
-    let message = if ok {
-        "Bangumi 同步完成".to_string()
-    } else {
-        format!("同步完成，但出现 {} 条错误", report.errors.len())
+    let message = match scope {
+        BangumiSyncScope::Full => {
+            if ok {
+                "Bangumi 同步完成".to_string()
+            } else {
+                format!("同步完成，但出现 {} 条错误", report.errors.len())
+            }
+        }
+        BangumiSyncScope::LocalOnly { reason } => {
+            if webdav_ran {
+                format!("{reason}；坚果云与播出数据已按需刷新")
+            } else {
+                format!("{reason}；播出数据已按需刷新")
+            }
+        }
     };
     Ok(json!({"ok": ok, "message": message, "report": serde_json::to_value(&report).unwrap_or_default()}))
 }
+
+// ---------------------------------------------------------------------------
+// Phase 4：Android 前台过期同步补偿（LOCAL 方案 §7.4）。
+//
+// 主保障是 Java 层 WorkManager（~6h，CONNECTED 约束）+ AlarmManager；Rust 侧
+// 仅做前台轻量兜底：应用启动（setup，任务 1）与 get_state（任务 2，含
+// consume_events 事件循环之后）时检查顶层 bangumiSyncStatus.lastFullSyncAt
+// 是否过期（无记录视为过期；距 now 超 15 分钟过期），过期则在本进程内补偿
+// 一次 run_full_bangumi_sync（内部已含开关/Token 判断与七步编排）；另对
+// "上次同步有错误"场景（任务 3）按 30 分钟节流做前台重试。同步完成/失败/
+// skipped 都由 run_full_bangumi_sync 步骤 7 落 bangumiSyncStatus，跨进程靠
+// lastFullSyncAt 已更新自然节流。Windows 桌面路径零变化（下方接线全部
+// Android + standard 双门控编译；桌面后台仍是 start_webdav_background /
+// start_desktop_background 原逻辑）。
+// ---------------------------------------------------------------------------
+
+/// Phase 4：前台过期同步补偿的纯判定逻辑 + single-flight 门。生产接线只在
+/// Android 编译；桌面构建下这些项仅供离线测试使用（allow(dead_code)）。
+#[cfg(feature = "standard")]
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+mod foreground_sync {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// 前台过期阈值：距上次全量同步超过 15 分钟（900 秒）视为过期。
+    pub const STALE_AFTER_SECS: i64 = 900;
+    /// 错误重试阈值：距上次同步尝试超过 30 分钟才再次补偿。
+    pub const ERROR_RETRY_AFTER_SECS: i64 = 1_800;
+
+    /// lastFullSyncAt 三态（now 注入，便于测试边界）。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum SyncStaleness {
+        /// 无 lastFullSyncAt 记录，视为过期需补偿。
+        Missing,
+        /// 距 now 超过阈值，需补偿。
+        Stale,
+        /// 新鲜（含恰好等于阈值的边界："超 15 分钟"为严格大于），无需补偿。
+        Fresh,
+    }
+
+    pub fn staleness(last_full_sync_at: Option<i64>, now: i64) -> SyncStaleness {
+        match last_full_sync_at {
+            None => SyncStaleness::Missing,
+            Some(at) if now.saturating_sub(at) > STALE_AFTER_SECS => SyncStaleness::Stale,
+            Some(_) => SyncStaleness::Fresh,
+        }
+    }
+
+    /// 任务 3 错误重试判定：lastSyncError 非空且距上次尝试超 30 分钟。
+    /// 上次尝试时间缺失（None）时不重试（从未同步过没有可重试的错误语境）；
+    /// 每次尝试都会刷新 lastBangumiSyncAt，失败场景最多每 30 分钟兜底一次。
+    pub fn error_retry_due(
+        last_sync_error: Option<&str>,
+        last_attempt_at: Option<i64>,
+        now: i64,
+    ) -> bool {
+        let has_error = last_sync_error.is_some_and(|error| !error.trim().is_empty());
+        has_error
+            && last_attempt_at.is_some_and(|at| now.saturating_sub(at) > ERROR_RETRY_AFTER_SECS)
+    }
+
+    /// 进程内 single-flight 门：compare_exchange 保证并发下只有一个赢家
+    /// （任务 1/2/3 共用，同一时刻最多一个补偿同步在跑）。
+    pub struct SingleFlightGate(AtomicBool);
+
+    impl SingleFlightGate {
+        pub const fn new() -> Self {
+            Self(AtomicBool::new(false))
+        }
+        /// 尝试占用门；已有任务在跑时返回 false。
+        pub fn try_begin(&self) -> bool {
+            self.0
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        }
+        /// 释放门（补偿同步结束后调用）。
+        pub fn finish(&self) {
+            self.0.store(false, Ordering::Release);
+        }
+        pub fn is_running(&self) -> bool {
+            self.0.load(Ordering::Acquire)
+        }
+    }
+}
+
+/// 进程生命周期内过期补偿只执行一次的标志（任务 1/2 共用：防应用频繁重启
+/// 场景下同进程重复触发；跨进程由 lastFullSyncAt 已更新自然节流）。
+#[cfg(all(feature = "standard", target_os = "android"))]
+static STALE_COMPENSATION_DONE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 任务 1/2/3 共用的 single-flight 门：同一时刻最多一个补偿同步在跑。
+#[cfg(all(feature = "standard", target_os = "android"))]
+static COMPENSATION_GATE: foreground_sync::SingleFlightGate =
+    foreground_sync::SingleFlightGate::new();
+
+/// 读取顶层 bangumiSyncStatus 五字段（本地-only，document_from_state 不外发；
+/// 缺失/损坏按默认值处理，即无 lastFullSyncAt → 视为过期）。
+#[cfg(all(feature = "standard", target_os = "android"))]
+fn current_bangumi_sync_status(context: &AppContext) -> bangumi::BangumiSyncStatus {
+    context
+        .state
+        .lock()
+        .ok()
+        .and_then(|state| state.get("bangumiSyncStatus").cloned())
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default()
+}
+
+/// Android 前台过期补偿统一入口（任务 1/2/3）：判定过期/错误重试后以
+/// single-flight 方式 spawn 后台 run_full_bangumi_sync，不阻塞调用方。
+#[cfg(all(feature = "standard", target_os = "android"))]
+fn maybe_spawn_foreground_sync(app: &AppHandle, context: &AppContext) {
+    if COMPENSATION_GATE.is_running() {
+        return;
+    }
+    let status = current_bangumi_sync_status(context);
+    let now = now_seconds();
+    // 任务 1/2：过期补偿（进程内一次；Missing 视为过期）。
+    let stale_due = !STALE_COMPENSATION_DONE.load(Ordering::Acquire)
+        && foreground_sync::staleness(status.last_full_sync_at, now)
+            != foreground_sync::SyncStaleness::Fresh;
+    // 任务 3：错误重试（与过期补偿独立节流：lastSyncError 非空且距上次
+    // 尝试 lastBangumiSyncAt 超 30 分钟；Rust 仅前台兜底，主保障是 Java
+    // WorkManager 的 CONNECTED 约束 + BootReceiver）。
+    let error_due = foreground_sync::error_retry_due(
+        status.last_sync_error.as_deref(),
+        status.last_bangumi_sync_at,
+        now,
+    );
+    if !stale_due && !error_due {
+        return;
+    }
+    if stale_due {
+        // 先置位再 spawn：并发调用方（setup / get_state）不会重复触发。
+        STALE_COMPENSATION_DONE.store(true, Ordering::Release);
+    }
+    if !COMPENSATION_GATE.try_begin() {
+        return;
+    }
+    let app = app.clone();
+    let context = context.clone();
+    tauri::async_runtime::spawn(async move {
+        // 成功/失败/skipped 都由 run_full_bangumi_sync 落 bangumiSyncStatus，
+        // 错误无需在此重复记录。
+        let _ = run_full_bangumi_sync(&app, &context).await;
+        COMPENSATION_GATE.finish();
+    });
+}
+
 
 /// Original 版 `bangumi_sync_now` 的统一拒绝返回（report 零值，camelCase 形状
 /// 与 standard 版一致，供前端类型稳定）。
@@ -5573,6 +5801,10 @@ pub fn run() {
                 mobile::configure(app.handle(), &context)?;
                 mobile::consume_events(app.handle(), &context)?;
             }
+            // Phase 4 任务 1：Android 前台过期同步补偿（setup 完成后异步执行，
+            // 仅 standard edition；Windows 桌面启动路径零变化）。
+            #[cfg(all(feature = "standard", target_os = "android"))]
+            maybe_spawn_foreground_sync(app.handle(), &context);
             #[cfg(desktop)]
             {
                 tauri::window::WindowBuilder::new(app, "background")
@@ -8411,6 +8643,230 @@ mod tests {
         // 幂等：已不存在的条目不再入队。
         assert!(!remove_following(&mut state, 100));
         assert_eq!(state["pendingBangumiUnfollows"].as_array().unwrap().len(), 1);
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 4：Android 前台过期同步补偿（foreground_sync 纯逻辑 +
+    // run_full_bangumi_sync skipped 语义回归锁定）。Windows 测试直接覆盖
+    // standard 门控的纯函数/核心编排，证明桌面路径未被 cfg 侵入。
+    // ------------------------------------------------------------------
+
+    /// 任务 4.1：过期判定三态（缺失/过期/新鲜，注入 now；边界恰好 900 秒
+    /// 为"未超"，严格大于才算过期）。
+    #[cfg(feature = "standard")]
+    #[test]
+    fn foreground_sync_staleness_three_states_with_injected_now() {
+        use foreground_sync::{STALE_AFTER_SECS, SyncStaleness, staleness};
+        let now = 1_760_000_000;
+        // 缺失：无 lastFullSyncAt 视为过期（需补偿）。
+        assert_eq!(staleness(None, now), SyncStaleness::Missing);
+        // 过期：距 now 严格大于 900 秒。
+        assert_eq!(
+            staleness(Some(now - STALE_AFTER_SECS - 1), now),
+            SyncStaleness::Stale
+        );
+        assert_eq!(staleness(Some(now - 30 * 60), now), SyncStaleness::Stale);
+        // 新鲜：15 分钟内，含恰好等于阈值的边界。
+        assert_eq!(staleness(Some(now - STALE_AFTER_SECS), now), SyncStaleness::Fresh);
+        assert_eq!(staleness(Some(now - 60), now), SyncStaleness::Fresh);
+        assert_eq!(staleness(Some(now), now), SyncStaleness::Fresh);
+        // 未来时间戳（时钟偏移）不 panic、按新鲜处理。
+        assert_eq!(staleness(Some(now + 120), now), SyncStaleness::Fresh);
+    }
+
+    /// 任务 4.1 补充：错误重试判定（lastSyncError 非空 + 距上次尝试超 30 分钟）。
+    #[cfg(feature = "standard")]
+    #[test]
+    fn foreground_sync_error_retry_throttled_to_thirty_minutes() {
+        use foreground_sync::{ERROR_RETRY_AFTER_SECS, error_retry_due};
+        let now = 1_760_000_000;
+        // 无错误（None / 空串 / 空白）不重试。
+        assert_eq!(error_retry_due(None, Some(now - 4 * 3600), now), false);
+        assert_eq!(error_retry_due(Some(""), Some(now - 4 * 3600), now), false);
+        assert_eq!(error_retry_due(Some("  "), Some(now - 4 * 3600), now), false);
+        // 有错误但从未同步过（无上次尝试时间）不重试。
+        assert_eq!(error_retry_due(Some("网络错误"), None, now), false);
+        // 有错误且距上次尝试超过 30 分钟 → 重试。
+        assert_eq!(
+            error_retry_due(Some("网络错误"), Some(now - ERROR_RETRY_AFTER_SECS - 1), now),
+            true
+        );
+        // 边界：恰好 30 分钟为"未超"，不重试。
+        assert_eq!(
+            error_retry_due(Some("网络错误"), Some(now - ERROR_RETRY_AFTER_SECS), now),
+            false
+        );
+        // 刚失败不久不重试。
+        assert_eq!(error_retry_due(Some("网络错误"), Some(now - 60), now), false);
+    }
+
+    /// 任务 4.2：single-flight 并发两次只跑一次（8 线程竞争只有 1 个赢家；
+    /// finish 后可再次占用，串行重入被拒绝）。
+    #[cfg(feature = "standard")]
+    #[test]
+    fn single_flight_gate_only_one_winner_under_concurrency() {
+        use std::sync::Barrier;
+        let gate = Arc::new(foreground_sync::SingleFlightGate::new());
+        let barrier = Arc::new(Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let gate = Arc::clone(&gate);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    gate.try_begin()
+                })
+            })
+            .collect();
+        let winners = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .filter(|won| *won)
+            .count();
+        assert_eq!(winners, 1);
+        assert!(gate.is_running());
+        // 持有期间重入被拒绝。
+        assert!(!gate.try_begin());
+        gate.finish();
+        // 释放后可再次占用（任务 3 的 30 分钟错误重试依赖此语义）。
+        assert!(gate.try_begin());
+        gate.finish();
+        assert!(gate.try_begin());
+    }
+
+    /// 任务 4.3：skipped 语义判定——开关关闭 / 无 Token 都落到 LocalOnly
+    /// （= 坚果云与播出数据步骤仍执行、仅 Bangumi 网络段跳过）。
+    #[cfg(feature = "standard")]
+    #[test]
+    fn bangumi_sync_scope_local_only_when_disabled_or_no_token() {
+        assert_eq!(
+            bangumi_sync_scope(false, true),
+            BangumiSyncScope::LocalOnly { reason: "Bangumi 同步未启用" }
+        );
+        // 无 Token：LocalOnly（回归锁定——不再整体早退，坚果云步骤仍执行）。
+        assert_eq!(
+            bangumi_sync_scope(true, false),
+            BangumiSyncScope::LocalOnly { reason: "尚未保存 Bangumi Token" }
+        );
+        assert_eq!(
+            bangumi_sync_scope(false, false),
+            BangumiSyncScope::LocalOnly { reason: "Bangumi 同步未启用" }
+        );
+        assert_eq!(bangumi_sync_scope(true, true), BangumiSyncScope::Full);
+    }
+
+    /// 任务 4.3：核心编排回归——LocalOnly（无 Token）作用域下坚果云与播出
+    /// 数据步骤仍执行、Bangumi 网络段跳过（report 零值）、lastFullSyncAt 落
+    /// 状态（Android 前台补偿跨进程节流依据）；webdav=None（本机未启用坚果
+    /// 云）时静默跳过、不写 lastSyncError。
+    #[cfg(feature = "standard")]
+    #[test]
+    fn full_sync_core_without_token_still_runs_webdav_and_schedule() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "anilog-phase4-core-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        fs::create_dir_all(&data_dir).unwrap();
+        let context = AppContext {
+            state: Arc::new(Mutex::new(default_state(false))),
+            runtime: Arc::new(Mutex::new(json!({}))),
+            data_dir: data_dir.clone(),
+            cache_dir: data_dir.join("cache"),
+            client: reqwest::Client::new(),
+            original: false,
+            sync_wakeup: Arc::new(tokio::sync::Notify::new()),
+            webdav_wakeup: Arc::new(tokio::sync::Notify::new()),
+            webdav_sync_lock: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(desktop)]
+            main_window_opening: Arc::new(AtomicBool::new(false)),
+            bangumi_lookup_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bangumi_unavailable_until: Arc::new(AtomicI64::new(0)),
+            offline_bangumi: Arc::new(json!({})),
+            // MemoryTokenStore：无 Token → LocalOnly 作用域。
+            bangumi_tokens: Arc::new(bangumi::MemoryTokenStore::new()),
+            bangumi_username_cache: Arc::new(Mutex::new(None)),
+        };
+        let webdav_calls = Arc::new(AtomicI64::new(0));
+        let schedule_calls = Arc::new(AtomicI64::new(0));
+
+        let payload = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio test runtime")
+            .block_on(async {
+                let webdav_future = {
+                    let calls = Arc::clone(&webdav_calls);
+                    async move {
+                        calls.fetch_add(1, Ordering::AcqRel);
+                        Ok::<Value, anyhow::Error>(json!({"ok": true}))
+                    }
+                };
+                let schedule_future = {
+                    let calls = Arc::clone(&schedule_calls);
+                    async move {
+                        calls.fetch_add(1, Ordering::AcqRel);
+                        Ok::<Value, String>(json!({}))
+                    }
+                };
+                run_full_bangumi_sync_core(
+                    &context,
+                    bangumi_sync_scope(false, false),
+                    Some(webdav_future),
+                    schedule_future,
+                )
+                .await
+                .expect("core sync succeeds")
+            });
+
+        // skipped 消息 + 零值 report；两步骤均执行。
+        assert_eq!(payload["ok"], true);
+        assert_eq!(
+            payload["message"],
+            "Bangumi 同步未启用；坚果云与播出数据已按需刷新"
+        );
+        assert_eq!(payload["report"]["pulled"], 0);
+        assert_eq!(payload["report"]["pushed"], 0);
+        assert_eq!(webdav_calls.load(Ordering::Acquire), 1);
+        assert_eq!(schedule_calls.load(Ordering::Acquire), 1);
+        // lastFullSyncAt / lastWebDavSyncAt 已落状态（前台补偿节流依据），
+        // 无错误（Bangumi 段跳过不算错误）。
+        let state = context.state.lock().unwrap();
+        let status: bangumi::BangumiSyncStatus =
+            serde_json::from_value(state["bangumiSyncStatus"].clone()).unwrap();
+        assert!(status.last_full_sync_at.is_some());
+        assert!(status.last_web_dav_sync_at.is_some());
+        assert!(status.last_bangumi_sync_at.is_some());
+        assert_eq!(status.last_sync_error.as_deref(), Some(""));
+        drop(state);
+
+        // webdav=None（LocalOnly 且本机未启用坚果云）：静默跳过、无错误、
+        // 不更新 lastWebDavSyncAt。
+        let payload = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio test runtime")
+            .block_on(async {
+                let no_webdav: Option<std::future::Ready<anyhow::Result<Value>>> = None;
+                run_full_bangumi_sync_core(
+                    &context,
+                    BangumiSyncScope::LocalOnly { reason: "尚未保存 Bangumi Token" },
+                    no_webdav,
+                    async { Ok::<Value, String>(json!({})) },
+                )
+                .await
+                .expect("core sync succeeds")
+            });
+        assert_eq!(
+            payload["message"],
+            "尚未保存 Bangumi Token；播出数据已按需刷新"
+        );
+        let state = context.state.lock().unwrap();
+        let status: bangumi::BangumiSyncStatus =
+            serde_json::from_value(state["bangumiSyncStatus"].clone()).unwrap();
+        assert_eq!(status.last_sync_error.as_deref(), Some(""));
+        drop(state);
+        let _ = fs::remove_dir_all(&data_dir);
     }
 
     #[cfg(feature = "original")]

@@ -25,6 +25,9 @@ android {
         targetSdk = 36
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "7").toInt()
         versionName = tauriProperties.getProperty("tauri.android.versionName", "0.6.0")
+        // 与上方 isOriginalEdition 同源（ANILOG_ANDROID_EDITION），Java 层运行时判断 edition，
+        // 用于 original 拒绝一切 Bangumi 请求。
+        buildConfigField("boolean", "isOriginalEdition", isOriginalEdition.toString())
     }
     buildTypes {
         getByName("debug") {
@@ -70,6 +73,8 @@ dependencies {
     implementation("androidx.core:core-ktx:1.17.0")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     testImplementation("junit:junit:4.13.2")
+    // 本地单元测试使用真实 org.json（android.jar 的 org.json 是 stub，会抛 "not mocked"）。
+    testImplementation("org.json:json:20240303")
     androidTestImplementation("androidx.test.ext:junit:1.1.4")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.5.0")
 }

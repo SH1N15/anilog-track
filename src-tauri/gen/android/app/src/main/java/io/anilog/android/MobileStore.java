@@ -21,6 +21,18 @@ final class MobileStore {
     private static final String DAILY_TASK_REMINDER = "daily_task_reminder_enabled";
     private static final String DAILY_TASK_REMINDER_TIME = "daily_task_reminder_time";
     private static final String LAST_TASK_REMINDER_DATE = "last_task_reminder_date";
+    // Phase 4 后台完整同步新增（全部本地-only，绝不进坚果云文档）：
+    private static final String TOMBSTONES = "following_deleted_at";
+    private static final String LAST_FULL_SYNC = "last_full_sync_at";
+    private static final String LAST_WEBDAV_SYNC = "last_webdav_sync_at";
+    private static final String LAST_BANGUMI_SYNC = "last_bangumi_sync_at";
+    private static final String LAST_SCHEDULE_SYNC = "last_schedule_sync_at";
+    private static final String LAST_SYNC_ERROR = "last_sync_error";
+    private static final String BANGUMI_API_BASE_URL = "bangumi_api_base_url";
+    private static final String PULL_COLLECTIONS = "pull_collections_enabled";
+    private static final String BANGUMI_SUGGESTIONS = "pending_bangumi_suggestions";
+    private static final String SYNC_INTERVAL_HOURS = "sync_interval_hours";
+    private static final String SCHEDULED_INTERVAL_HOURS = "scheduled_interval_hours";
     private static final Object LOCK = new Object();
 
     private MobileStore() {}
@@ -197,6 +209,124 @@ final class MobileStore {
 
     static void requestOpenTasks(Context context) {
         prefs(context).edit().putBoolean(OPEN_TASKS, true).apply();
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 4 后台完整同步：本地状态读写（WebDAV 合并写回 + 同步状态 + 设置）
+    // ------------------------------------------------------------------
+
+    /** 直接替换 following 列表（仅后台 Worker 的坚果云合并写回使用；前台由 Rust configure 驱动）。 */
+    static void setFollowing(Context context, JSONArray following) {
+        synchronized (LOCK) {
+            prefs(context).edit().putString(FOLLOWING, following == null ? "[]" : following.toString()).apply();
+        }
+    }
+
+    /** 直接替换 pending 任务列表（仅后台 Worker 的坚果云合并写回使用）。 */
+    static void setPendingTasks(Context context, JSONArray pendingTasks) {
+        synchronized (LOCK) {
+            prefs(context).edit().putString(PENDING_TASKS, pendingTasks == null ? "[]" : pendingTasks.toString()).apply();
+        }
+    }
+
+    /** 取消追番墓碑（{animeId: 毫秒时间戳}），与 Rust syncMetadata.followingDeletedAt 同语义。 */
+    static JSONObject tombstones(Context context) {
+        synchronized (LOCK) {
+            try {
+                return new JSONObject(prefs(context).getString(TOMBSTONES, "{}"));
+            } catch (JSONException error) {
+                return new JSONObject();
+            }
+        }
+    }
+
+    static void setTombstones(Context context, JSONObject tombstones) {
+        prefs(context).edit().putString(TOMBSTONES, tombstones == null ? "{}" : tombstones.toString()).apply();
+    }
+
+    /** 同步状态五字段（秒级时间戳；与 Rust BangumiSyncStatus 单位一致，仅本地展示）。 */
+    static long lastFullSyncAt(Context context) { return prefs(context).getLong(LAST_FULL_SYNC, 0); }
+
+    static long lastWebDavSyncAt(Context context) { return prefs(context).getLong(LAST_WEBDAV_SYNC, 0); }
+
+    static long lastBangumiSyncAt(Context context) { return prefs(context).getLong(LAST_BANGUMI_SYNC, 0); }
+
+    static long lastScheduleSyncAt(Context context) { return prefs(context).getLong(LAST_SCHEDULE_SYNC, 0); }
+
+    static void setLastFullSyncAt(Context context, long epochSeconds) {
+        prefs(context).edit().putLong(LAST_FULL_SYNC, epochSeconds).apply();
+    }
+
+    static void setLastWebDavSyncAt(Context context, long epochSeconds) {
+        prefs(context).edit().putLong(LAST_WEBDAV_SYNC, epochSeconds).apply();
+    }
+
+    static void setLastBangumiSyncAt(Context context, long epochSeconds) {
+        prefs(context).edit().putLong(LAST_BANGUMI_SYNC, epochSeconds).apply();
+    }
+
+    static void setLastScheduleSyncAt(Context context, long epochSeconds) {
+        prefs(context).edit().putLong(LAST_SCHEDULE_SYNC, epochSeconds).apply();
+    }
+
+    /** 最近一次同步错误摘要；绝不写入 token/凭据（写入前由调用方净化）。 */
+    static String lastSyncError(Context context) {
+        return prefs(context).getString(LAST_SYNC_ERROR, "");
+    }
+
+    static void setLastSyncError(Context context, String error) {
+        String value = error == null ? "" : error;
+        if (value.length() > 300) value = value.substring(0, 300);
+        prefs(context).edit().putString(LAST_SYNC_ERROR, value).apply();
+    }
+
+    /** Bangumi 反代基址（settings.bangumiApiBaseUrl 同源；空 = 官方 api.bgm.tv）。 */
+    static String bangumiApiBaseUrl(Context context) {
+        return prefs(context).getString(BANGUMI_API_BASE_URL, "");
+    }
+
+    static void setBangumiApiBaseUrl(Context context, String url) {
+        prefs(context).edit().putString(BANGUMI_API_BASE_URL, url == null ? "" : url.trim()).apply();
+    }
+
+    /** 是否拉取 Bangumi 收藏（默认开；original 永不拉取，与设置无关）。 */
+    static boolean pullCollectionsEnabled(Context context) {
+        return prefs(context).getBoolean(PULL_COLLECTIONS, true);
+    }
+
+    static void setPullCollectionsEnabled(Context context, boolean enabled) {
+        prefs(context).edit().putBoolean(PULL_COLLECTIONS, enabled).apply();
+    }
+
+    /** Bangumi 收藏拉取的“建议”列表（后台只标记不破坏；由前台 run_full_sync 细化合并）。 */
+    static JSONArray bangumiSuggestions(Context context) {
+        synchronized (LOCK) {
+            return readArray(context, BANGUMI_SUGGESTIONS);
+        }
+    }
+
+    static void setBangumiSuggestions(Context context, JSONArray suggestions) {
+        synchronized (LOCK) {
+            prefs(context).edit().putString(BANGUMI_SUGGESTIONS, suggestions == null ? "[]" : suggestions.toString()).apply();
+        }
+    }
+
+    /** 周期同步间隔（小时，默认 6；与 LOCAL_MIGRATION_PROGRESS 硬不变量 5 一致）。 */
+    static int syncIntervalHours(Context context) {
+        int value = prefs(context).getInt(SYNC_INTERVAL_HOURS, 6);
+        return value >= 1 ? value : 6;
+    }
+
+    static void setSyncIntervalHours(Context context, int hours) {
+        prefs(context).edit().putInt(SYNC_INTERVAL_HOURS, Math.max(1, hours)).apply();
+    }
+
+    static int scheduledIntervalHours(Context context) {
+        return prefs(context).getInt(SCHEDULED_INTERVAL_HOURS, 0);
+    }
+
+    static void setScheduledIntervalHours(Context context, int hours) {
+        prefs(context).edit().putInt(SCHEDULED_INTERVAL_HOURS, hours).apply();
     }
 
     static boolean consumeOpenTasks(Context context) {
