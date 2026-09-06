@@ -60,6 +60,10 @@ export interface FollowedAnime {
   anilistId?: number | null;
   mapping?: BangumiMapping | null;
   mappingPending?: boolean;
+  // Phase 3 收藏/评分/进度同步新增（可选，Bangumi 拉取合并后由 Rust 侧填充）。
+  bangumiStatus?: 'wish' | 'doing' | 'done' | 'on_hold' | 'dropped' | null;
+  rating?: number | null;
+  watchedEpisode?: number | null;
 }
 
 export interface WatchTask {
@@ -193,6 +197,9 @@ export interface DesktopApi {
   bangumiConfirmMapping?(params: { animeId: number; subjectId: number }): Promise<AppState>;
   bangumiSkipMapping?(params: { animeId: number }): Promise<AppState>;
   bangumiGetSubjectExtras?(params: { subjectId: number }): Promise<BangumiSubjectExtras | null>;
+  bangumiSyncNow?(): Promise<BangumiSyncResult>;
+  bangumiUpdateSyncSettings?(params: BangumiSyncSettingsPatch): Promise<AppState>;
+  bangumiSetRating?(params: { subjectId: number; rating: number | null }): Promise<{ ok: boolean; message: string }>;
   openExternal(url: string): Promise<void>;
   onStateChanged(callback: (state: AppState) => void): () => void;
   onSeasonUpdated(callback: (update: { season: Season; year: number; anime: Anime[]; fetchedAt: number }) => void): () => void;
@@ -360,4 +367,37 @@ export interface BangumiSubjectExtras {
   related: Array<{ id: number; name: string; nameCn: string | null; relation: string; imageUrl?: string | null }>;
   staff: Array<{ key: string; value: string }>;
   siteUrl: string;
+}
+
+// —— Phase 3（收藏/评分/进度，Rust 命令镜像，camelCase）——
+export interface BangumiSyncSuggestion {
+  subjectId: number;
+  nameCn: string | null;
+  type: number; // Bangumi SubjectCollectionType：1 wish / 2 done / 3 doing / 4 on_hold / 5 dropped
+}
+
+export interface BangumiSyncReport {
+  pulled: number;
+  followed: number;
+  unfollowed: number;
+  completedTasks: number;
+  suggestions: BangumiSyncSuggestion[];
+  conflicts: number;
+  pushed: number;
+  errors: string[];
+}
+
+export interface BangumiSyncResult {
+  ok: boolean;
+  message: string;
+  report: BangumiSyncReport;
+}
+
+export interface BangumiSyncSettingsPatch {
+  syncEnabled?: boolean;
+  pullCollections?: boolean;
+  pushLocalChanges?: boolean;
+  pushCompletedEpisodes?: boolean;
+  pullExternalStatus?: boolean;
+  conflictPolicy?: BangumiConflictPolicy;
 }

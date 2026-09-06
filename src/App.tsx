@@ -39,7 +39,7 @@ import {
   X,
 } from 'lucide-react';
 import { api } from './api';
-import type { Anime, AppState, BangumiAuthStatus, BangumiMappingResolution, BangumiSubjectExtras, BangumiTitleMatch, BangumiUserProfile, FollowedAnime, Season, SeasonViewMode, Settings as AppSettings, UiLanguage, ViewId, WatchTask, WebDavConfig } from './types';
+import type { Anime, AppState, BangumiAuthStatus, BangumiConflictPolicy, BangumiMappingResolution, BangumiSubjectExtras, BangumiSyncReport, BangumiSyncSettingsPatch, BangumiTitleMatch, BangumiUserProfile, FollowedAnime, Season, SeasonViewMode, Settings as AppSettings, UiLanguage, ViewId, WatchTask, WebDavConfig } from './types';
 import { IS_ORIGINAL_EDITION, productName, titleForPreference } from './edition';
 import { localizeMessage, normalizeUiLanguage, tr } from './i18n';
 import { createStateRefreshController } from './state-refresh';
@@ -78,6 +78,17 @@ const NAV_ITEMS: Array<{ id: ViewId; label: [string, string]; icon: typeof Calen
 ];
 
 const UI_STATE_KEY = IS_ORIGINAL_EDITION ? 'anilog-original-ui-state' : 'anilog-ui-state';
+
+// Phase 3：Bangumi 收藏状态徽章（doing=追番中即当前默认态，不展示徽章）。
+const BANGUMI_STATUS_LABELS: Record<string, [string, string]> = {
+  done: ['已看完', 'Completed'],
+  dropped: ['已弃番', 'Dropped'],
+  on_hold: ['搁置', 'On hold'],
+  wish: ['想看', 'Wish to watch'],
+};
+const BANGUMI_RATING_OPTIONS = Array.from({ length: 11 }, (_, value) => value);
+// Bangumi SubjectCollectionType（1 wish / 2 done / 3 doing / 4 on_hold / 5 dropped）→ 建议列表展示名。
+const BANGUMI_SUGGESTION_TYPE_LABELS: Record<number, string> = { 1: '想看', 2: '看过', 3: '在看', 4: '搁置', 5: '弃番' };
 
 function loadUiState(fallback: { season: Season; year: number }): { view: ViewId; season: Season; year: number; seasonView: SeasonViewMode } {
   try {
@@ -308,10 +319,25 @@ function App() {
               onSkipMapping={async (animeId) => {
                 if (api.bangumiSkipMapping) setState(await api.bangumiSkipMapping({ animeId }));
               }}
+              onSetRating={async (subjectId, rating) => {
+                if (!api.bangumiSetRating) return;
+                try {
+                  const result = await api.bangumiSetRating({ subjectId, rating });
+                  setState(await api.getState());
+                  setLastSyncMessage(localizeMessage(result.message, language));
+                } catch (reason) {
+                  setLastSyncMessage(reason instanceof Error ? localizeMessage(reason.message, language) : t('评分同步失败', 'Rating sync failed'));
+                }
+              }}
             />
           )}
           {view === 'settings' && (
-            <SettingsView state={state} language={language} onChange={async (patch) => setState(await api.updateSettings(patch))} />
+            <SettingsView
+              state={state}
+              language={language}
+              onChange={async (patch) => setState(await api.updateSettings(patch))}
+              onApplyState={(next) => setState(next)}
+            />
           )}
         </div>
       </main>
@@ -780,6 +806,7 @@ function FollowingView({
   onRename,
   onConfirmMapping,
   onSkipMapping,
+  onSetRating,
 }: {
   items: AppState['following'];
   language: UiLanguage;
@@ -788,16 +815,28 @@ function FollowingView({
   onRename: (id: number, displayTitle: string) => Promise<void>;
   onConfirmMapping: (animeId: number, subjectId: number) => Promise<void>;
   onSkipMapping: (animeId: number) => Promise<void>;
+  onSetRating: (subjectId: number, rating: number | null) => Promise<void>;
 }) {
   const t = (chinese: string, english: string) => tr(language, chinese, english);
   const [editingId, setEditingId] = useState<number | null>(null);
   const [draftTitle, setDraftTitle] = useState('');
   const [mappingDialogFor, setMappingDialogFor] = useState<number | null>(null);
   const [mappingBusy, setMappingBusy] = useState(false);
+  const [ratingBusyId, setRatingBusyId] = useState<number | null>(null);
   const [resolutions, setResolutions] = useState<Record<number, BangumiMappingResolution>>({});
   const requestedMappings = useRef(new Set<number>());
   const sorted = [...items].sort((a, b) => (a.nextAiringEpisode?.airingAt || Infinity) - (b.nextAiringEpisode?.airingAt || Infinity));
   const pendingItems = items.filter((item) => item.mappingPending === true);
+
+  // Phase 3：Bangumi 条目的行内评分变更；subjectId 取 bangumiId，Bangumi 来源条目回落主键 id。
+  const handleSetRating = async (item: FollowedAnime, subjectId: number, value: string) => {
+    setRatingBusyId(item.id);
+    try {
+      await onSetRating(subjectId, value === '' ? null : Number(value));
+    } finally {
+      setRatingBusyId((current) => (current === item.id ? null : current));
+    }
+  };
 
   // 挂载时对每个待确认条目惰性解析候选；结果缓存在组件 state，确认/跳过后清除。
   useEffect(() => {
@@ -857,7 +896,13 @@ function FollowingView({
         <EmptyState icon={Bell} title={t('还没有添加追番', 'Nothing followed yet')} body={t('到季度新番中选择作品，更新提醒会自动开启。', 'Choose a title from Seasonal Anime to enable update alerts.')} />
       ) : (
         <div className="following-list">
-          {sorted.map((item) => (
+          {sorted.map((item) => {
+            // Phase 3：standard 下 Bangumi 条目（source='bangumi' 或带 bangumiId）提供行内评分与状态徽章。
+            const bangumiSubjectId = !IS_ORIGINAL_EDITION && (item.source === 'bangumi' || typeof item.bangumiId === 'number')
+              ? (typeof item.bangumiId === 'number' ? item.bangumiId : item.id)
+              : null;
+            const statusBadge = item.bangumiStatus ? BANGUMI_STATUS_LABELS[item.bangumiStatus] : undefined;
+            return (
             <article className="following-row" key={item.id}>
               <img src={item.coverImage} alt="" />
               <div className="following-copy">
@@ -872,6 +917,14 @@ function FollowingView({
                     >
                       {t('待确认映射', 'Mapping pending')}
                     </button>
+                  )}
+                  {statusBadge && (
+                    <span
+                      style={{ marginLeft: 8, border: '1px solid currentColor', borderRadius: 999, padding: '1px 9px', fontSize: 12, opacity: 0.75 }}
+                      title={t('Bangumi 收藏状态', 'Bangumi collection status')}
+                    >
+                      {t(...statusBadge)}
+                    </span>
                   )}
                 </span>
                 {editingId === item.id ? (
@@ -906,6 +959,27 @@ function FollowingView({
                   </div>
                 )}
                 <small>{titleOf(item.title, language) !== item.displayTitle ? `${titleOf(item.title, language)} · ` : ''}{item.episodes ? t(`全 ${item.episodes} 集`, `${item.episodes} episodes`) : t('总集数待定', 'Episode count TBA')}</small>
+                {bangumiSubjectId != null && (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 4, fontSize: 12 }}>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                      <Star size={13} />
+                      <select
+                        value={item.rating == null ? '' : String(item.rating)}
+                        disabled={ratingBusyId === item.id}
+                        aria-label={t(`评分 ${item.displayTitle}`, `Rate ${item.displayTitle}`)}
+                        onChange={(event) => void handleSetRating(item, bangumiSubjectId, event.target.value)}
+                      >
+                        <option value="">{t('未评分', 'Unrated')}</option>
+                        {BANGUMI_RATING_OPTIONS.map((value) => <option key={value} value={value}>{value}</option>)}
+                      </select>
+                    </label>
+                    {item.watchedEpisode != null && (
+                      <span style={{ opacity: 0.7 }}>
+                        {t(`进度 ${item.watchedEpisode}${item.episodes ? ` / ${item.episodes}` : ''}`, `Progress ${item.watchedEpisode}${item.episodes ? ` / ${item.episodes}` : ''}`)}
+                      </span>
+                    )}
+                  </div>
+                )}
               </div>
               <div className="following-next">
                 <small>{t('下次更新', 'Next episode')}</small>
@@ -914,7 +988,8 @@ function FollowingView({
               </div>
               <button className="icon-button danger" title={t('取消追番', 'Unfollow')} aria-label={t(`取消追番 ${item.displayTitle}`, `Unfollow ${item.displayTitle}`)} onClick={() => onUnfollow(item.id)}><Minus size={19} /></button>
             </article>
-          ))}
+            );
+          })}
         </div>
       )}
       {dialogItem && (
@@ -1003,7 +1078,7 @@ function MappingDialog({
   );
 }
 
-function SettingsView({ state, language, onChange }: { state: AppState; language: UiLanguage; onChange: (patch: Partial<AppSettings>) => Promise<void> }) {
+function SettingsView({ state, language, onChange, onApplyState }: { state: AppState; language: UiLanguage; onChange: (patch: Partial<AppSettings>) => Promise<void>; onApplyState: (state: AppState) => void }) {
   const t = (chinese: string, english: string) => tr(language, chinese, english);
   const message = (reason: unknown, chinese: string, english: string) => reason instanceof Error ? localizeMessage(reason.message, language) : t(chinese, english);
   const isAndroid = state.runtime?.platform === 'android';
@@ -1027,6 +1102,10 @@ function SettingsView({ state, language, onChange }: { state: AppState; language
   const [bangumiApiUrl, setBangumiApiUrl] = useState(state.bangumiSyncSettings?.apiBaseUrl || state.settings.bangumiApiBaseUrl);
   const [bangumiStatus, setBangumiStatus] = useState('');
   const [bangumiBusy, setBangumiBusy] = useState(false);
+  const [syncBusy, setSyncBusy] = useState(false);
+  const [syncReport, setSyncReport] = useState<BangumiSyncReport | null>(null);
+  const [showSuggestions, setShowSuggestions] = useState(false);
+  const bangumiSyncSettings = state.bangumiSyncSettings;
 
   useEffect(() => setProxyUrl(state.settings.bangumiApiBaseUrl), [state.settings.bangumiApiBaseUrl]);
   useEffect(() => setBangumiApiUrl(state.bangumiSyncSettings?.apiBaseUrl || state.settings.bangumiApiBaseUrl), [state.bangumiSyncSettings?.apiBaseUrl, state.settings.bangumiApiBaseUrl]);
@@ -1117,6 +1196,40 @@ function SettingsView({ state, language, onChange }: { state: AppState; language
       setBangumiStatus(message(reason, 'Bangumi 断开失败', 'Could not disconnect Bangumi'));
     } finally {
       setBangumiBusy(false);
+    }
+  };
+
+  // Phase 3：Bangumi 收藏/评分/进度同步设置；任一切换即调用后端并用返回的 AppState 刷新。
+  const updateBangumiSyncSettings = async (patch: BangumiSyncSettingsPatch) => {
+    if (patch.pushLocalChanges === true && !window.confirm(t(
+      '开启后，本地追番/取消追番/评分变化将写入你的 Bangumi 账户。确认开启吗？',
+      'Once enabled, local follow/unfollow/rating changes will be written to your Bangumi account. Enable it?',
+    ))) return;
+    if (!api.bangumiUpdateSyncSettings) return;
+    setBangumiBusy(true);
+    try {
+      onApplyState(await api.bangumiUpdateSyncSettings(patch));
+      setBangumiStatus(t('同步设置已保存', 'Sync settings saved'));
+    } catch (reason) {
+      setBangumiStatus(message(reason, 'Bangumi 同步设置保存失败', 'Could not save Bangumi sync settings'));
+    } finally {
+      setBangumiBusy(false);
+    }
+  };
+
+  const runBangumiSync = async () => {
+    if (!api.bangumiSyncNow) return;
+    setSyncBusy(true);
+    setBangumiStatus(t('正在同步 Bangumi…', 'Syncing Bangumi…'));
+    try {
+      const result = await api.bangumiSyncNow();
+      onApplyState(await api.getState());
+      setSyncReport(result.report);
+      setBangumiStatus(localizeMessage(result.message, language));
+    } catch (reason) {
+      setBangumiStatus(message(reason, 'Bangumi 同步失败', 'Bangumi sync failed'));
+    } finally {
+      setSyncBusy(false);
     }
   };
 
@@ -1304,7 +1417,7 @@ function SettingsView({ state, language, onChange }: { state: AppState; language
           </div>
         </section>
         <section className="settings-section">
-          <div className="settings-title"><User size={20} /><div><h2>Bangumi 账户</h2><p>连接 Bangumi 账户以读取资料与收藏；本阶段为只读接入。</p></div></div>
+          <div className="settings-title"><User size={20} /><div><h2>Bangumi 账户</h2><p>连接 Bangumi 账户以读取资料与收藏，并按下方设置双向同步。</p></div></div>
           <SettingRow title="连接状态" description="Token 保存在系统安全存储中，不会写入追番数据或同步文件。">
             {bangumiAuth?.hasToken ? (
               <span className="fixed-setting-value">
@@ -1336,6 +1449,81 @@ function SettingsView({ state, language, onChange }: { state: AppState; language
               {bangumiStatus || '留空 API 地址时使用官方接口；此地址与上方中文标题反代共用同一设置。'}
             </p>
           </div>
+          {bangumiAuth?.hasToken && (
+            <>
+              <SettingRow title="从 Bangumi 读取收藏" description="把 Bangumi 收藏（追番/看完/弃番等）拉取合并到本地追番清单">
+                <Toggle checked={bangumiSyncSettings?.pullCollections ?? true} disabled={bangumiBusy} onChange={(value) => void updateBangumiSyncSettings({ pullCollections: value })} />
+              </SettingRow>
+              <SettingRow title="将本地追番变化写回 Bangumi" description="本地追番/取消/评分变化将写入你的 Bangumi 账户，默认关闭">
+                <Toggle checked={bangumiSyncSettings?.pushLocalChanges ?? false} disabled={bangumiBusy} onChange={(value) => void updateBangumiSyncSettings({ pushLocalChanges: value })} />
+              </SettingRow>
+              <SettingRow title="完成任务时同步观看进度" description="勾选看完一集后，把观看进度写回 Bangumi">
+                <Toggle checked={bangumiSyncSettings?.pushCompletedEpisodes ?? false} disabled={bangumiBusy} onChange={(value) => void updateBangumiSyncSettings({ pushCompletedEpisodes: value })} />
+              </SettingRow>
+              <SettingRow title="读取 Bangumi 外部状态" description="在 Bangumi 网页或其他客户端产生的变化会拉取回本地">
+                <Toggle checked={bangumiSyncSettings?.pullExternalStatus ?? true} disabled={bangumiBusy} onChange={(value) => void updateBangumiSyncSettings({ pullExternalStatus: value })} />
+              </SettingRow>
+              <SettingRow title="冲突策略" description="两端同时变化时按所选策略合并">
+                <label className="number-select">
+                  <select
+                    value={bangumiSyncSettings?.conflictPolicy ?? 'latest'}
+                    disabled={bangumiBusy}
+                    aria-label="冲突策略"
+                    onChange={(event) => void updateBangumiSyncSettings({ conflictPolicy: event.target.value as BangumiConflictPolicy })}
+                  >
+                    <option value="latest">按更新时间</option>
+                    <option value="local-first">本地优先</option>
+                    <option value="bangumi-first">Bangumi 优先</option>
+                  </select>
+                </label>
+              </SettingRow>
+              <div className="webdav-actions">
+                <button className="secondary-button" disabled={syncBusy} onClick={() => void runBangumiSync()}>
+                  {syncBusy ? <LoaderCircle size={15} className="spin" /> : <RefreshCw size={15} />}
+                  <span>立即同步 Bangumi</span>
+                </button>
+              </div>
+              <p className="proxy-status">
+                {`上次 Bangumi 同步：${relativePastTime(state.bangumiSyncStatus?.lastBangumiSyncAt, language)} · 上次坚果云同步：${relativePastTime(state.bangumiSyncStatus?.lastWebDavSyncAt, language)}`}
+              </p>
+              {state.bangumiSyncStatus?.lastSyncError && (
+                <p className="proxy-status" style={{ color: '#e5484d' }}>{state.bangumiSyncStatus.lastSyncError}</p>
+              )}
+              {syncReport && (
+                <div style={{ fontSize: 13, borderTop: '1px solid rgba(128,128,128,0.25)', paddingTop: 8 }}>
+                  <p style={{ margin: '4px 0' }}>
+                    {`拉取 ${syncReport.pulled} · 追番 +${syncReport.followed} · 取消 -${syncReport.unfollowed} · 补完成 ${syncReport.completedTasks} · 写回 ${syncReport.pushed}`}
+                    {syncReport.conflicts > 0 ? ` · 冲突 ${syncReport.conflicts}` : ''}
+                  </p>
+                  {syncReport.suggestions.length > 0 && (
+                    <div style={{ margin: '4px 0' }}>
+                      <button
+                        className="mapping-badge"
+                        style={{ border: '1px solid currentColor', borderRadius: 999, padding: '1px 9px', fontSize: 12, background: 'transparent', color: 'inherit', cursor: 'pointer' }}
+                        onClick={() => setShowSuggestions((value) => !value)}
+                      >
+                        {showSuggestions ? '收起建议' : `建议 ${syncReport.suggestions.length} 条（想看/搁置等，不自动改追番）`}
+                      </button>
+                      {showSuggestions && (
+                        <ul style={{ margin: '6px 0', paddingLeft: 20 }}>
+                          {syncReport.suggestions.map((suggestion) => (
+                            <li key={suggestion.subjectId}>
+                              {`${BANGUMI_SUGGESTION_TYPE_LABELS[suggestion.type] || `类型 ${suggestion.type}`}：${suggestion.nameCn || `条目 ${suggestion.subjectId}`}`}
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                  )}
+                  {syncReport.errors.length > 0 && (
+                    <ul style={{ color: '#e5484d', margin: '6px 0', paddingLeft: 20 }}>
+                      {syncReport.errors.map((item, index) => <li key={index}>{item}</li>)}
+                    </ul>
+                  )}
+                </div>
+              )}
+            </>
+          )}
         </section>
         </>
       )}
@@ -1384,6 +1572,19 @@ function formatStorageSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+// Phase 3：同步状态行的“多久之前”展示（秒级时间戳）。utils 的 relativeTime 面向未来播出时间，
+// 过去的时间戳会固定返回“已播出”，因此这里提供过去向的相对时间。
+function relativePastTime(timestamp: number | null | undefined, language: UiLanguage): string {
+  if (!timestamp) return tr(language, '从未', 'never');
+  const seconds = Math.max(0, Math.floor(Date.now() / 1000) - timestamp);
+  const days = Math.floor(seconds / 86400);
+  if (days > 0) return tr(language, `${days} 天前`, `${days} day${days === 1 ? '' : 's'} ago`);
+  const hours = Math.floor(seconds / 3600);
+  if (hours > 0) return tr(language, `${hours} 小时前`, `${hours} hour${hours === 1 ? '' : 's'} ago`);
+  const minutes = Math.max(1, Math.floor(seconds / 60));
+  return tr(language, `${minutes} 分钟前`, `${minutes} minute${minutes === 1 ? '' : 's'} ago`);
 }
 
 function SettingRow({ title, description, children }: { title: string; description: string; children: React.ReactNode }) {

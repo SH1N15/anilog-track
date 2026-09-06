@@ -765,6 +765,16 @@ const browserApi: DesktopApi = {
   async bangumiConfirmMapping() { return browserState; },
   async bangumiSkipMapping() { return browserState; },
   async bangumiGetSubjectExtras() { return null; },
+  // Phase 3：浏览器/Electron 回退路径不接入 Bangumi 收藏/评分/进度同步。
+  async bangumiSyncNow() {
+    return {
+      ok: false,
+      message: '当前平台不支持 Bangumi 账户同步',
+      report: { pulled: 0, followed: 0, unfollowed: 0, completedTasks: 0, suggestions: [], conflicts: 0, pushed: 0, errors: [] },
+    };
+  },
+  async bangumiUpdateSyncSettings() { return browserState; },
+  async bangumiSetRating() { return { ok: false, message: '当前平台不支持 Bangumi 账户同步' }; },
   async toggleTask(taskId) {
     const task = browserState.tasks.find((item) => item.id === taskId);
     if (task) {

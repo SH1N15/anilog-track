@@ -14,6 +14,7 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
@@ -462,6 +463,22 @@ pub struct BangumiCollection {
     pub updated_at: Option<String>,
     pub private: Option<bool>,
     pub comment: Option<String>,
+    /// 列表/单条读取响应中的内嵌条目概要（SlimSubject，官方可选字段）。
+    pub subject: Option<BangumiSlimSubject>,
+}
+
+/// v0 SlimSubject（`UserSubjectCollection.subject`，官方 schema：必填 id/name/
+/// name_cn/images/eps 等；本结构只取创建 following 条目所需字段，其余忽略）。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BangumiSlimSubject {
+    pub id: i64,
+    pub name: String,
+    pub name_cn: Option<String>,
+    /// 放送日期 `"YYYY-MM-DD"`。
+    pub date: Option<String>,
+    pub images: Option<BangumiSubjectImages>,
+    pub eps: Option<u32>,
 }
 
 /// v0 错误响应体（`{"title", "description", "details"}`）。
@@ -610,6 +627,101 @@ impl EpType {
             _ => None,
         }
     }
+}
+
+/// [`SubjectCollectionType`] 数字 → following 条目 `bangumiStatus` 字符串
+/// （前端类型 `src/types.ts`：`'wish'|'doing'|'done'|'on_hold'|'dropped'`）。
+pub fn collection_status_name(collection_type: u32) -> Option<&'static str> {
+    match collection_type {
+        1 => Some("wish"),
+        2 => Some("done"),
+        3 => Some("doing"),
+        4 => Some("on_hold"),
+        5 => Some("dropped"),
+        _ => None,
+    }
+}
+
+/// 收藏关心字段的规范化 payload 哈希（sha256 十六进制小写；schema §3.2）。
+///
+/// 规范化规则（本地与远端两侧统一，保证 `H_local == H_remote` 判定可比）：
+/// - 只取 `{type, rate, ep_status, comment, tags, private}`，键名固定、
+///   serde_json 默认 BTreeMap 顺序输出；
+/// - `comment` 空串归一为 `null`（本地不存评价）；
+/// - `tags` 排序后参与哈希；
+/// - `private=false` 归一为 `null`（本地不跟踪私有标记；`true` 参与哈希，
+///   使私有收藏在拉取侧总是被识别为外部变化）。
+pub fn collection_payload_hash_parts(
+    collection_type: u32,
+    rate: Option<u8>,
+    ep_status: Option<u32>,
+    comment: Option<&str>,
+    tags: &[String],
+    private: Option<bool>,
+) -> String {
+    let comment = comment.map(str::trim).filter(|comment| !comment.is_empty());
+    let mut tags: Vec<&str> = tags.iter().map(String::as_str).collect();
+    tags.sort_unstable();
+    let object = serde_json::json!({
+        "type": collection_type,
+        "rate": rate,
+        "ep_status": ep_status,
+        "comment": comment,
+        "tags": tags,
+        "private": private.filter(|is_private| *is_private),
+    });
+    let canonical = serde_json::to_string(&object).unwrap_or_default();
+    let digest = Sha256::digest(canonical.as_bytes());
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex
+}
+
+/// 远端收藏记录的 payload 哈希（[`collection_payload_hash_parts`] 的便捷封装）。
+pub fn collection_payload_hash(collection: &BangumiCollection) -> String {
+    collection_payload_hash_parts(
+        collection.collection_type,
+        collection.rate,
+        collection.ep_status,
+        collection.comment.as_deref(),
+        &collection.tags,
+        collection.private,
+    )
+}
+
+/// 同步建议（`BangumiSyncReport.suggestions` 条目；前端契约：
+/// `{subjectId, nameCn, type}`，`type` 为 collection type 数字）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BangumiSyncSuggestion {
+    pub subject_id: i64,
+    pub name_cn: Option<String>,
+    #[serde(rename = "type")]
+    pub collection_type: u32,
+}
+
+/// 一次 Bangumi 同步的报告（`bangumi_sync_now` 的 `report` 字段；camelCase）。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct BangumiSyncReport {
+    /// 本次拉取到的远端收藏条数。
+    pub pulled: u32,
+    /// 因远端 doing 新建本地追番的条数。
+    pub followed: u32,
+    /// 因远端 dropped 取消本地追番的条数（只删未完成任务）。
+    pub unfollowed: u32,
+    /// 因远端 done 补完成的本地任务数。
+    pub completed_tasks: u32,
+    /// wish/on_hold/墓碑阻恢复等仅建议项。
+    pub suggestions: Vec<BangumiSyncSuggestion>,
+    /// 冲突策略下记录的冲突数（conflictPolicy=latest 时方向不明即计数）。
+    pub conflicts: u32,
+    /// 成功写回 Bangumi 的请求次数（收藏 + 批量进度）。
+    pub pushed: u32,
+    /// 错误摘要（不含任何 Token/Authorization 材料）。
+    pub errors: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------

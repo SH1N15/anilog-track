@@ -143,6 +143,14 @@ fn default_state(original: bool) -> Value {
                     serde_json::to_value(bangumi::BangumiSyncSettings::default())
                         .unwrap_or_else(|_| json!({})),
                 );
+                // Phase 3 任务 1：本地-only 同步状态五字段（绝不进坚果云文档，
+                // 回归测试 document_from_state_* 锁定；merge_defaults 依赖此键
+                // 为旧状态补齐默认值）。
+                object.insert(
+                    "bangumiSyncStatus".into(),
+                    serde_json::to_value(bangumi::BangumiSyncStatus::default())
+                        .unwrap_or_else(|_| json!({})),
+                );
             }
         }
         state
@@ -186,7 +194,8 @@ fn merge_defaults(mut loaded: Value, original: bool) -> Value {
 }
 
 /// standard 版 additive 默认键归一（schema §3/§12）：following 补
-/// source/anilistId/mapping/mappingPending；任务补 subjectId/episodeId/
+/// source/anilistId/mapping/mappingPending 与 Phase 3 的
+/// bangumiStatus/rating/watchedEpisode；任务补 subjectId/episodeId/
 /// episodeSortKey/episodeType。仅补缺失键，不改动任何既有业务字段。
 #[cfg(feature = "standard")]
 fn normalize_state_records_for_standard(state: &mut Value) {
@@ -197,6 +206,17 @@ fn normalize_state_records_for_standard(state: &mut Value) {
                 item["anilistId"] = Value::Null;
                 item["mapping"] = Value::Null;
                 item["mappingPending"] = json!(false);
+            }
+            // Phase 3 任务 1：收藏/评分/进度镜像字段（get_state/public_state
+            // 自然带出；缺省 null）。
+            if !item.get("bangumiStatus").is_some_and(Value::is_string) {
+                item["bangumiStatus"] = Value::Null;
+            }
+            if !item.get("rating").is_some_and(Value::is_number) {
+                item["rating"] = Value::Null;
+            }
+            if !item.get("watchedEpisode").is_some_and(Value::is_number) {
+                item["watchedEpisode"] = Value::Null;
             }
         }
     }
@@ -621,6 +641,51 @@ fn mark_following_deleted(state: &mut Value, anime_id: i64) {
     state["syncMetadata"]["followingDeletedAt"][anime_id.to_string()] = json!(now_millis());
 }
 
+/// 「最近取消追番队列」（Phase 3 任务 3，顶层 `pendingBangumiUnfollows`）：
+/// standard 版取消追番 Bangumi 来源条目时由 [`remove_following`] 写入
+/// `{subjectId, at}`，供 `push_local_changes` 写回 `PATCH type=5`；
+/// 推送成功后清除。**绝不进坚果云文档**（回归测试锁定），original 不写该键。
+#[cfg(feature = "standard")]
+fn record_pending_bangumi_unfollow(state: &mut Value, subject_id: i64) {
+    if subject_id <= 0 {
+        return;
+    }
+    let Some(object) = state.as_object_mut() else {
+        return;
+    };
+    let queue = object
+        .entry("pendingBangumiUnfollows".to_string())
+        .or_insert_with(|| json!([]));
+    let Some(items) = queue.as_array_mut() else {
+        *queue = json!([]);
+        return;
+    };
+    if items
+        .iter()
+        .any(|item| value_i64(item.get("subjectId")) == subject_id)
+    {
+        return;
+    }
+    items.push(json!({"subjectId": subject_id, "at": now_seconds()}));
+    // 防失控：只保留最近 200 条。
+    const MAX_PENDING_UNFOLLOWS: usize = 200;
+    if items.len() > MAX_PENDING_UNFOLLOWS {
+        items.drain(0..items.len() - MAX_PENDING_UNFOLLOWS);
+    }
+}
+
+/// 从「最近取消追番队列」移除一个 subject（推送成功后清除；远端驱动的
+/// 取消追番在拉取引擎内即时清除以防写回循环）。
+#[cfg(feature = "standard")]
+fn remove_pending_bangumi_unfollow(state: &mut Value, subject_id: i64) {
+    if let Some(items) = state
+        .get_mut("pendingBangumiUnfollows")
+        .and_then(Value::as_array_mut)
+    {
+        items.retain(|item| value_i64(item.get("subjectId")) != subject_id);
+    }
+}
+
 fn remove_following(state: &mut Value, anime_id: i64) -> bool {
     let Some(index) = state["following"].as_array().and_then(|items| {
         items
@@ -629,12 +694,21 @@ fn remove_following(state: &mut Value, anime_id: i64) -> bool {
     }) else {
         return false;
     };
+    // Phase 3 任务 3：standard 版 Bangumi 来源条目取消追番时入「最近取消队列」，
+    // 供写回引擎 PATCH type=5；anilist 来源与 original 不入队。
+    #[cfg(feature = "standard")]
+    let bangumi_sourced =
+        value_string(state["following"][index].get("source")) == "bangumi";
     state["following"].as_array_mut().unwrap().remove(index);
     state["tasks"].as_array_mut().unwrap().retain(|task| {
         !(value_i64(task.get("animeId")) == anime_id
             && value_string(task.get("status")) == "pending")
     });
     mark_following_deleted(state, anime_id);
+    #[cfg(feature = "standard")]
+    if bangumi_sourced {
+        record_pending_bangumi_unfollow(state, anime_id);
+    }
     true
 }
 
@@ -1787,6 +1861,8 @@ fn bangumi_following_entry(anime: &Value, preference: &str, language: &str) -> V
         "format": anime.get("format"), "episodes": anime.get("episodes"), "seasonYear": anime.get("seasonYear"),
         "startDate": anime.get("startDate"), "nextAiringEpisode": anime.get("nextAiringEpisode"),
         "siteUrl": format!("https://bgm.tv/subject/{subject_id}"),
+        // Phase 3 任务 1：收藏/评分/进度镜像字段（拉取引擎写入实际值）。
+        "bangumiStatus": Value::Null, "rating": Value::Null, "watchedEpisode": Value::Null,
         "mapping": {"method": "manual", "confidence": "high", "updatedAt": now_seconds()},
         "mappingPending": false,
         "followedAt": now_seconds(), "syncUpdatedAt": now_millis()
@@ -2987,8 +3063,9 @@ mod bangumi_commands {
         }
     }
 
-    /// /v0/me → username 的进程内缓存读取（bangumi_get_user_collections 用）。
-    async fn ensure_username(
+    /// /v0/me → username 的进程内缓存读取（bangumi_get_user_collections 与
+    /// Phase 3 拉取引擎共用）。
+    pub(super) async fn ensure_username(
         tokens: &dyn BangumiTokenStore,
         client: &HttpBangumiClient,
         username_cache: &Mutex<Option<String>>,
@@ -3200,6 +3277,1098 @@ mod bangumi_commands {
         }
         context.save_state().map_err(|error| error.to_string())?;
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3（standard，LOCAL 方案 §7）：Bangumi 收藏/评分/进度拉取合并 + hash
+// 冲突解决 + 写回引擎。
+//
+// 冲突解决禁用 updated_at LWW（官方注明 updated_at 不可靠，schema §3.2）：
+// 每条 following 记录维护 lastPulledPayloadHash / lastPushedPayloadHash
+//（对 collection 关心字段 {type,rate,ep_status,comment,tags,private} 规范化
+// JSON 的 sha256，见 bangumi::collection_payload_hash_parts）与 lastChangedBy。
+// 拉取时判定：
+// - H_remote == lastPulledPayloadHash → 远端无变化，跳过；
+// - H_local == H_remote → 方向不明，按 conflictPolicy（latest=不动+记冲突 /
+//   local-first=推远端 / bangumi-first=改本地）；若 lastPushedPayloadHash ==
+//   H_local（本地自上次推送无变更）则视为已收敛，仅更新拉取基线；
+// - 否则 → 外部变化 → 合并（写 lastPulledPayloadHash=H_remote、
+//   lastChangedBy="bangumi"）。
+// 防循环：lastChangedBy=="bangumi" 的记录不自动推送；远端驱动的取消追番即时
+// 清出 pendingBangumiUnfollows；写回仅处理 lastChangedBy 为 local/webdav 且
+// H_local != lastPushedPayloadHash 的记录。
+// ---------------------------------------------------------------------------
+#[cfg(feature = "standard")]
+mod bangumi_sync {
+    use super::{
+        bangumi_following_entry, bangumi_platform_to_format, mark_following_changed,
+        now_millis, now_seconds, offline_bangumi_subject, remove_following, value_i64,
+        value_string,
+    };
+    use crate::bangumi::{
+        self, BangumiCollection, BangumiSubject, BangumiSyncReport, BangumiSyncSettings,
+        BangumiTokenStore, HttpBangumiClient,
+    };
+    use serde_json::{Value, json};
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    /// 收藏列表分页上限（limit=50，≤20 页）。
+    const COLLECTION_MAX_PAGES: usize = 20;
+    /// 收藏列表分页大小。
+    const COLLECTION_PAGE_LIMIT: u32 = 50;
+
+    /// 读取顶层 `bangumi` 设置块（缺失/损坏时回落默认值）。
+    pub(super) fn sync_settings(state: &Value) -> BangumiSyncSettings {
+        state
+            .get("bangumi")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default()
+    }
+
+    /// 本地评分（0-10；null/负数/越界 → None）。
+    fn local_rating(entry: &Value) -> Option<u8> {
+        entry
+            .get("rating")
+            .and_then(Value::as_i64)
+            .filter(|rate| (0..=10).contains(rate))
+            .and_then(|rate| u8::try_from(rate).ok())
+    }
+
+    /// 本地观看进度（>=0；null → None）。
+    fn local_watched_episode(entry: &Value) -> Option<u32> {
+        entry
+            .get("watchedEpisode")
+            .and_then(Value::as_i64)
+            .filter(|episode| *episode >= 0)
+            .and_then(|episode| u32::try_from(episode).ok())
+    }
+
+    /// 本地收藏写回 payload（`type=3` 表示追番中；rate 仅在有评分时携带——
+    /// ModifyPayload 全可选，不传会被忽略）。
+    pub(super) fn local_collection_payload(entry: &Value) -> Value {
+        let mut payload = serde_json::Map::new();
+        payload.insert("type".into(), json!(3));
+        if let Some(rate) = local_rating(entry) {
+            payload.insert("rate".into(), json!(rate));
+        }
+        Value::Object(payload)
+    }
+
+    /// 本地记录的收藏 payload 哈希（H_local；与远端同一规范化函数，保证可比）。
+    pub(super) fn local_collection_hash(entry: &Value) -> String {
+        bangumi::collection_payload_hash_parts(
+            3,
+            local_rating(entry),
+            local_watched_episode(entry),
+            None,
+            &[],
+            None,
+        )
+    }
+
+    fn find_entry_index(state: &Value, subject_id: i64) -> Option<usize> {
+        state["following"].as_array().and_then(|items| {
+            items.iter().position(|item| {
+                value_i64(item.get("id")) == subject_id
+                    || value_i64(item.get("bangumiId")) == subject_id
+            })
+        })
+    }
+
+    fn tombstone_exists(state: &Value, subject_id: i64) -> bool {
+        value_i64(
+            state["syncMetadata"]["followingDeletedAt"]
+                .get(&subject_id.to_string()),
+        ) > 0
+    }
+
+    /// 任务 2：拉取合并引擎。前置：Token 且 `bangumi.syncEnabled` 且
+    /// `pullCollections`，否则返回零值报告（skipped，调用方按语义给 message）。
+    pub(super) async fn run_bangumi_collection_sync(
+        http: &HttpBangumiClient,
+        tokens: &dyn BangumiTokenStore,
+        username_cache: &Mutex<Option<String>>,
+        state: &Mutex<Value>,
+        offline_map: &Value,
+    ) -> BangumiSyncReport {
+        let mut report = BangumiSyncReport::default();
+        let settings = {
+            let guard = state.lock().expect("state lock");
+            sync_settings(&guard)
+        };
+        if !settings.sync_enabled || !settings.pull_collections {
+            return report; // skipped：同步未启用
+        }
+        let token = match tokens.load() {
+            Ok(Some(token)) if !token.trim().is_empty() => token,
+            _ => return report, // skipped：无 Token
+        };
+        let username =
+            match super::bangumi_commands::ensure_username(tokens, http, username_cache).await {
+                Ok(username) => username,
+                Err(message) => {
+                    report.errors.push(message);
+                    return report;
+                }
+            };
+        // 分页拉全（GET /v0/users/{username}/collections?subject_type=2）。
+        let mut collections: Vec<BangumiCollection> = Vec::new();
+        let mut offset = 0u32;
+        for _ in 0..COLLECTION_MAX_PAGES {
+            let page = match http
+                .get_user_collections(
+                    &token,
+                    &username,
+                    bangumi::SUBJECT_TYPE_ANIME,
+                    COLLECTION_PAGE_LIMIT,
+                    offset,
+                )
+                .await
+            {
+                Ok(page) => page,
+                Err(error) => {
+                    report
+                        .errors
+                        .push(super::bangumi_commands::request_error_message(error));
+                    return report;
+                }
+            };
+            let count = page.data.len() as u32;
+            collections.extend(page.data);
+            offset += count;
+            if count == 0
+                || (count as usize) < COLLECTION_PAGE_LIMIT as usize
+                || (page.total > 0 && offset >= page.total)
+            {
+                break;
+            }
+        }
+        report.pulled = collections.len() as u32;
+
+        // 第 1 步（无网络）：快照分类 → 创建 / 合并 / 冲突推送 / 收敛。
+        struct CreatePlan {
+            collection: BangumiCollection,
+            h_remote: String,
+            subject: Option<BangumiSubject>,
+        }
+        struct ConflictPushPlan {
+            subject_id: i64,
+            payload: Value,
+            create: bool,
+            h_local: String,
+        }
+        let (following_snapshot, deleted_snapshot) = {
+            let guard = state.lock().expect("state lock");
+            (
+                guard["following"].as_array().cloned().unwrap_or_default(),
+                guard["syncMetadata"]["followingDeletedAt"].clone(),
+            )
+        };
+        let snapshot_tombstone =
+            |subject_id: i64| -> bool { value_i64(deleted_snapshot.get(&subject_id.to_string())) > 0 };
+        let mut creates: Vec<CreatePlan> = Vec::new();
+        let mut merges: Vec<(BangumiCollection, String)> = Vec::new();
+        let mut converged: Vec<(i64, String)> = Vec::new();
+        let mut conflict_pushes: Vec<ConflictPushPlan> = Vec::new();
+        for collection in &collections {
+            let subject_id = collection.subject_id;
+            if subject_id <= 0 {
+                continue;
+            }
+            let h_remote = bangumi::collection_payload_hash(collection);
+            let entry = following_snapshot.iter().find(|item| {
+                value_i64(item.get("id")) == subject_id
+                    || value_i64(item.get("bangumiId")) == subject_id
+            });
+            let Some(entry) = entry else {
+                match collection.collection_type {
+                    // 本地无条目 + doing + 无墓碑 → 创建 following。
+                    3 if !snapshot_tombstone(subject_id) => {
+                        creates.push(CreatePlan {
+                            collection: collection.clone(),
+                            h_remote: h_remote.clone(),
+                            subject: None,
+                        });
+                    }
+                    // wish/on_hold → 仅建议；doing 但墓碑存在 → 本地删除优先，
+                    // 不自动恢复，计入建议。
+                    1 | 3 | 4 => report.suggestions.push(bangumi::BangumiSyncSuggestion {
+                        subject_id,
+                        name_cn: collection.subject.as_ref().and_then(|s| s.name_cn.clone()),
+                        collection_type: collection.collection_type,
+                    }),
+                    // dropped（弃番）/ done（看过）且本地无条目：跳过（看过≠追番）。
+                    _ => {}
+                }
+                continue;
+            };
+            // 远端无变化（payload hash 相同）→ 跳过。
+            if entry.get("lastPulledPayloadHash").and_then(Value::as_str)
+                == Some(h_remote.as_str())
+            {
+                continue;
+            }
+            let h_local = local_collection_hash(entry);
+            if h_local == h_remote {
+                // H_local==H_remote：方向不明。
+                if entry.get("lastPushedPayloadHash").and_then(Value::as_str)
+                    == Some(h_local.as_str())
+                {
+                    // 本地自上次推送无变更 → 已收敛，仅更新拉取基线。
+                    converged.push((subject_id, h_remote.clone()));
+                } else {
+                    match settings.conflict_policy {
+                        // latest：不动本地，仅记录冲突。
+                        bangumi::ConflictPolicy::Latest => report.conflicts += 1,
+                        // local-first：推远端。
+                        bangumi::ConflictPolicy::LocalFirst => {
+                            conflict_pushes.push(ConflictPushPlan {
+                                subject_id,
+                                payload: local_collection_payload(entry),
+                                // H_local==H_remote 意味着远端已有等值记录 → PATCH。
+                                create: false,
+                                h_local: h_local.clone(),
+                            });
+                        }
+                        // bangumi-first：改本地（走外部变化合并）。
+                        bangumi::ConflictPolicy::BangumiFirst => {
+                            merges.push((collection.clone(), h_remote.clone()));
+                        }
+                    }
+                }
+                continue;
+            }
+            // 外部变化 → 合并。
+            merges.push((collection.clone(), h_remote.clone()));
+        }
+
+        // 第 2 步（网络）：为缺少内嵌 SlimSubject 的创建计划补拉条目详情。
+        for plan in creates.iter_mut() {
+            if plan.collection.subject.is_none() {
+                match http.get_subject_detail(plan.collection.subject_id).await {
+                    Ok(detail) => plan.subject = Some(detail),
+                    Err(error) => {
+                        report
+                            .errors
+                            .push(super::bangumi_commands::request_error_message(error));
+                    }
+                }
+            }
+        }
+
+        // 第 3 步（锁内）：应用创建 / 合并 / 收敛（纯本地写，无网络）。
+        {
+            let mut guard = state.lock().expect("state lock");
+            for plan in &creates {
+                if plan.collection.subject.is_none() && plan.subject.is_none() {
+                    continue; // 详情补拉失败且无内嵌概要：无法构造条目
+                }
+                if find_entry_index(&guard, plan.collection.subject_id).is_some()
+                    || tombstone_exists(&guard, plan.collection.subject_id)
+                {
+                    continue; // 复核：应用前条目已被创建/删除
+                }
+                let anime =
+                    collection_subject_anime(&plan.collection, plan.subject.as_ref(), offline_map);
+                let mut entry = bangumi_following_entry(
+                    &anime,
+                    &value_string(guard["settings"].get("titlePreference")),
+                    &value_string(guard["settings"].get("uiLanguage")),
+                );
+                entry["bangumiStatus"] = json!("doing");
+                entry["rating"] = match plan.collection.rate {
+                    Some(rate) => json!(rate),
+                    None => Value::Null,
+                };
+                entry["watchedEpisode"] = plan
+                    .collection
+                    .ep_status
+                    .map(|value| json!(i64::from(value)))
+                    .unwrap_or(Value::Null);
+                entry["lastPulledPayloadHash"] = json!(plan.h_remote);
+                entry["lastPushedPayloadHash"] = Value::Null;
+                entry["lastChangedBy"] = json!("bangumi");
+                entry["lastPulledFromBangumiAt"] = json!(now_seconds());
+                guard["following"]
+                    .as_array_mut()
+                    .expect("following array")
+                    .push(entry);
+                mark_following_changed(&mut guard, plan.collection.subject_id);
+                report.followed += 1;
+            }
+            for (collection, h_remote) in &merges {
+                if let Some(index) = find_entry_index(&guard, collection.subject_id) {
+                    apply_remote_merge(&mut guard, index, collection, h_remote, &mut report);
+                }
+            }
+            for (subject_id, hash) in &converged {
+                if let Some(index) = find_entry_index(&guard, *subject_id) {
+                    guard["following"][index]["lastPulledPayloadHash"] = json!(hash);
+                }
+            }
+        }
+
+        // 第 4 步（网络）：conflictPolicy=local-first 的方向不明冲突推远端。
+        let mut pushed_hashes: Vec<(i64, String)> = Vec::new();
+        for push in conflict_pushes {
+            match http
+                .update_collection(&token, push.subject_id, &push.payload, push.create)
+                .await
+            {
+                Ok(()) => {
+                    report.pushed += 1;
+                    pushed_hashes.push((push.subject_id, push.h_local));
+                }
+                Err(error) => report
+                    .errors
+                    .push(super::bangumi_commands::request_error_message(error)),
+            }
+        }
+
+        // 第 5 步（锁内）：记录推送基线。
+        if !pushed_hashes.is_empty() {
+            let mut guard = state.lock().expect("state lock");
+            for (subject_id, hash) in pushed_hashes {
+                if let Some(index) = find_entry_index(&guard, subject_id) {
+                    guard["following"][index]["lastPushedPayloadHash"] = json!(hash);
+                    guard["following"][index]["lastPushedToBangumiAt"] = json!(now_seconds());
+                }
+            }
+        }
+        report
+    }
+
+    /// 远端收藏合并到本地条目（外部变化 / bangumi-first）。
+    /// 枚举映射（schema §5）：3=Doing→追番中（已追番则同步状态字段）；
+    /// 2=Done→补完成本地 pending 中 episode<=ep_status 的任务（不新建、不删）；
+    /// 5=Dropped→取消追番（复用 remove_following：只删未完成任务，已完成任务
+    /// 永保留；远端驱动 → 即时清出取消队列防写回循环）；1=Wish/4=OnHold→本地
+    /// 追番状态不动，仅同步 bangumiStatus 字段。rating：rate>=0 → 本地 rating=rate。
+    fn apply_remote_merge(
+        state: &mut Value,
+        entry_index: usize,
+        collection: &BangumiCollection,
+        h_remote: &str,
+        report: &mut BangumiSyncReport,
+    ) {
+        let entry_id = value_i64(state["following"][entry_index].get("id"));
+        if collection.collection_type == bangumi::SubjectCollectionType::Dropped.as_u32() {
+            remove_following(state, entry_id);
+            super::remove_pending_bangumi_unfollow(state, collection.subject_id);
+            report.unfollowed += 1;
+            return; // 条目已删除，剩余 hash 记在墓碑侧
+        }
+        if collection.collection_type == bangumi::SubjectCollectionType::Done.as_u32() {
+            let ep_status = i64::from(collection.ep_status.unwrap_or(0));
+            let now = now_seconds();
+            let mut completed = 0u32;
+            if let Some(tasks) = state["tasks"].as_array_mut() {
+                for task in tasks.iter_mut() {
+                    if value_i64(task.get("animeId")) == entry_id
+                        && value_string(task.get("status")) == "pending"
+                        && value_i64(task.get("episode")) > 0
+                        && value_i64(task.get("episode")) <= ep_status
+                    {
+                        task["status"] = json!("completed");
+                        task["completedAt"] = json!(now);
+                        task["syncUpdatedAt"] = json!(now_millis());
+                        task["lastChangedBy"] = json!("bangumi");
+                        completed += 1;
+                    }
+                }
+            }
+            report.completed_tasks += completed;
+        }
+        // wish/on_hold：仅建议（本地追番状态不动），与无条目分支同语义。
+        // fallback 标题先于 entry 可变借用读取。
+        let suggestion_title = if collection.collection_type
+            == bangumi::SubjectCollectionType::Wish.as_u32()
+            || collection.collection_type == bangumi::SubjectCollectionType::OnHold.as_u32()
+        {
+            Some(
+                collection
+                    .subject
+                    .as_ref()
+                    .and_then(|subject| subject.name_cn.clone())
+                    .or_else(|| {
+                        Some(value_string(state["following"][entry_index].get("displayTitle")))
+                    })
+                    .filter(|name| !name.is_empty()),
+            )
+        } else {
+            None
+        };
+        let Some(entry) = state["following"]
+            .as_array_mut()
+            .and_then(|items| items.get_mut(entry_index))
+        else {
+            return;
+        };
+        if let Some(status) = bangumi::collection_status_name(collection.collection_type) {
+            entry["bangumiStatus"] = json!(status);
+        }
+        if collection.collection_type == bangumi::SubjectCollectionType::Done.as_u32() {
+            entry["watchedEpisode"] = collection
+                .ep_status
+                .map(|value| json!(i64::from(value)))
+                .unwrap_or(Value::Null);
+        }
+        if let Some(rate) = collection.rate {
+            entry["rating"] = json!(rate);
+        }
+        if let Some(name_cn) = suggestion_title {
+            report.suggestions.push(bangumi::BangumiSyncSuggestion {
+                subject_id: collection.subject_id,
+                name_cn,
+                collection_type: collection.collection_type,
+            });
+        }
+        entry["lastPulledPayloadHash"] = json!(h_remote);
+        entry["lastChangedBy"] = json!("bangumi");
+        entry["lastPulledFromBangumiAt"] = json!(now_seconds());
+        entry["syncUpdatedAt"] = json!(now_millis());
+    }
+
+    /// 收藏（内嵌 SlimSubject 优先，缺信息用补拉的 Subject 详情）→
+    /// `bangumi_following_entry` 所需的 Anime 形状（Phase 2 契约）。
+    /// anilistId 由离线映射反查（使 AIRING_QUERY 迁移期补充继续生效）。
+    fn collection_subject_anime(
+        collection: &BangumiCollection,
+        detail: Option<&BangumiSubject>,
+        offline_map: &Value,
+    ) -> Value {
+        let subject_id = collection.subject_id;
+        let slim = collection.subject.as_ref();
+        let name = detail
+            .map(|subject| subject.name.clone())
+            .or_else(|| slim.map(|subject| subject.name.clone()))
+            .unwrap_or_default();
+        let name_cn = detail
+            .and_then(|subject| subject.name_cn.clone())
+            .or_else(|| slim.and_then(|subject| subject.name_cn.clone()));
+        let date = detail
+            .and_then(|subject| subject.date.clone())
+            .or_else(|| slim.and_then(|subject| subject.date.clone()));
+        let eps = detail
+            .and_then(|subject| subject.eps)
+            .or_else(|| slim.and_then(|subject| subject.eps));
+        let images = detail
+            .and_then(|subject| subject.images.clone())
+            .or_else(|| slim.and_then(|subject| subject.images.clone()));
+        let platform = detail.and_then(|subject| subject.platform.clone());
+        let anilist_id = offline_bangumi_subject(offline_map, subject_id)
+            .and_then(|entry| entry.get("a").and_then(Value::as_i64))
+            .filter(|anilist_id| *anilist_id > 0);
+        let pick_image =
+            |pick: fn(&bangumi::BangumiSubjectImages) -> &Option<String>| -> String {
+                images
+                    .as_ref()
+                    .and_then(|images| pick(images).clone())
+                    .filter(|url| !url.is_empty())
+                    .unwrap_or_default()
+            };
+        let extra_large = {
+            let large = pick_image(|images| &images.large);
+            if large.is_empty() {
+                pick_image(|images| &images.common)
+            } else {
+                large
+            }
+        };
+        let medium = {
+            let medium = pick_image(|images| &images.medium);
+            if medium.is_empty() {
+                pick_image(|images| &images.common)
+            } else {
+                medium
+            }
+        };
+        let (season_year, start_date) = match date.as_deref().and_then(|date| {
+            let mut parts = date.split('-');
+            let year: i64 = parts.next()?.parse().ok()?;
+            let month: i64 = parts.next()?.parse().ok()?;
+            let day: i64 = parts.next()?.parse().ok()?;
+            Some((year, month, day))
+        }) {
+            Some((year, month, day)) => (
+                json!(year),
+                json!({"year": year, "month": month, "day": day}),
+            ),
+            None => (Value::Null, Value::Null),
+        };
+        json!({
+            "id": subject_id,
+            "source": "bangumi",
+            "bangumiSubjectId": subject_id,
+            "anilistId": anilist_id.map(|id| json!(id)).unwrap_or(Value::Null),
+            "nameCn": name_cn,
+            "title": {
+                "native": name_cn.clone().unwrap_or_else(|| name.clone()),
+                "english": Value::Null,
+                "romaji": name
+            },
+            "coverImage": {"extraLarge": extra_large, "medium": medium, "color": Value::Null},
+            "format": bangumi_platform_to_format(platform.as_deref()),
+            "episodes": eps,
+            "seasonYear": season_year,
+            "startDate": start_date,
+            "nextAiringEpisode": Value::Null
+        })
+    }
+
+    /// 任务 3：写回引擎。前置：Token 且 pushLocalChanges（进度另需
+    /// pushCompletedEpisodes）。写前 hash 幂等：H_local == lastPushedPayloadHash
+    /// 跳过；lastChangedBy=="bangumi" 跳过（防循环）。成功后更新
+    /// lastPushedPayloadHash / lastPushedToBangumiAt，并清除取消队列对应项。
+    /// 无拉取基线的条目先经 `GET /v0/users/{username}/collections/{subject_id}`
+    /// 探测远端记录（404 → POST 创建，200 → PATCH 更新，官方写端点用 `-` 占位）。
+    pub(super) async fn push_local_changes(
+        http: &HttpBangumiClient,
+        tokens: &dyn BangumiTokenStore,
+        username_cache: &Mutex<Option<String>>,
+        state: &Mutex<Value>,
+    ) -> BangumiSyncReport {
+        let mut report = BangumiSyncReport::default();
+        let settings = {
+            let guard = state.lock().expect("state lock");
+            sync_settings(&guard)
+        };
+        if !settings.push_local_changes && !settings.push_completed_episodes {
+            return report; // skipped：写回未启用
+        }
+        let token = match tokens.load() {
+            Ok(Some(token)) if !token.trim().is_empty() => token,
+            _ => return report, // skipped：无 Token
+        };
+
+        // 第 1 步（锁内）：快照写回计划。
+        struct CollectionPush {
+            subject_id: i64,
+            payload: Value,
+            create: bool,
+            hash: String,
+        }
+        let (follows, unfollows, refollowed, episode_batches) = {
+            let guard = state.lock().expect("state lock");
+            let mut follows: Vec<CollectionPush> = Vec::new();
+            let mut unfollows: Vec<i64> = Vec::new();
+            let mut refollowed: Vec<i64> = Vec::new();
+            if settings.push_local_changes {
+                // 最近取消队列：本地取消追番刚发生 → PATCH type=5。
+                if let Some(queue) = guard
+                    .get("pendingBangumiUnfollows")
+                    .and_then(Value::as_array)
+                {
+                    for item in queue {
+                        let subject_id = value_i64(item.get("subjectId"));
+                        if subject_id <= 0 {
+                            continue;
+                        }
+                        if find_entry_index(&guard, subject_id).is_some() {
+                            // 已重新追番：丢弃队列项，不推 type=5。
+                            refollowed.push(subject_id);
+                        } else {
+                            unfollows.push(subject_id);
+                        }
+                    }
+                }
+                for entry in guard["following"].as_array().into_iter().flatten() {
+                    if value_string(entry.get("source")) != "bangumi" {
+                        continue;
+                    }
+                    // 防循环：拉取来的变更（lastChangedBy=bangumi）不自动推送。
+                    if entry.get("lastChangedBy").and_then(Value::as_str) == Some("bangumi") {
+                        continue;
+                    }
+                    let subject_id = value_i64(entry.get("id"));
+                    if subject_id <= 0 {
+                        continue;
+                    }
+                    let hash = local_collection_hash(entry);
+                    // hash 幂等：本地无未推送变更 → 跳过。
+                    if entry.get("lastPushedPayloadHash").and_then(Value::as_str)
+                        == Some(hash.as_str())
+                    {
+                        continue;
+                    }
+                    // 远端有记录（拉取过）→ PATCH；无记录 → POST 创建。
+                    let create = entry
+                        .get("lastPulledPayloadHash")
+                        .is_none_or(Value::is_null);
+                    follows.push(CollectionPush {
+                        subject_id,
+                        payload: local_collection_payload(entry),
+                        create,
+                        hash,
+                    });
+                }
+            }
+            let mut episode_batches: Vec<(i64, Vec<i64>)> = Vec::new();
+            if settings.push_completed_episodes {
+                let mut grouped: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
+                for task in guard["tasks"].as_array().into_iter().flatten() {
+                    if value_string(task.get("status")) != "completed" {
+                        continue;
+                    }
+                    // 拉取来的完成（lastChangedBy=bangumi）不上传。
+                    if task.get("lastChangedBy").and_then(Value::as_str) == Some("bangumi") {
+                        continue;
+                    }
+                    // hash 幂等：已推送过的单集不再上传。
+                    if task.get("lastPushedToBangumiAt").is_some_and(Value::is_number) {
+                        continue;
+                    }
+                    let subject_id = task
+                        .get("subjectId")
+                        .and_then(Value::as_i64)
+                        .filter(|value| *value > 0);
+                    let episode_id = task
+                        .get("episodeId")
+                        .and_then(Value::as_i64)
+                        .filter(|value| *value > 0);
+                    let (Some(subject_id), Some(episode_id)) = (subject_id, episode_id) else {
+                        continue;
+                    };
+                    grouped.entry(subject_id).or_default().push(episode_id);
+                }
+                episode_batches = grouped.into_iter().collect();
+            }
+            (follows, unfollows, refollowed, episode_batches)
+        };
+
+        // 第 2 步（网络）：写回请求（官方 `-` 占位当前 token 用户）。
+        let mut done_unfollows: Vec<i64> = Vec::new();
+        for subject_id in unfollows {
+            let dropped = json!({"type": bangumi::SubjectCollectionType::Dropped.as_u32()});
+            let result = match http
+                .update_collection(&token, subject_id, &dropped, false)
+                .await
+            {
+                Ok(()) => Ok(()),
+                // 远端无收藏记录 → POST 创建 type=5（同语义）。
+                Err(bangumi::BangumiApiError::NotFound { .. }) => {
+                    http.update_collection(&token, subject_id, &dropped, true)
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(()) => {
+                    done_unfollows.push(subject_id);
+                    report.pushed += 1;
+                }
+                Err(error) => report
+                    .errors
+                    .push(super::bangumi_commands::request_error_message(error)),
+            }
+        }
+        let mut done_follows: Vec<(i64, String)> = Vec::new();
+        for push in follows {
+            let mut create = push.create;
+            if create {
+                // 无拉取基线：先探测远端是否有收藏记录（读端点用 {username}）。
+                let username = match super::bangumi_commands::ensure_username(
+                    tokens,
+                    http,
+                    username_cache,
+                )
+                .await
+                {
+                    Ok(username) => username,
+                    Err(message) => {
+                        report.errors.push(message);
+                        continue;
+                    }
+                };
+                match http.get_user_collection(&token, &username, push.subject_id).await {
+                    Ok(_) => create = false,
+                    Err(bangumi::BangumiApiError::NotFound { .. }) => create = true,
+                    Err(error) => {
+                        report
+                            .errors
+                            .push(super::bangumi_commands::request_error_message(error));
+                        continue;
+                    }
+                }
+            }
+            match http
+                .update_collection(&token, push.subject_id, &push.payload, create)
+                .await
+            {
+                Ok(()) => {
+                    done_follows.push((push.subject_id, push.hash));
+                    report.pushed += 1;
+                }
+                Err(error) => report
+                    .errors
+                    .push(super::bangumi_commands::request_error_message(error)),
+            }
+        }
+        let mut done_batches: Vec<(i64, Vec<i64>)> = Vec::new();
+        for (subject_id, episode_ids) in episode_batches {
+            match http
+                .update_episode_progress_batch(
+                    &token,
+                    subject_id,
+                    &episode_ids,
+                    bangumi::EpisodeCollectionType::Watched,
+                )
+                .await
+            {
+                Ok(()) => {
+                    done_batches.push((subject_id, episode_ids));
+                    report.pushed += 1;
+                }
+                Err(error) => report
+                    .errors
+                    .push(super::bangumi_commands::request_error_message(error)),
+            }
+        }
+
+        // 第 3 步（锁内）：成功后记账。
+        {
+            let mut guard = state.lock().expect("state lock");
+            for subject_id in done_unfollows {
+                super::remove_pending_bangumi_unfollow(&mut guard, subject_id);
+            }
+            for subject_id in refollowed {
+                super::remove_pending_bangumi_unfollow(&mut guard, subject_id);
+            }
+            for (subject_id, hash) in done_follows {
+                if let Some(index) = find_entry_index(&guard, subject_id) {
+                    guard["following"][index]["lastPushedPayloadHash"] = json!(hash);
+                    guard["following"][index]["lastPushedToBangumiAt"] = json!(now_seconds());
+                }
+            }
+            for (subject_id, episode_ids) in done_batches {
+                if let Some(tasks) = guard["tasks"].as_array_mut() {
+                    for task in tasks.iter_mut() {
+                        if value_i64(task.get("subjectId")) == subject_id
+                            && task
+                                .get("episodeId")
+                                .and_then(Value::as_i64)
+                                .is_some_and(|episode_id| episode_ids.contains(&episode_id))
+                        {
+                            task["lastPushedToBangumiAt"] = json!(now_seconds());
+                            task["syncUpdatedAt"] = json!(now_millis());
+                        }
+                    }
+                }
+            }
+        }
+        report
+    }
+}
+
+/// Phase 3 任务 1：合并顶层 `bangumiSyncStatus` 五字段（本地-only，绝不进坚果云
+/// 文档——document_from_state 回归测试锁定）。
+#[cfg(feature = "standard")]
+fn merge_bangumi_sync_status(state: &mut Value, patch: bangumi::BangumiSyncStatus) {
+    let mut current: bangumi::BangumiSyncStatus = state
+        .get("bangumiSyncStatus")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default();
+    if patch.last_full_sync_at.is_some() {
+        current.last_full_sync_at = patch.last_full_sync_at;
+    }
+    if patch.last_web_dav_sync_at.is_some() {
+        current.last_web_dav_sync_at = patch.last_web_dav_sync_at;
+    }
+    if patch.last_bangumi_sync_at.is_some() {
+        current.last_bangumi_sync_at = patch.last_bangumi_sync_at;
+    }
+    if patch.last_schedule_sync_at.is_some() {
+        current.last_schedule_sync_at = patch.last_schedule_sync_at;
+    }
+    if patch.last_sync_error.is_some() {
+        current.last_sync_error = patch.last_sync_error;
+    }
+    if let Some(object) = state.as_object_mut() {
+        object.insert(
+            "bangumiSyncStatus".into(),
+            serde_json::to_value(current).unwrap_or_else(|_| json!({})),
+        );
+    }
+}
+
+/// Phase 3 任务 4：`bangumi_sync_now` 完整同步（LOCAL 方案 §7.3 七步）：
+/// 1) 坚果云同步 2) 主数据轻刷新 3) 收藏拉取合并 4) 合并（引擎内落账）
+/// 5) 写回（按开关）6) 唤醒 WebDAV 上传 7) 重排 + 同步状态更新。
+/// 错误摘要只含用户可读文案（BangumiApiError Display 经测试锁定不含
+/// Token/Authorization），截断 300 字符。
+#[cfg(feature = "standard")]
+async fn run_full_bangumi_sync(app: &AppHandle, context: &AppContext) -> Result<Value, String> {
+    let mut report = bangumi::BangumiSyncReport::default();
+    let mut error_summary: Vec<String> = Vec::new();
+    let settings = {
+        let state = context.state.lock().map_err(|_| "状态锁不可用")?;
+        bangumi_sync::sync_settings(&state)
+    };
+    let zero_report = || serde_json::to_value(bangumi::BangumiSyncReport::default()).unwrap_or_default();
+    if !settings.sync_enabled {
+        return Ok(json!({"ok": true, "message": "Bangumi 同步未启用", "report": zero_report()}));
+    }
+    let has_token = context
+        .bangumi_tokens
+        .load()
+        .ok()
+        .flatten()
+        .is_some_and(|token| !token.trim().is_empty());
+    if !has_token {
+        return Ok(json!({"ok": true, "message": "尚未保存 Bangumi Token", "report": zero_report()}));
+    }
+
+    // 1) 坚果云同步（三字段业务数据先合流）。
+    match perform_platform_webdav_sync(app, context).await {
+        Ok(_) => {
+            let mut state = context.state.lock().map_err(|_| "状态锁不可用")?;
+            merge_bangumi_sync_status(
+                &mut state,
+                bangumi::BangumiSyncStatus {
+                    last_web_dav_sync_at: Some(now_seconds()),
+                    ..bangumi::BangumiSyncStatus::default()
+                },
+            );
+        }
+        Err(error) => error_summary.push(format!("坚果云同步失败：{error}")),
+    }
+    // 2) 主数据轻刷新（播出调度 / 任务）。
+    #[cfg(target_os = "android")]
+    let _ = mobile::sync_native(app, context);
+    #[cfg(not(target_os = "android"))]
+    if let Err(error) = sync_now_inner(app, context).await {
+        error_summary.push(format!("主数据刷新失败：{error}"));
+    }
+    {
+        let mut state = context.state.lock().map_err(|_| "状态锁不可用")?;
+        merge_bangumi_sync_status(
+            &mut state,
+            bangumi::BangumiSyncStatus {
+                last_schedule_sync_at: Some(now_seconds()),
+                ..bangumi::BangumiSyncStatus::default()
+            },
+        );
+    }
+    // 3+4) 收藏拉取合并（引擎内落账）。
+    let base = {
+        let state = context.state.lock().map_err(|_| "状态锁不可用")?;
+        bangumi_base_urls(&state)
+    };
+    let http = bangumi::HttpBangumiClient::new(context.client.clone(), base);
+    let pull_report = bangumi_sync::run_bangumi_collection_sync(
+        &http,
+        context.bangumi_tokens.as_ref(),
+        &context.bangumi_username_cache,
+        &context.state,
+        &context.offline_bangumi,
+    )
+    .await;
+    report.pulled = pull_report.pulled;
+    report.followed = pull_report.followed;
+    report.unfollowed = pull_report.unfollowed;
+    report.completed_tasks = pull_report.completed_tasks;
+    report.suggestions = pull_report.suggestions;
+    report.conflicts = pull_report.conflicts;
+    for error in &pull_report.errors {
+        report.errors.push(error.clone());
+    }
+    error_summary.extend(pull_report.errors.iter().cloned());
+    let pull_touched = pull_report.followed > 0
+        || pull_report.unfollowed > 0
+        || pull_report.completed_tasks > 0
+        || !pull_report.errors.is_empty();
+    if pull_touched {
+        context.save_state().map_err(|error| error.to_string())?;
+    }
+    // 5) 写回（按开关）。
+    let push_report = bangumi_sync::push_local_changes(
+        &http,
+        context.bangumi_tokens.as_ref(),
+        &context.bangumi_username_cache,
+        &context.state,
+    )
+    .await;
+    report.pushed += push_report.pushed;
+    for error in &push_report.errors {
+        report.errors.push(error.clone());
+    }
+    error_summary.extend(push_report.errors.iter().cloned());
+    if push_report.pushed > 0 {
+        context.save_state().map_err(|error| error.to_string())?;
+    }
+    // 6) 唤醒 WebDAV 后台上传合并后的三字段文档。
+    context.webdav_wakeup.notify_one();
+    // 7) 重排 + 同步状态更新。
+    {
+        let mut state = context.state.lock().map_err(|_| "状态锁不可用")?;
+        let joined = error_summary.join("；");
+        merge_bangumi_sync_status(
+            &mut state,
+            bangumi::BangumiSyncStatus {
+                last_bangumi_sync_at: Some(now_seconds()),
+                last_full_sync_at: Some(now_seconds()),
+                last_sync_error: Some(if joined.is_empty() {
+                    String::new()
+                } else {
+                    joined.chars().take(300).collect()
+                }),
+                ..bangumi::BangumiSyncStatus::default()
+            },
+        );
+    }
+    context.save_state().map_err(|error| error.to_string())?;
+    refresh_mobile_configuration(app, context)?;
+    emit_state(app, context);
+    let ok = report.errors.is_empty();
+    let message = if ok {
+        "Bangumi 同步完成".to_string()
+    } else {
+        format!("同步完成，但出现 {} 条错误", report.errors.len())
+    };
+    Ok(json!({"ok": ok, "message": message, "report": serde_json::to_value(&report).unwrap_or_default()}))
+}
+
+/// Original 版 `bangumi_sync_now` 的统一拒绝返回（report 零值，camelCase 形状
+/// 与 standard 版一致，供前端类型稳定）。
+fn bangumi_sync_now_rejected() -> Value {
+    json!({
+        "ok": false,
+        "message": "Original 版不支持 Bangumi",
+        "report": {
+            "pulled": 0, "followed": 0, "unfollowed": 0, "completedTasks": 0,
+            "suggestions": [], "conflicts": 0, "pushed": 0, "errors": []
+        }
+    })
+}
+
+#[tauri::command]
+async fn bangumi_sync_now(app: AppHandle, context: State<'_, AppContext>) -> Result<Value, String> {
+    if context.original {
+        return Ok(bangumi_sync_now_rejected());
+    }
+    #[cfg(feature = "standard")]
+    {
+        return run_full_bangumi_sync(&app, &context).await;
+    }
+    #[cfg(not(feature = "standard"))]
+    {
+        let _ = (&app, &context);
+        Ok(bangumi_sync_now_rejected())
+    }
+}
+
+/// Phase 3：`bangumi_update_sync_settings`（扁平参数，前端契约；只更新提供的键，
+/// conflictPolicy 非法值忽略）。Original 运行即拒绝。
+#[tauri::command]
+fn bangumi_update_sync_settings(
+    app: AppHandle,
+    context: State<'_, AppContext>,
+    sync_enabled: Option<bool>,
+    pull_collections: Option<bool>,
+    push_local_changes: Option<bool>,
+    push_completed_episodes: Option<bool>,
+    pull_external_status: Option<bool>,
+    conflict_policy: Option<String>,
+) -> Result<Value, String> {
+    if context.original {
+        return Ok(bangumi_command_rejected());
+    }
+    #[cfg(feature = "standard")]
+    {
+        {
+            let mut state = context.state.lock().map_err(|_| "状态锁不可用")?;
+            let Some(block) = state.get_mut("bangumi").and_then(Value::as_object_mut) else {
+                return Err("Bangumi 设置块不存在".into());
+            };
+            if let Some(value) = sync_enabled {
+                block.insert("syncEnabled".into(), json!(value));
+            }
+            if let Some(value) = pull_collections {
+                block.insert("pullCollections".into(), json!(value));
+            }
+            if let Some(value) = push_local_changes {
+                block.insert("pushLocalChanges".into(), json!(value));
+            }
+            if let Some(value) = push_completed_episodes {
+                block.insert("pushCompletedEpisodes".into(), json!(value));
+            }
+            if let Some(value) = pull_external_status {
+                block.insert("pullExternalStatus".into(), json!(value));
+            }
+            if let Some(policy) = conflict_policy.map(|policy| policy.trim().to_lowercase()) {
+                if ["latest", "local-first", "bangumi-first"].contains(&policy.as_str()) {
+                    block.insert("conflictPolicy".into(), json!(policy));
+                }
+            }
+        }
+        context.save_state().map_err(|error| error.to_string())?;
+        refresh_mobile_configuration(&app, &context)?;
+        emit_state(&app, &context);
+        return Ok(context.public_state());
+    }
+    #[cfg(not(feature = "standard"))]
+    {
+        let _ = (
+            &app,
+            sync_enabled,
+            pull_collections,
+            push_local_changes,
+            push_completed_episodes,
+            pull_external_status,
+            conflict_policy,
+        );
+        Ok(bangumi_command_rejected())
+    }
+}
+
+/// Phase 3：`bangumi_set_rating({ subjectId, rating })`。本地评分写入 following
+/// 条目并标记 lastChangedBy=local（H_local 随之变化，push_local_changes 幂等
+/// 判定后写回 PATCH rate；rating=null 表示清除评分）。
+#[tauri::command]
+fn bangumi_set_rating(
+    app: AppHandle,
+    context: State<'_, AppContext>,
+    subject_id: i64,
+    rating: Option<u8>,
+) -> Result<Value, String> {
+    if context.original {
+        return Ok(bangumi_command_rejected());
+    }
+    #[cfg(feature = "standard")]
+    {
+        if rating.is_some_and(|value| value > 10) {
+            return Ok(json!({"ok": false, "message": "评分需在 0-10 之间"}));
+        }
+        let mut state = context.state.lock().map_err(|_| "状态锁不可用")?;
+        let index = state["following"].as_array().and_then(|items| {
+            items.iter().position(|item| {
+                value_i64(item.get("id")) == subject_id
+                    || value_i64(item.get("bangumiId")) == subject_id
+            })
+        });
+        let Some(index) = index else {
+            return Ok(json!({"ok": false, "message": "未找到对应追番条目"}));
+        };
+        let anime_id = value_i64(state["following"][index].get("id"));
+        state["following"][index]["rating"] = rating
+            .map(|value| json!(value))
+            .unwrap_or(Value::Null);
+        state["following"][index]["lastChangedBy"] = json!("local");
+        mark_following_changed(&mut state, anime_id);
+        drop(state);
+        context.save_state().map_err(|error| error.to_string())?;
+        context.webdav_wakeup.notify_one();
+        emit_state(&app, &context);
+        return Ok(json!({"ok": true, "message": "评分已保存，将在同步时写回 Bangumi"}));
+    }
+    #[cfg(not(feature = "standard"))]
+    {
+        let _ = (&app, subject_id, rating);
+        Ok(bangumi_command_rejected())
     }
 }
 
@@ -4456,6 +5625,9 @@ pub fn run() {
             bangumi_confirm_mapping,
             bangumi_skip_mapping,
             bangumi_get_subject_extras,
+            bangumi_sync_now,
+            bangumi_update_sync_settings,
+            bangumi_set_rating,
             toggle_task,
             update_settings,
             sync_now,
@@ -4513,6 +5685,9 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Phase 3 测试：MemoryTokenStore 的 store/load 方法来自该 trait。
+    #[cfg(feature = "standard")]
+    use crate::bangumi::BangumiTokenStore as _;
 
     fn followed(id: i64, updated_at: i64) -> Value {
         json!({
@@ -6505,5 +7680,754 @@ mod tests {
         // extras：original 命令守卫直接返回 null（context.original → Value::Null），
         // extras 缓存/客户端代码在 original 编译产物中不存在（cfg(feature) 级隔离）。
         assert!(default_state(true).get("bangumi").is_none());
+    }
+
+    // -- Phase 3：收藏/评分/进度 拉取合并 + hash 冲突 + 写回 ---------------------
+
+    /// Phase 3 测试底座：standard 默认状态 + 全开关打开的 bangumi 块。
+    #[cfg(feature = "standard")]
+    fn phase3_state(bangumi_api: &str) -> Value {
+        let mut state = default_state(false);
+        state["bangumi"]["apiBaseUrl"] = json!(bangumi_api);
+        state["bangumi"]["syncEnabled"] = json!(true);
+        state["bangumi"]["pullCollections"] = json!(true);
+        state["bangumi"]["pushLocalChanges"] = json!(true);
+        state["bangumi"]["pushCompletedEpisodes"] = json!(true);
+        state
+    }
+
+    /// Phase 3 测试底座：Bangumi 来源 following 条目（可补丁覆盖字段）。
+    #[cfg(feature = "standard")]
+    fn bangumi_following(id: i64, patch: Value) -> Value {
+        let mut entry = json!({
+            "id": id, "source": "bangumi", "bangumiId": id,
+            "title": {"native": format!("サンプル {id}"), "romaji": null, "english": null},
+            "displayTitle": format!("示例 {id}"),
+            "coverImage": "", "followedAt": 1, "syncUpdatedAt": 1
+        });
+        if let (Some(base), Some(extra)) = (entry.as_object_mut(), patch.as_object()) {
+            for (key, value) in extra {
+                base.insert(key.clone(), value.clone());
+            }
+        }
+        entry
+    }
+
+    #[cfg(feature = "standard")]
+    fn collection_page(data: Value) -> String {
+        json!({"total": data.as_array().map_or(0, |items| items.len()), "limit": 50, "offset": 0, "data": data}).to_string()
+    }
+
+    #[cfg(feature = "standard")]
+    fn slim_subject(id: i64, name_cn: &str) -> Value {
+        json!({
+            "id": id, "name": format!("サンプル {id}"), "name_cn": name_cn,
+            "date": "2026-07-08", "eps": 12,
+            "images": {"medium": format!("https://lain.bgm.tv/pic/cover/m/{id}.jpg")}
+        })
+    }
+
+    #[cfg(feature = "standard")]
+    fn write_count(requests: &[crate::bangumi::test_support::RequestRecord]) -> usize {
+        requests.iter().filter(|request| request.method != "GET").count()
+    }
+
+    #[cfg(feature = "standard")]
+    #[test]
+    fn bangumi_sync_hash_idempotent_second_run_zero_writes() {
+        use crate::bangumi::test_support::MockBangumiServer;
+
+        let profile = include_str!("../fixtures/bangumi/user-profile.json").to_string();
+        let collections = collection_page(json!([{
+            "subject_id": 45678, "subject_type": 2, "rate": 8, "type": 3,
+            "tags": [], "ep_status": 3, "vol_status": 0,
+            "updated_at": "2026-08-01T12:00:00+08:00", "private": false,
+            "subject": slim_subject(45678, "示例 45678")
+        }]));
+        let server = MockBangumiServer::spawn(Arc::new(
+            move |method, target, _headers, _request_body| {
+                if target == "/v0/me" {
+                    assert_eq!(method, "GET");
+                    return (200, vec![], profile.clone());
+                }
+                if target.starts_with("/v0/users/anilog_dev/collections?") {
+                    assert!(target.contains("subject_type=2") && target.contains("limit=50"));
+                    return (200, vec![], collections.clone());
+                }
+                if target.starts_with("/v0/users/-/collections/") {
+                    return (204, vec![], String::new());
+                }
+                (404, vec![], "{}".into())
+            },
+        ));
+        let tokens = bangumi::MemoryTokenStore::new();
+        tokens.store("sync-token").unwrap();
+        let username_cache = std::sync::Mutex::new(None);
+        let client =
+            bangumi::HttpBangumiClient::with_base(bangumi_test_base(&server.url())).unwrap();
+        let offline = json!({"bySubject": {}, "anilistIndex": {}});
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio test runtime");
+
+        // 前置短路：syncEnabled=false → 零请求 skipped。
+        let disabled = {
+            let mut state = phase3_state("https://unused.example.com/v0");
+            state["bangumi"]["syncEnabled"] = json!(false);
+            state["following"] = json!([bangumi_following(55555, json!({"rating": 9}))]);
+            std::sync::Mutex::new(state)
+        };
+        let skipped = rt.block_on(bangumi_sync::run_bangumi_collection_sync(
+            &client, &tokens, &username_cache, &disabled, &offline,
+        ));
+        assert_eq!(skipped, bangumi::BangumiSyncReport::default());
+        assert_eq!(server.requests().len(), 0);
+
+        // 本地已有追番（评分 9，本地修改）+ 远端 doing 45678 → 第一次同步：
+        // 拉取新建 45678（lastChangedBy=bangumi）+ 写回 55555（POST type=3）。
+        let state = {
+            let mut state = phase3_state("https://unused.example.com/v0");
+            state["following"] = json!([bangumi_following(55555, json!({"rating": 9}))]);
+            std::sync::Mutex::new(state)
+        };
+        let first = rt.block_on(bangumi_sync::run_bangumi_collection_sync(
+            &client, &tokens, &username_cache, &state, &offline,
+        ));
+        let push1 = rt.block_on(bangumi_sync::push_local_changes(
+            &client, &tokens, &username_cache, &state,
+        ));
+        let writes_first = write_count(&server.requests());
+        assert!(writes_first >= 1, "first sync must write the local change");
+
+        assert_eq!(first.pulled, 1);
+        assert_eq!(first.followed, 1);
+        assert_eq!(push1.pushed, 1);
+        {
+            let guard = state.lock().unwrap();
+            let created = guard["following"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| value_i64(item.get("id")) == 45678)
+                .expect("45678 created");
+            assert_eq!(created["bangumiStatus"], "doing");
+            assert_eq!(created["rating"], 8);
+            assert_eq!(created["watchedEpisode"], 3);
+            assert_eq!(created["lastChangedBy"], "bangumi");
+            assert!(created.get("lastPulledPayloadHash").is_some_and(Value::is_string));
+            let local = guard["following"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| value_i64(item.get("id")) == 55555)
+                .expect("55555 kept");
+            assert_eq!(
+                local["lastPushedPayloadHash"],
+                json!(bangumi_sync::local_collection_hash(local))
+            );
+        }
+        let post = server
+            .requests()
+            .into_iter()
+            .find(|request| request.method == "POST" && request.target == "/v0/users/-/collections/55555")
+            .expect("POST create for locally followed subject");
+        let payload: Value = serde_json::from_str(&post.body).unwrap();
+        assert_eq!(payload["type"], 3);
+        assert_eq!(payload["rate"], 9);
+
+        // 第二次同步：拉取 hash 命中跳过 + 写回 hash 命中跳过 → 零写请求。
+        let second = rt.block_on(bangumi_sync::run_bangumi_collection_sync(
+            &client, &tokens, &username_cache, &state, &offline,
+        ));
+        let push2 = rt.block_on(bangumi_sync::push_local_changes(
+            &client, &tokens, &username_cache, &state,
+        ));
+        let writes_second = write_count(&server.requests());
+        assert_eq!(writes_second, writes_first, "second sync must not write");
+        assert_eq!(second.followed, 0);
+        assert_eq!(second.pulled, 1);
+        assert_eq!(push2.pushed, 0);
+    }
+
+    #[cfg(feature = "standard")]
+    #[test]
+    fn bangumi_pull_maps_all_collection_types() {
+        use crate::bangumi::test_support::MockBangumiServer;
+
+        let profile = include_str!("../fixtures/bangumi/user-profile.json").to_string();
+        let collections = collection_page(json!([
+            // 本地已有：doing → 状态/评分字段合并。
+            {"subject_id": 45678, "subject_type": 2, "rate": 8, "type": 3,
+             "tags": [], "ep_status": 3, "private": false},
+            // 本地已有：dropped → 取消追番（只删未完成）。
+            {"subject_id": 99999, "subject_type": 2, "rate": 0, "type": 5,
+             "tags": [], "ep_status": 1, "private": false},
+            // 本地已有：done → 补完成 episode<=ep_status 的 pending。
+            {"subject_id": 11111, "subject_type": 2, "rate": 0, "type": 2,
+             "tags": [], "ep_status": 2, "private": false},
+            // 本地已有：wish / on_hold → 仅建议，追番状态不动。
+            {"subject_id": 22222, "subject_type": 2, "rate": null, "type": 1,
+             "tags": [], "ep_status": 0, "private": false, "subject": slim_subject(22222, " wishing 甲")},
+            {"subject_id": 33333, "subject_type": 2, "rate": null, "type": 4,
+             "tags": [], "ep_status": 0, "private": false, "subject": slim_subject(33333, "搁置 乙")},
+            // 本地无 + 墓碑：doing 不自动恢复，计入建议（本地删除优先）。
+            {"subject_id": 44444, "subject_type": 2, "rate": null, "type": 3,
+             "tags": [], "ep_status": 0, "private": false, "subject": slim_subject(44444, "被删 丙")},
+            // 本地无：doing → 创建 following（内嵌 SlimSubject）。
+            {"subject_id": 55555, "subject_type": 2, "rate": 6, "type": 3,
+             "tags": [], "ep_status": 4, "private": false, "subject": slim_subject(55555, "新增 丁")}
+        ]));
+        let server = MockBangumiServer::spawn(Arc::new(
+            move |_method, target, _headers, _request_body| {
+                if target == "/v0/me" {
+                    return (200, vec![], profile.clone());
+                }
+                if target.starts_with("/v0/users/anilog_dev/collections?") {
+                    return (200, vec![], collections.clone());
+                }
+                (404, vec![], "{}".into())
+            },
+        ));
+        let mut state = phase3_state("https://unused.example.com/v0");
+        state["following"] = json!([
+            bangumi_following(45678, json!({})),
+            bangumi_following(99999, json!({})),
+            bangumi_following(11111, json!({})),
+            bangumi_following(22222, json!({})),
+            bangumi_following(33333, json!({}))
+        ]);
+        state["tasks"] = json!([
+            {"id": "99999-1", "animeId": 99999, "animeTitle": "示例 99999", "episode": 1,
+             "airingAt": 10, "status": "pending", "createdAt": 10, "completedAt": null, "syncUpdatedAt": 1},
+            {"id": "99999-2", "animeId": 99999, "animeTitle": "示例 99999", "episode": 2,
+             "airingAt": 10, "status": "completed", "createdAt": 10, "completedAt": 20, "syncUpdatedAt": 1},
+            {"id": "11111-1", "animeId": 11111, "animeTitle": "示例 11111", "episode": 1,
+             "airingAt": 10, "status": "pending", "createdAt": 10, "completedAt": null, "syncUpdatedAt": 1},
+            {"id": "11111-3", "animeId": 11111, "animeTitle": "示例 11111", "episode": 3,
+             "airingAt": 10, "status": "pending", "createdAt": 10, "completedAt": null, "syncUpdatedAt": 1}
+        ]);
+        state["syncMetadata"]["followingDeletedAt"]["44444"] = json!(now_millis());
+        let state = std::sync::Mutex::new(state);
+        let tokens = bangumi::MemoryTokenStore::new();
+        tokens.store("pull-token").unwrap();
+        let username_cache = std::sync::Mutex::new(None);
+        let client =
+            bangumi::HttpBangumiClient::with_base(bangumi_test_base(&server.url())).unwrap();
+        let offline = json!({"bySubject": {}, "anilistIndex": {}});
+
+        let report = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio test runtime")
+            .block_on(bangumi_sync::run_bangumi_collection_sync(
+                &client, &tokens, &username_cache, &state, &offline,
+            ));
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.pulled, 7);
+        assert_eq!(report.followed, 1);
+        assert_eq!(report.unfollowed, 1);
+        assert_eq!(report.completed_tasks, 1);
+        assert_eq!(report.conflicts, 0);
+        let mut suggestions = report.suggestions.clone();
+        suggestions.sort_by_key(|suggestion| suggestion.subject_id);
+        let rendered: Vec<(i64, u32)> = suggestions
+            .iter()
+            .map(|suggestion| (suggestion.subject_id, suggestion.collection_type))
+            .collect();
+        assert_eq!(rendered, vec![(22222, 1), (33333, 4), (44444, 3)]);
+        assert_eq!(suggestions[0].name_cn.as_deref(), Some(" wishing 甲"));
+
+        let guard = state.lock().unwrap();
+        let entry = |id: i64| {
+            guard["following"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| value_i64(item.get("id")) == id)
+                .cloned()
+        };
+        // doing：状态字段 + 评分合并，追番保持。
+        let doing = entry(45678).expect("45678 kept");
+        assert_eq!(doing["bangumiStatus"], "doing");
+        assert_eq!(doing["rating"], 8);
+        assert_eq!(doing["lastChangedBy"], "bangumi");
+        assert!(doing.get("watchedEpisode").is_none_or(Value::is_null));
+        // dropped：取消追番（条目删除、未完成删、已完成保留、墓碑写入）。
+        assert!(entry(99999).is_none());
+        let tasks = guard["tasks"].as_array().unwrap();
+        assert!(!tasks.iter().any(|task| value_string(task.get("id")) == "99999-1"));
+        assert!(tasks.iter().any(|task| value_string(task.get("id")) == "99999-2"));
+        assert!(value_i64(guard["syncMetadata"]["followingDeletedAt"].get("99999")) > 0);
+        // 远端驱动取消不进取消队列（防写回循环）。
+        assert!(guard
+            .get("pendingBangumiUnfollows")
+            .is_none_or(|queue| queue.as_array().is_none_or(|items| items
+                .iter()
+                .all(|item| value_i64(item.get("subjectId")) != 99999))));
+        // done：episode<=ep_status 的 pending 补完成，超出范围保留 pending；
+        // 不新建任务；watchedEpisode=ep_status；rate=0 → rating=0。
+        let done = entry(11111).expect("11111 kept");
+        assert_eq!(done["bangumiStatus"], "done");
+        assert_eq!(done["watchedEpisode"], 2);
+        assert_eq!(done["rating"], 0);
+        let completed = tasks
+            .iter()
+            .find(|task| value_string(task.get("id")) == "11111-1")
+            .expect("11111-1 completed");
+        assert_eq!(completed["status"], "completed");
+        assert_eq!(completed["lastChangedBy"], "bangumi");
+        let beyond = tasks
+            .iter()
+            .find(|task| value_string(task.get("id")) == "11111-3")
+            .expect("11111-3 stays pending");
+        assert_eq!(beyond["status"], "pending");
+        assert_eq!(tasks.len(), 3, "no new tasks created");
+        // wish / on_hold：追番状态不动，仅 bangumiStatus 字段同步。
+        assert!(entry(22222).is_some());
+        assert_eq!(entry(22222).unwrap()["bangumiStatus"], "wish");
+        assert!(entry(33333).is_some());
+        assert_eq!(entry(33333).unwrap()["bangumiStatus"], "on_hold");
+        // 墓碑阻恢复：44444 不创建。
+        assert!(entry(44444).is_none());
+        // doing 无墓碑 → 新建 following（复用 bangumi 构造 + 收藏字段）。
+        let created = entry(55555).expect("55555 created");
+        assert_eq!(created["source"], "bangumi");
+        assert_eq!(created["bangumiStatus"], "doing");
+        assert_eq!(created["rating"], 6);
+        assert_eq!(created["watchedEpisode"], 4);
+        assert_eq!(created["siteUrl"], "https://bgm.tv/subject/55555");
+        assert_eq!(created["lastChangedBy"], "bangumi");
+        assert!(created.get("lastPulledPayloadHash").is_some_and(Value::is_string));
+    }
+
+    #[cfg(feature = "standard")]
+    #[test]
+    fn bangumi_pull_changes_never_push_and_local_changes_do() {
+        use crate::bangumi::test_support::MockBangumiServer;
+
+        let profile = include_str!("../fixtures/bangumi/user-profile.json").to_string();
+        let collections = collection_page(json!([{
+            "subject_id": 45678, "subject_type": 2, "rate": 8, "type": 3,
+            "tags": [], "ep_status": 3, "private": false,
+            "subject": slim_subject(45678, "示例 45678")
+        }]));
+        // 有状态 mock：记录远端已创建的收藏，驱动单条读取探测（404/200）。
+        let created: Arc<Mutex<HashSet<i64>>> = Arc::new(Mutex::new(HashSet::new()));
+        let created_handler = created.clone();
+        let server = MockBangumiServer::spawn(Arc::new(
+            move |_method, target, _headers, _request_body| {
+                if target == "/v0/me" {
+                    return (200, vec![], profile.clone());
+                }
+                if target.starts_with("/v0/users/anilog_dev/collections?") {
+                    return (200, vec![], collections.clone());
+                }
+                if let Some(rest) = target.strip_prefix("/v0/users/anilog_dev/collections/") {
+                    let subject_id: i64 = rest.parse().unwrap_or(0);
+                    return if created_handler.lock().unwrap().contains(&subject_id) {
+                        (200, vec![], json!({"subject_id": subject_id, "type": 3}).to_string())
+                    } else {
+                        (404, vec![], "{}".into())
+                    };
+                }
+                if target.starts_with("/v0/users/-/collections/") {
+                    let rest = &target["/v0/users/-/collections/".len()..];
+                    let subject_id: i64 = rest
+                        .split('/')
+                        .next()
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(0);
+                    created_handler.lock().unwrap().insert(subject_id);
+                    return (204, vec![], String::new());
+                }
+                (404, vec![], "{}".into())
+            },
+        ));
+        let state = std::sync::Mutex::new(phase3_state("https://unused.example.com/v0"));
+        let tokens = bangumi::MemoryTokenStore::new();
+        tokens.store("loop-token").unwrap();
+        let username_cache = std::sync::Mutex::new(None);
+        let client =
+            bangumi::HttpBangumiClient::with_base(bangumi_test_base(&server.url())).unwrap();
+        let offline = json!({"bySubject": {}, "anilistIndex": {}});
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio test runtime");
+
+        // 防循环：拉取来的变更（lastChangedBy=bangumi）在写回阶段零请求。
+        let pull = rt.block_on(bangumi_sync::run_bangumi_collection_sync(
+            &client, &tokens, &username_cache, &state, &offline,
+        ));
+        assert_eq!(pull.followed, 1);
+        let push = rt.block_on(bangumi_sync::push_local_changes(
+                &client, &tokens, &username_cache, &state,
+            ));
+        assert_eq!(push.pushed, 0, "pull-driven changes must not push back");
+        assert_eq!(write_count(&server.requests()), 0);
+
+        // 本地追番（lastChangedBy=local，无拉取基线）→ POST 创建 type=3。
+        {
+            let mut guard = state.lock().unwrap();
+            guard["following"]
+                .as_array_mut()
+                .unwrap()
+                .push(bangumi_following(77777, json!({})));
+        }
+        let push = rt.block_on(bangumi_sync::push_local_changes(
+                &client, &tokens, &username_cache, &state,
+            ));
+        assert_eq!(push.pushed, 1);
+        let post = server
+            .requests()
+            .into_iter()
+            .find(|request| request.method == "POST" && request.target == "/v0/users/-/collections/77777")
+            .expect("POST create");
+        let payload: Value = serde_json::from_str(&post.body).unwrap();
+        assert_eq!(payload["type"], 3);
+
+        // 本地评分变化 → PATCH rate（hash 变化触发）。
+        {
+            let mut guard = state.lock().unwrap();
+            let index = guard["following"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .position(|item| value_i64(item.get("id")) == 77777)
+                .unwrap();
+            guard["following"][index]["rating"] = json!(7);
+            guard["following"][index]["lastChangedBy"] = json!("local");
+        }
+        let push = rt.block_on(bangumi_sync::push_local_changes(
+                &client, &tokens, &username_cache, &state,
+            ));
+        assert_eq!(push.pushed, 1);
+        let patch = server
+            .requests()
+            .into_iter()
+            .find(|request| request.method == "PATCH" && request.target == "/v0/users/-/collections/77777")
+            .expect("PATCH rating");
+        let payload: Value = serde_json::from_str(&patch.body).unwrap();
+        assert_eq!(payload["type"], 3);
+        assert_eq!(payload["rate"], 7);
+
+        // 本地取消追番 → 队列入列 → PATCH type=5 → 推送成功清除队列。
+        {
+            let mut guard = state.lock().unwrap();
+            assert!(remove_following(&mut guard, 77777));
+            assert!(guard
+                .get("pendingBangumiUnfollows")
+                .and_then(Value::as_array)
+                .is_some_and(|items| items
+                    .iter()
+                    .any(|item| value_i64(item.get("subjectId")) == 77777)));
+        }
+        let push = rt.block_on(bangumi_sync::push_local_changes(
+                &client, &tokens, &username_cache, &state,
+            ));
+        assert_eq!(push.pushed, 1);
+        let dropped = server
+            .requests()
+            .into_iter()
+            .find(|request| {
+                request.method == "PATCH"
+                    && request.target == "/v0/users/-/collections/77777"
+                    && request.body.contains("\"type\":5")
+            })
+            .expect("PATCH type=5 for local unfollow");
+        let payload: Value = serde_json::from_str(&dropped.body).unwrap();
+        assert_eq!(payload["type"], 5);
+        {
+            let guard = state.lock().unwrap();
+            assert!(guard
+                .get("pendingBangumiUnfollows")
+                .is_none_or(|queue| queue.as_array().is_none_or(|items| items.is_empty())));
+        }
+    }
+
+    #[cfg(feature = "standard")]
+    #[test]
+    fn bangumi_push_completed_episodes_batch_is_hash_idempotent() {
+        use crate::bangumi::test_support::MockBangumiServer;
+
+        let server = MockBangumiServer::spawn(Arc::new(
+            move |_method, target, _headers, _request_body| {
+                if target == "/v0/users/-/collections/45678/episodes" {
+                    return (204, vec![], String::new());
+                }
+                (404, vec![], "{}".into())
+            },
+        ));
+        let mut state = phase3_state("https://unused.example.com/v0");
+        state["bangumi"]["pushLocalChanges"] = json!(false);
+        state["bangumi"]["pushCompletedEpisodes"] = json!(false);
+        state["tasks"] = json!([
+            // 本地完成的任务（episodeId/subjectId 齐备）→ 可上传。
+            {"id": "45678-2", "animeId": 45678, "animeTitle": "示例", "episode": 2,
+             "airingAt": 10, "status": "completed", "createdAt": 10, "completedAt": 20,
+             "syncUpdatedAt": 1, "subjectId": 45678, "episodeId": 98765},
+            // 拉取来的完成（lastChangedBy=bangumi）→ 不上传。
+            {"id": "45678-3", "animeId": 45678, "animeTitle": "示例", "episode": 3,
+             "airingAt": 10, "status": "completed", "createdAt": 10, "completedAt": 20,
+             "syncUpdatedAt": 1, "subjectId": 45678, "episodeId": 98766,
+             "lastChangedBy": "bangumi"},
+            // 缺 episodeId（未映射）→ 不上传。
+            {"id": "45678-4", "animeId": 45678, "animeTitle": "示例", "episode": 4,
+             "airingAt": 10, "status": "completed", "createdAt": 10, "completedAt": 20,
+             "syncUpdatedAt": 1, "subjectId": 45678, "episodeId": null}
+        ]);
+        let state = std::sync::Mutex::new(state);
+        let tokens = bangumi::MemoryTokenStore::new();
+        tokens.store("episodes-token").unwrap();
+        let username_cache = std::sync::Mutex::new(None);
+        let client =
+            bangumi::HttpBangumiClient::with_base(bangumi_test_base(&server.url())).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio test runtime");
+
+        // pushCompletedEpisodes=false：不上传。
+        let report = rt.block_on(bangumi_sync::push_local_changes(
+                &client, &tokens, &username_cache, &state,
+            ));
+        assert_eq!(report.pushed, 0);
+        assert_eq!(server.requests().len(), 0);
+
+        // 开启后：聚合同 subject 批量 PATCH（episode_id 数组 + type=2），
+        // 只含本地完成且带 episodeId 的那一集。
+        state.lock().unwrap()["bangumi"]["pushCompletedEpisodes"] = json!(true);
+        let report = rt.block_on(bangumi_sync::push_local_changes(
+                &client, &tokens, &username_cache, &state,
+            ));
+        assert_eq!(report.pushed, 1);
+        let request = &server.requests()[0];
+        assert_eq!(request.method, "PATCH");
+        assert_eq!(request.target, "/v0/users/-/collections/45678/episodes");
+        let payload: Value = serde_json::from_str(&request.body).unwrap();
+        assert_eq!(payload["episode_id"], json!([98765]));
+        assert_eq!(payload["type"], 2);
+        {
+            let guard = state.lock().unwrap();
+            let pushed = guard["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|task| value_string(task.get("id")) == "45678-2")
+                .unwrap();
+            assert!(pushed.get("lastPushedToBangumiAt").is_some_and(Value::is_number));
+        }
+
+        // hash 幂等：再次推送零请求（lastPushedToBangumiAt 标记）。
+        let report = rt.block_on(bangumi_sync::push_local_changes(
+                &client, &tokens, &username_cache, &state,
+            ));
+        assert_eq!(report.pushed, 0);
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    #[cfg(feature = "standard")]
+    #[test]
+    fn bangumi_conflict_policy_three_ways() {
+        use crate::bangumi::test_support::MockBangumiServer;
+
+        // 远端与本地内容完全一致（H_local==H_remote），但本地与远端各自的
+        // 基线 hash 都已过期 → 方向不明，按 conflictPolicy 分派。
+        let remote = json!({
+            "subject_id": 45678, "subject_type": 2, "rate": 8, "type": 3,
+            "tags": [], "ep_status": 3, "private": false
+        });
+        let collection: bangumi::BangumiCollection =
+            serde_json::from_value(remote.clone()).unwrap();
+        let h_remote = bangumi::collection_payload_hash(&collection);
+        let stale_pulled = bangumi::collection_payload_hash_parts(3, Some(7), Some(1), None, &[], None);
+        let stale_pushed = bangumi::collection_payload_hash_parts(3, Some(9), Some(1), None, &[], None);
+
+        let run = |policy: &str| -> (bangumi::BangumiSyncReport, MockBangumiServer, std::sync::Mutex<Value>) {
+            let profile = include_str!("../fixtures/bangumi/user-profile.json").to_string();
+            let collections = collection_page(json!([remote.clone()]));
+            let server = MockBangumiServer::spawn(Arc::new(
+                move |_method, target, _headers, _request_body| {
+                    if target == "/v0/me" {
+                        return (200, vec![], profile.clone());
+                    }
+                    if target.starts_with("/v0/users/anilog_dev/collections?") {
+                        return (200, vec![], collections.clone());
+                    }
+                    if target.starts_with("/v0/users/-/collections/") {
+                        return (204, vec![], String::new());
+                    }
+                    (404, vec![], "{}".into())
+                },
+            ));
+            let mut state = phase3_state("https://unused.example.com/v0");
+            state["bangumi"]["conflictPolicy"] = json!(policy);
+            state["following"] = json!([bangumi_following(
+                45678,
+                json!({
+                    "rating": 8, "watchedEpisode": 3,
+                    "lastPulledPayloadHash": stale_pulled,
+                    "lastPushedPayloadHash": stale_pushed
+                })
+            )]);
+            let state = std::sync::Mutex::new(state);
+            let tokens = bangumi::MemoryTokenStore::new();
+            tokens.store("conflict-token").unwrap();
+            let username_cache = std::sync::Mutex::new(None);
+            let client =
+                bangumi::HttpBangumiClient::with_base(bangumi_test_base(&server.url())).unwrap();
+            let offline = json!({"bySubject": {}, "anilistIndex": {}});
+            let report = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio test runtime")
+                .block_on(bangumi_sync::run_bangumi_collection_sync(
+                    &client, &tokens, &username_cache, &state, &offline,
+                ));
+            (report, server, state)
+        };
+
+        // latest：不动本地 + 记冲突，零写请求。
+        let (report, server, state) = run("latest");
+        assert_eq!(report.conflicts, 1);
+        assert_eq!(report.pushed, 0);
+        assert_eq!(write_count(&server.requests()), 0);
+        {
+            let guard = state.lock().unwrap();
+            let entry = &guard["following"][0];
+            assert_eq!(entry["lastPulledPayloadHash"], json!(stale_pulled));
+            assert_eq!(entry["lastPushedPayloadHash"], json!(stale_pushed));
+        }
+
+        // local-first：推远端（本地 payload PATCH）+ 记录推送基线。
+        let (report, server, state) = run("local-first");
+        assert_eq!(report.conflicts, 0);
+        assert_eq!(report.pushed, 1);
+        let patch = server
+            .requests()
+            .into_iter()
+            .find(|request| request.method == "PATCH" && request.target == "/v0/users/-/collections/45678")
+            .expect("local-first pushes local payload");
+        let payload: Value = serde_json::from_str(&patch.body).unwrap();
+        assert_eq!(payload["type"], 3);
+        assert_eq!(payload["rate"], 8);
+        {
+            let guard = state.lock().unwrap();
+            let entry = &guard["following"][0];
+            let expected_local =
+                bangumi::collection_payload_hash_parts(3, Some(8), Some(3), None, &[], None);
+            assert_eq!(entry["lastPushedPayloadHash"], json!(expected_local));
+        }
+
+        // bangumi-first：改本地（合并远端），零写请求。
+        let (report, server, state) = run("bangumi-first");
+        assert_eq!(report.conflicts, 0);
+        assert_eq!(report.pushed, 0);
+        assert_eq!(write_count(&server.requests()), 0);
+        {
+            let guard = state.lock().unwrap();
+            let entry = &guard["following"][0];
+            assert_eq!(entry["lastPulledPayloadHash"], json!(h_remote));
+            assert_eq!(entry["lastChangedBy"], "bangumi");
+        }
+    }
+
+    // 回归锁定（schema §9 + Phase 3）：bangumiSyncStatus 五字段与
+    // pendingBangumiUnfollows 只进本地状态，绝不进坚果云文档。
+    #[cfg(feature = "standard")]
+    #[test]
+    fn document_from_state_phase3_local_only_keys_never_sync() {
+        let mut state = default_state(false);
+        state["bangumiSyncStatus"] = json!({
+            "lastFullSyncAt": 1, "lastWebDavSyncAt": 2, "lastBangumiSyncAt": 3,
+            "lastScheduleSyncAt": 4, "lastSyncError": "boom"
+        });
+        state["pendingBangumiUnfollows"] = json!([{"subjectId": 9, "at": 5}]);
+        state["bangumi"]["syncEnabled"] = json!(true);
+        state["following"] = json!([{
+            "id": 1, "title": {"native": "n", "romaji": null, "english": null},
+            "displayTitle": "x", "followedAt": 1, "syncUpdatedAt": 1,
+            "bangumiStatus": "doing", "rating": 8, "watchedEpisode": 3,
+            "lastPulledPayloadHash": "aa", "lastPushedPayloadHash": "bb",
+            "lastChangedBy": "bangumi"
+        }]);
+
+        let document = document_from_state(&mut state);
+
+        let mut keys: Vec<&str> = document
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["following", "followingDeletedAt", "tasks", "updatedAt", "version"]
+        );
+        // 记录体允许携带（属于 following 数组记录，随业务字段同步）。
+        assert_eq!(document["following"][0]["bangumiStatus"], "doing");
+
+        // merge_defaults 为旧状态补齐 bangumiSyncStatus 五字段与 following 镜像键。
+        let merged = merge_defaults(legacy_v2_state(), false);
+        let status = merged["bangumiSyncStatus"].as_object().expect("status block");
+        let mut status_keys: Vec<&str> = status.keys().map(String::as_str).collect();
+        status_keys.sort_unstable();
+        assert_eq!(
+            status_keys,
+            ["lastBangumiSyncAt", "lastFullSyncAt", "lastScheduleSyncAt", "lastSyncError", "lastWebDavSyncAt"]
+        );
+        assert!(merged["following"][0].get("bangumiStatus").is_some());
+        assert!(merged["following"][0].get("rating").is_some());
+        assert!(merged["following"][0].get("watchedEpisode").is_some());
+
+        // original 不补任何 Phase 3 键。
+        let original = merge_defaults(legacy_v2_state(), true);
+        assert!(original.get("bangumiSyncStatus").is_none());
+        assert!(original.get("pendingBangumiUnfollows").is_none());
+        assert!(original["following"][0].get("bangumiStatus").is_none());
+        assert!(original["following"][0].get("rating").is_none());
+        assert!(original["following"][0].get("watchedEpisode").is_none());
+    }
+
+    #[cfg(feature = "standard")]
+    #[test]
+    fn remove_following_queues_bangumi_unfollows_only() {
+        let mut state = default_state(false);
+        state["following"] = json!([
+            bangumi_following(100, json!({})),
+            followed(200, 1_000)
+        ]);
+
+        assert!(remove_following(&mut state, 100));
+        assert!(remove_following(&mut state, 200));
+
+        let queue = state["pendingBangumiUnfollows"].as_array().unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0]["subjectId"], 100);
+        assert!(value_i64(queue[0].get("at")) > 0);
+        // 幂等：已不存在的条目不再入队。
+        assert!(!remove_following(&mut state, 100));
+        assert_eq!(state["pendingBangumiUnfollows"].as_array().unwrap().len(), 1);
+    }
+
+    #[cfg(feature = "original")]
+    #[test]
+    fn original_bangumi_phase3_surfaces_unchanged() {
+        // 三命令统一拒绝（sync_now 携带零值 report 的固定文案）。
+        let rejected = bangumi_sync_now_rejected();
+        assert_eq!(rejected["ok"], false);
+        assert_eq!(rejected["message"], "Original 版不支持 Bangumi");
+        assert_eq!(rejected["report"]["pulled"], 0);
+        assert_eq!(rejected["report"]["suggestions"], json!([]));
+        // original 无 bangumiSyncStatus 默认键、merge 不补。
+        assert!(default_state(true).get("bangumiSyncStatus").is_none());
+        // 取消追番不写取消队列（该机制不存在于 original 编译产物）。
+        let mut state = default_state(true);
+        state["following"] = json!([followed(1, 1_000)]);
+        assert!(remove_following(&mut state, 1));
+        assert!(state.get("pendingBangumiUnfollows").is_none());
     }
 }
