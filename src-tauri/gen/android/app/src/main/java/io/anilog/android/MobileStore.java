@@ -78,6 +78,16 @@ final class MobileStore {
         }
     }
 
+    /**
+     * Bangumi 追番状态（Rust configure payload following 摘要的 bangumiStatus 字段：
+     * "wish"|"doing"|"done"|"on_hold"|"dropped"，缺省为空）。
+     * following 以原始 JSON 原样落盘（configure/updateSchedule/setFollowing 均保留未知键），
+     * 因此无需单独投影字段；此读取接口集中暴露语义，供播出通知调度做状态过滤。
+     */
+    static String followBangumiStatus(JSONObject follow) {
+        return follow == null ? "" : follow.optString("bangumiStatus", "");
+    }
+
     static JSONObject findFollow(Context context, int animeId) {
         synchronized (LOCK) {
             JSONArray items = readArray(context, FOLLOWING);

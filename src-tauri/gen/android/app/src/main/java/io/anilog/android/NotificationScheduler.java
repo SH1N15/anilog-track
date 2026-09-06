@@ -16,6 +16,15 @@ import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
+/**
+ * 新集播出通知/闹钟调度。
+ *
+ * Bangumi 状态驱动追踪（与 Rust configure payload 对齐）：following 摘要携带
+ * `bangumiStatus`（"wish"|"doing"|"done"|"on_hold"|"dropped"，缺省为空），
+ * 仅 doing（或缺省/未知，含 anilist 来源条目）排新集播出闹钟；其他状态在
+ * {@link #schedule} 中跳过并执行 {@link #cancel} 清掉已排闹钟。待看任务提醒
+ * （DailyTaskReminder）不受此过滤影响。
+ */
 final class NotificationScheduler {
     static final String CHANNEL_ID = "episode_updates";
     private static final String ACTION_PREFIX = "io.anilog.android.AIRING.";
@@ -45,6 +54,13 @@ final class NotificationScheduler {
 
     static void schedule(Context context, JSONObject follow) {
         int animeId = follow.optInt("id");
+        // Bangumi 状态驱动追踪：仅“在看”（doing，或缺省/未知按在看处理）排新集播出闹钟；
+        // 其他状态（wish/done/on_hold/dropped）不提醒新集，已排的闹钟在此取消。
+        String bangumiStatus = MobileStore.followBangumiStatus(follow);
+        if (!bangumiStatus.isEmpty() && !"doing".equals(bangumiStatus)) {
+            cancel(context, animeId);
+            return;
+        }
         int episode = follow.optInt("nextEpisode");
         long airingAt = follow.optLong("nextAiringAt");
         if (animeId <= 0 || episode <= 0 || airingAt <= 0) {

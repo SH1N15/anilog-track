@@ -5,7 +5,9 @@ import type {
   AppState,
   BangumiAuthStatus,
   BangumiCollectionItem,
+  BangumiCollectionStatus,
   BangumiConnectionTestResult,
+  BangumiFinaleCompletedPayload,
   BangumiMappingResolution,
   BangumiSubjectExtras,
   BangumiSyncResult,
@@ -69,8 +71,11 @@ export const tauriApi: DesktopApi = {
   bangumiSyncNow: () => invoke<BangumiSyncResult>('bangumi_sync_now'),
   bangumiUpdateSyncSettings: (params: BangumiSyncSettingsPatch) => invoke<AppState>('bangumi_update_sync_settings', { ...params }),
   bangumiSetRating: (params: { subjectId: number; rating: number | null }) => invoke<{ ok: boolean; message: string }>('bangumi_set_rating', { subjectId: params.subjectId, rating: params.rating }),
+  // 状态驱动追踪：直接写 Bangumi 收藏状态，返回完整 AppState 用于刷新。
+  bangumiSetCollectionStatus: (params: { subjectId: number; status: BangumiCollectionStatus }) => invoke<{ ok: boolean; message: string; state: AppState }>('bangumi_set_collection_status', { subjectId: params.subjectId, status: params.status }),
   openExternal: (url: string) => invoke<void>('open_external', { url }),
   onStateChanged: (callback) => subscribe<AppState>('state-changed', callback),
   onSeasonUpdated: (callback) => subscribe<{ season: Season; year: number; anime: Anime[]; fetchedAt: number }>('season-updated', callback),
   onOpenTasks: (callback) => subscribe<void>('open-tasks', callback),
+  onFinaleCompleted: (callback) => subscribe<BangumiFinaleCompletedPayload>('finale-completed', callback),
 };

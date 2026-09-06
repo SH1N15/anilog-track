@@ -775,6 +775,7 @@ const browserApi: DesktopApi = {
   },
   async bangumiUpdateSyncSettings() { return browserState; },
   async bangumiSetRating() { return { ok: false, message: '当前平台不支持 Bangumi 账户同步' }; },
+  async bangumiSetCollectionStatus() { return { ok: false, message: '当前平台不支持 Bangumi 账户同步', state: browserState }; },
   async toggleTask(taskId) {
     const task = browserState.tasks.find((item) => item.id === taskId);
     if (task) {

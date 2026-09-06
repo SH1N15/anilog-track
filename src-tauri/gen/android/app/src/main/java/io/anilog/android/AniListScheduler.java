@@ -56,6 +56,7 @@ final class AniListScheduler {
                         coverImage
                     );
                     JSONObject follow = MobileStore.findFollow(appContext, animeId);
+                    // schedule() 内部按 Bangumi 状态过滤（非“在看”只取消不排新集闹钟），此处无需重复判断。
                     if (follow != null) NotificationScheduler.schedule(appContext, follow);
                 }
                 updated += 1;

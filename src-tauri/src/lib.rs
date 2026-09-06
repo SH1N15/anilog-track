@@ -739,6 +739,14 @@ fn remove_following(state: &mut Value, anime_id: i64) -> bool {
     true
 }
 
+/// Bangumi 状态驱动追踪（产品语义门控）：`bangumiStatus` 非空且不是 `doing`
+/// （wish 想看 / on_hold 搁置 / done 看过）→ 收录不追踪，不为新集创建观看
+/// 任务。空/null（anilist 来源条目或从未同步过状态）→ 维持现有追踪行为。
+#[cfg(feature = "standard")]
+fn bangumi_status_blocks_tracking(status: &str) -> bool {
+    !status.is_empty() && status != "doing"
+}
+
 // ---------------------------------------------------------------------------
 // Phase 2 主键迁移：映射应用（schema §4）。仅 standard edition。
 // ---------------------------------------------------------------------------
@@ -2942,19 +2950,71 @@ fn toggle_task_status(task: &mut Value) -> bool {
     newly_completed
 }
 
-/// 桌面（standard）动作唤醒入口（问题 2b）：toggle_follow / toggle_task /
+/// 状态驱动追踪（任务 3）完结自动转「看过」内核：任务 newly_completed 后检查
+/// 条目是否已到最后一话（episodes 已知且 task.episode >= episodes），且条目
+/// 当前处于追踪中（bangumiStatus 为 doing 或空/null——wish/on_hold/done 不触发，
+/// 已 done 天然只触发一次）。满足则置 `bangumiStatus="done"` +
+/// `lastChangedBy="local"`（H_local 随之变化，写回引擎 PATCH type=2）。
+/// 返回 `Some((subjectId, displayTitle))` 表示发生了完结转换（命令层据此发
+/// `finale-completed` 事件）。
+///
+/// 条目定位：subjectId>0 直接按条目 id/bangumiId 匹配；anilist 键任务（无
+/// subjectId）经条目 anilistId/id 反查。
+#[cfg(feature = "standard")]
+fn mark_entry_done_on_finale(state: &mut Value, task: &Value) -> Option<(i64, String)> {
+    let subject_id = value_i64(task.get("subjectId"));
+    let anime_id = value_i64(task.get("animeId"));
+    let index = state["following"].as_array().and_then(|items| {
+        items.iter().position(|item| {
+            if subject_id > 0 {
+                value_i64(item.get("id")) == subject_id
+                    || value_i64(item.get("bangumiId")) == subject_id
+            } else {
+                anime_id > 0
+                    && (value_i64(item.get("id")) == anime_id
+                        || value_i64(item.get("anilistId")) == anime_id)
+            }
+        })
+    })?;
+    let entry = &state["following"][index];
+    // 仅追踪中（doing / 空状态）触发；非空且非 doing（wish/on_hold/done）跳过。
+    let current_status = value_string(entry.get("bangumiStatus"));
+    if bangumi_status_blocks_tracking(&current_status) {
+        return None;
+    }
+    let episodes = value_i64(entry.get("episodes"));
+    let episode = value_i64(task.get("episode"));
+    if episodes <= 0 || episode <= 0 || episode < episodes {
+        return None;
+    }
+    let entry_subject_id = if subject_id > 0 {
+        subject_id
+    } else {
+        value_i64(entry.get("id"))
+    };
+    let display_title = value_string(entry.get("displayTitle"));
+    let entry = &mut state["following"][index];
+    entry["bangumiStatus"] = json!("done");
+    entry["lastChangedBy"] = json!("local");
+    entry["syncUpdatedAt"] = json!(now_millis());
+    Some((entry_subject_id, display_title))
+}
+
+/// standard 动作唤醒入口（问题 2b，跨平台）：toggle_follow / toggle_task /
 /// bangumi_set_rating 的本地变更触发 `BANGUMI_SYNC_WAKEUP`，30 秒静默期合并
-/// 后由 start_desktop_bangumi_sync 执行全量同步。其余编译目标（original /
-/// Android）为空操作：original 零 Bangumi，Android 由 Java WorkManager 节奏
-/// 负责、后台不接唤醒（不常驻约束）。
-#[cfg(all(feature = "standard", not(target_os = "android")))]
+/// 后由 start_bangumi_sync_loop 执行全量同步。仅按 edition 门控（standard /
+/// original），平台不限：Android 上循环只在进程存活期间运行、随进程死亡，
+/// 60 分钟周期 + 动作唤醒，不违反"后台不常驻/不高频轮询"约束。original
+/// 为空操作：零 Bangumi。
+#[cfg(feature = "standard")]
 fn notify_bangumi_sync_wakeup(wake: bool) {
     if wake {
         BANGUMI_SYNC_WAKEUP.notify_one();
     }
 }
 
-#[cfg(not(all(feature = "standard", not(target_os = "android"))))]
+/// original 回退：零 Bangumi，唤醒即空操作。
+#[cfg(not(feature = "standard"))]
 fn notify_bangumi_sync_wakeup(_wake: bool) {}
 
 #[tauri::command]
@@ -2964,19 +3024,36 @@ fn toggle_task(
     task_id: String,
 ) -> Result<Value, String> {
     let mut state = context.state.lock().map_err(|_| "状态锁不可用")?;
-    let bangumi_task_completed = if let Some(task) = state["tasks"].as_array_mut().and_then(
-        |items| {
-            items
-                .iter_mut()
-                .find(|task| value_string(task.get("id")) == task_id)
-        },
-    ) {
+    // 状态驱动追踪（任务 3）：完结集完成 → 条目自动转 done + finale-completed
+    // 事件（app.emit，standard only；original 无 Bangumi 概念，行为不变）。
+    #[cfg(feature = "standard")]
+    let mut finale_completed: Option<(i64, String)> = None;
+    #[cfg(not(feature = "standard"))]
+    let finale_completed: Option<(i64, String)> = None;
+    let bangumi_task_completed;
+    if let Some(task) = state["tasks"].as_array_mut().and_then(|items| {
+        items
+            .iter_mut()
+            .find(|task| value_string(task.get("id")) == task_id)
+    }) {
         let newly_completed = toggle_task_status(task);
-        newly_completed && value_i64(task.get("subjectId")) > 0
+        bangumi_task_completed = newly_completed && value_i64(task.get("subjectId")) > 0;
+        // 快照后任务借用即终结，才能再借 &mut state 做条目级完结转换。
+        #[cfg(feature = "standard")]
+        if newly_completed {
+            let snapshot = task.clone();
+            finale_completed = mark_entry_done_on_finale(&mut state, &snapshot);
+        }
     } else {
-        false
+        bangumi_task_completed = false;
     };
     drop(state);
+    if let Some((subject_id, display_title)) = finale_completed {
+        let _ = app.emit(
+            "finale-completed",
+            json!({"subjectId": subject_id, "displayTitle": display_title}),
+        );
+    }
     context.save_state().map_err(|error| error.to_string())?;
     context.webdav_wakeup.notify_one();
     // 问题 2b：bangumi 任务完成 → 动作唤醒桌面自动同步（写回单集进度）。
@@ -3102,6 +3179,49 @@ struct AiringOutcome {
     created: usize,
 }
 
+/// 问题 3 内核（纯函数）：从任务列表收集"已完成集合"——status=completed
+/// 任务的 (animeId, episode) 与 (subjectId, episode) 两种键身份 + 同集。
+/// 旧版（AniList 主键时代）完成任务挂 anilistId 键，新版 bangumi 条目按
+/// subjectId 生成任务，按任务 id 查重查不到，需按此集合按集拦截。供
+/// apply_airing_schedules 与 Android mobile::merge_status 共用同一判定口径。
+#[cfg(feature = "standard")]
+fn completed_episode_history(tasks: &Value) -> HashSet<(i64, i64)> {
+    let mut history: HashSet<(i64, i64)> = HashSet::new();
+    for task in tasks.as_array().into_iter().flatten() {
+        if value_string(task.get("status")) != "completed" {
+            continue;
+        }
+        let episode = value_i64(task.get("episode"));
+        if episode <= 0 {
+            continue;
+        }
+        let anime_id = value_i64(task.get("animeId"));
+        let subject_id = value_i64(task.get("subjectId"));
+        if anime_id > 0 {
+            history.insert((anime_id, episode));
+        }
+        if subject_id > 0 {
+            history.insert((subject_id, episode));
+        }
+    }
+    history
+}
+
+/// 问题 3 内核（纯函数，易测）：bangumi 条目（subjectId=S，anilistId=A）的
+/// 新集事件命中已完成集合 (S, episode) 或 (A, episode) → 该集已有观看历史，
+/// 应跳过创建 pending 任务。anilist 键条目不经过此守卫（其任务 id 查重本就
+/// 覆盖 completed），由调用方负责。
+#[cfg(feature = "standard")]
+fn completed_history_blocks_event(
+    history: &HashSet<(i64, i64)>,
+    task_anime_id: i64,
+    anilist_id: i64,
+    episode: i64,
+) -> bool {
+    history.contains(&(task_anime_id, episode))
+        || (anilist_id > 0 && history.contains(&(anilist_id, episode)))
+}
+
 #[cfg(not(target_os = "android"))]
 fn apply_airing_schedules(state: &mut Value, schedules: &[Value], now: i64) -> AiringOutcome {
     let create_tasks = value_bool(state["settings"].get("createWatchTasks"));
@@ -3124,27 +3244,7 @@ fn apply_airing_schedules(state: &mut Value, schedules: &[Value], now: i64) -> A
     // pending。创建前先按"已完成集合"（status=completed 任务的 animeId 与
     // subjectId 两种键身份 + 同集）拦截：命中即视为该集已有观看历史。
     #[cfg(feature = "standard")]
-    let completed_history: HashSet<(i64, i64)> = {
-        let mut history: HashSet<(i64, i64)> = HashSet::new();
-        for task in state["tasks"].as_array().into_iter().flatten() {
-            if value_string(task.get("status")) != "completed" {
-                continue;
-            }
-            let episode = value_i64(task.get("episode"));
-            if episode <= 0 {
-                continue;
-            }
-            let anime_id = value_i64(task.get("animeId"));
-            let subject_id = value_i64(task.get("subjectId"));
-            if anime_id > 0 {
-                history.insert((anime_id, episode));
-            }
-            if subject_id > 0 {
-                history.insert((subject_id, episode));
-            }
-        }
-        history
-    };
+    let completed_history = completed_episode_history(&state["tasks"]);
     #[cfg(not(feature = "standard"))]
     let _completed_history: HashSet<(i64, i64)> = HashSet::new();
     let mut outcome = AiringOutcome::default();
@@ -3201,6 +3301,16 @@ fn apply_airing_schedules(state: &mut Value, schedules: &[Value], now: i64) -> A
         if !create_tasks {
             continue;
         }
+        // 状态驱动追踪（任务 2 门控）：`bangumiStatus` 非空且非 doing（wish /
+        // on_hold / done）→ 收录不追踪，不为新集创建观看任务。上方
+        // nextAiringEpisode / seenAiringEvents 更新保留（供前端展示下一期）。
+        // AniList 条目（bangumiStatus 为 null）不受影响。
+        #[cfg(feature = "standard")]
+        if bangumi_status_blocks_tracking(&value_string(
+            state["following"][followed_index].get("bangumiStatus"),
+        )) {
+            continue;
+        }
         if known.contains(&id) {
             continue;
         }
@@ -3211,9 +3321,8 @@ fn apply_airing_schedules(state: &mut Value, schedules: &[Value], now: i64) -> A
         #[cfg(feature = "standard")]
         if bangumi_sourced {
             let anilist_id = value_i64(state["following"][followed_index].get("anilistId"));
-            let has_history = completed_history.contains(&(task_anime_id, episode))
-                || (anilist_id > 0 && completed_history.contains(&(anilist_id, episode)));
-            if has_history {
+            if completed_history_blocks_event(&completed_history, task_anime_id, anilist_id, episode)
+            {
                 continue;
             }
         }
@@ -4380,11 +4489,18 @@ mod bangumi_sync {
             .and_then(|episode| u32::try_from(episode).ok())
     }
 
-    /// 本地收藏写回 payload（`type=3` 表示追番中；rate 仅在有评分时携带——
-    /// ModifyPayload 全可选，不传会被忽略）。
+    /// 写回 type（状态驱动追踪，任务 4）：由条目 `bangumiStatus` 映射
+    /// （wish=1 / done=2 / doing=3 / on_hold=4），空/null 视为 doing=3
+    /// （anilist 来源迁移条目维持旧行为）。
+    fn local_collection_type(entry: &Value) -> u32 {
+        bangumi::collection_status_value(&value_string(entry.get("bangumiStatus")))
+    }
+
+    /// 本地收藏写回 payload（type 由 [`local_collection_type`] 映射；rate 仅在
+    /// 有评分时携带——ModifyPayload 全可选，不传会被忽略）。
     pub(super) fn local_collection_payload(entry: &Value) -> Value {
         let mut payload = serde_json::Map::new();
-        payload.insert("type".into(), json!(3));
+        payload.insert("type".into(), json!(local_collection_type(entry)));
         if let Some(rate) = local_rating(entry) {
             payload.insert("rate".into(), json!(rate));
         }
@@ -4394,7 +4510,7 @@ mod bangumi_sync {
     /// 本地记录的收藏 payload 哈希（H_local；与远端同一规范化函数，保证可比）。
     pub(super) fn local_collection_hash(entry: &Value) -> String {
         bangumi::collection_payload_hash_parts(
-            3,
+            local_collection_type(entry),
             local_rating(entry),
             local_watched_episode(entry),
             None,
@@ -5490,26 +5606,28 @@ fn maybe_spawn_foreground_sync(app: &AppHandle, context: &AppContext) {
 }
 
 // ---------------------------------------------------------------------------
-// 问题 2b（验收第 2 轮，P0 追番/评分不自动写回）：桌面自动 Bangumi 同步循环
-// （standard + 桌面编译；original / Android 均不编译本节）。
+// 问题 2b（验收第 2 轮，P0 追番/评分不自动写回；跨平台化）：自动 Bangumi
+// 同步循环（standard 编译，Windows/Android 两端挂载；original 不编译本节）。
 //
 // 此前 run_full_bangumi_sync 只有手动命令（bangumi_sync_now）与 Android 前台
-// 补偿触发，桌面上追番/完成任务/评分的写回（push_local_changes）只能等用户
+// 15 分钟过期补偿，追番/完成任务/评分的写回（push_local_changes）只能等用户
 // 手动点"立即同步 Bangumi"。新增两条触发路径：
 // - 周期：每 60 分钟调用 run_full_bangumi_sync（内部开关自会 skip：同步未
-//   启用/无 Token 时只做坚果云与播出数据按需刷新，与现有桌面后台兼容）；
+//   启用/无 Token 时只做坚果云与播出数据按需刷新，与现有后台兼容）；
 // - 动作唤醒：toggle_follow（新增/取消）、toggle_task（bangumi 任务完成）、
 //   bangumi_set_rating 触发 [`BANGUMI_SYNC_WAKEUP`]，进入 30 秒静默期（静默
 //   期内再次唤醒则重新计时，合并密集动作，同 start_webdav_background 的
 //   5 秒静默合并写法）后执行一轮。
+// Android 约束：循环只在进程存活期间运行、随进程死亡——60 分钟周期 + 动作
+// 唤醒，不要求常驻后台，也不是高频轮询。
 // 执行前检查 Token 存在（load Ok(Some)），否则跳过本轮（坚果云/播出刷新由
 // 各自的后台循环负责，不在此重复触发）。single-flight 门防本循环重入；手动
 // 命令保持既有行为不进门。不用 tokio::select!（tokio 依赖无 macros feature）
 // —— 用 Notify::notified() + tokio::time::timeout 组合（仓库既有做法）。
 // ---------------------------------------------------------------------------
 
-#[cfg(all(feature = "standard", not(target_os = "android")))]
-mod desktop_bangumi_sync {
+#[cfg(feature = "standard")]
+mod bangumi_sync_loop {
     use std::time::Duration;
 
     /// 周期全量同步间隔：60 分钟。
@@ -5534,23 +5652,23 @@ mod desktop_bangumi_sync {
     }
 }
 
-#[cfg(all(feature = "standard", not(target_os = "android")))]
+#[cfg(feature = "standard")]
 static BANGUMI_SYNC_WAKEUP: std::sync::LazyLock<tokio::sync::Notify> =
     std::sync::LazyLock::new(tokio::sync::Notify::new);
 
-/// 桌面自动同步 single-flight 门（与 Android 前台补偿同思路：同一时刻最多
+/// 自动同步 single-flight 门（与 Android 前台补偿同思路：同一时刻最多
 /// 一轮自动全量同步在跑）。
-#[cfg(all(feature = "standard", not(target_os = "android")))]
-static DESKTOP_BANGUMI_SYNC_GATE: foreground_sync::SingleFlightGate =
+#[cfg(feature = "standard")]
+static BANGUMI_SYNC_LOOP_GATE: foreground_sync::SingleFlightGate =
     foreground_sync::SingleFlightGate::new();
 
-#[cfg(all(feature = "standard", not(target_os = "android")))]
-fn start_desktop_bangumi_sync(app: AppHandle, context: AppContext) {
+#[cfg(feature = "standard")]
+fn start_bangumi_sync_loop(app: AppHandle, context: AppContext) {
     tauri::async_runtime::spawn(async move {
         let mut quiet_pending = false;
         loop {
             let wait_elapsed = tokio::time::timeout(
-                desktop_bangumi_sync::wait_duration(quiet_pending),
+                bangumi_sync_loop::wait_duration(quiet_pending),
                 BANGUMI_SYNC_WAKEUP.notified(),
             )
             .await
@@ -5569,15 +5687,15 @@ fn start_desktop_bangumi_sync(app: AppHandle, context: AppContext) {
                 .ok()
                 .flatten()
                 .is_some_and(|token| !token.trim().is_empty());
-            if !desktop_bangumi_sync::should_execute(
+            if !bangumi_sync_loop::should_execute(
                 has_token,
-                DESKTOP_BANGUMI_SYNC_GATE.try_begin(),
+                BANGUMI_SYNC_LOOP_GATE.try_begin(),
             ) {
                 continue;
             }
             // 成功/失败/skipped 都由 run_full_bangumi_sync 落 bangumiSyncStatus。
             let _ = run_full_bangumi_sync(&app, &context).await;
-            DESKTOP_BANGUMI_SYNC_GATE.finish();
+            BANGUMI_SYNC_LOOP_GATE.finish();
         }
     });
 }
@@ -5703,6 +5821,206 @@ fn bangumi_update_sync_settings(
             conflict_policy,
         );
         Ok(bangumi_command_rejected())
+    }
+}
+
+/// 状态驱动追踪（任务 1）`bangumi_set_collection_status` 的纯内核：按目标
+/// 收藏状态应用本地语义，返回是否发生变更（条目按 id/bangumiId==subjectId
+/// 定位，缺失返回 false）。
+/// - dropped → 复用取消追番语义（[`remove_following`]：pending 删、completed
+///   留、墓碑；bangumi 来源入「最近取消队列」供写回 PATCH type=5）；
+/// - wish → status=wish + 删除该作品 pending（completed 作为观看历史保留）；
+/// - on_hold → status=on_hold（pending 保留）；
+/// - done → status=done + 该作品 pending 全部标记 completed（completedAt=now
+///   秒、lastChangedBy=local；不新建——门控已拦）；
+/// - doing → status=doing（恢复追踪）。
+/// 除 dropped（条目已删）外全路径 `lastChangedBy="local"`。
+#[cfg(feature = "standard")]
+fn apply_bangumi_collection_status(state: &mut Value, subject_id: i64, status: &str) -> bool {
+    let Some(index) = state["following"].as_array().and_then(|items| {
+        items.iter().position(|item| {
+            value_i64(item.get("id")) == subject_id
+                || value_i64(item.get("bangumiId")) == subject_id
+        })
+    }) else {
+        return false;
+    };
+    let entry_id = value_i64(state["following"][index].get("id"));
+    if status == "dropped" {
+        remove_following(state, entry_id);
+        return true;
+    }
+    {
+        let entry = &mut state["following"][index];
+        entry["bangumiStatus"] = json!(status);
+        entry["lastChangedBy"] = json!("local");
+    }
+    // syncUpdatedAt=now 毫秒 + 清除该 id 的既有墓碑（与其他追番写路径一致）。
+    mark_following_changed(state, entry_id);
+    // 任务匹配与拉取引擎 done 分支一致（animeId；subjectId 兜底跨键任务）。
+    let task_matches = |task: &Value| {
+        value_i64(task.get("animeId")) == entry_id
+            || value_i64(task.get("subjectId")) == entry_id
+    };
+    match status {
+        // wish：收录不追踪，删除该作品未完成任务（completed 保留）。
+        "wish" => {
+            state["tasks"].as_array_mut().unwrap().retain(|task| {
+                !(task_matches(task) && value_string(task.get("status")) == "pending")
+            });
+        }
+        // done：全部看完，该作品 pending 全部标记完成。
+        "done" => {
+            let completed_at = now_seconds();
+            let synced_at = now_millis();
+            for task in state["tasks"].as_array_mut().unwrap().iter_mut() {
+                if task_matches(task) && value_string(task.get("status")) == "pending" {
+                    task["status"] = json!("completed");
+                    task["completedAt"] = json!(completed_at);
+                    task["syncUpdatedAt"] = json!(synced_at);
+                    task["lastChangedBy"] = json!("local");
+                }
+            }
+        }
+        // doing / on_hold：pending 保留。
+        _ => {}
+    }
+    true
+}
+
+/// 状态驱动追踪（任务 1）：`bangumi_set_collection_status({ subjectId, status })`
+/// → `{ ok, message, state }`。status ∈ wish|doing|done|on_hold|dropped，本地
+/// 语义见 [`apply_bangumi_collection_status`]。有 Token 时立即写回
+/// `PATCH /v0/users/-/collections/{subject_id}`（404 → POST 创建；payload 与
+/// 写回引擎一致，type 由 bangumiStatus 映射 + 可选 rate），成功后记账
+/// lastPushedPayloadHash（dropped 成功则清出取消队列），失败不阻断本地生效
+/// （后续同步由 push_local_changes 重试）；无 Token 仅本地生效。original 运行
+/// 即拒绝。
+#[tauri::command]
+async fn bangumi_set_collection_status(
+    app: AppHandle,
+    context: State<'_, AppContext>,
+    subject_id: i64,
+    status: String,
+) -> Result<Value, String> {
+    if context.original {
+        return Ok(json!({
+            "ok": false,
+            "message": "Original 版不支持 Bangumi",
+            "state": context.public_state()
+        }));
+    }
+    #[cfg(feature = "standard")]
+    {
+        const VALID_STATUSES: [&str; 5] = ["wish", "doing", "done", "on_hold", "dropped"];
+        if !VALID_STATUSES.contains(&status.as_str()) {
+            return Ok(json!({
+                "ok": false,
+                "message": "无效的收藏状态",
+                "state": context.public_state()
+            }));
+        }
+        let dropped = status == "dropped";
+        let (has_token, base, write_payload) = {
+            let mut state = context.state.lock().map_err(|_| "状态锁不可用")?;
+            if !apply_bangumi_collection_status(&mut state, subject_id, &status) {
+                return Ok(json!({
+                    "ok": false,
+                    "message": "未找到对应追番条目",
+                    "state": context.public_state()
+                }));
+            }
+            let has_token = context
+                .bangumi_tokens
+                .load()
+                .ok()
+                .flatten()
+                .is_some_and(|token| !token.trim().is_empty());
+            let write_payload = if dropped {
+                Some(json!({"type": bangumi::SubjectCollectionType::Dropped.as_u32()}))
+            } else {
+                state["following"].as_array().and_then(|items| {
+                    items
+                        .iter()
+                        .find(|item| {
+                            value_i64(item.get("id")) == subject_id
+                                || value_i64(item.get("bangumiId")) == subject_id
+                        })
+                        .map(bangumi_sync::local_collection_payload)
+                })
+            };
+            let base = bangumi_base_urls(&state);
+            (has_token, base, write_payload)
+        };
+        let mut message = String::new();
+        if has_token {
+            if let (Some(token), Some(payload)) = (
+                context.bangumi_tokens.load().ok().flatten(),
+                write_payload,
+            ) {
+                let client = bangumi::HttpBangumiClient::new(context.client.clone(), base);
+                // 远端已有收藏记录 → PATCH；404 → POST 创建（官方 `-` 占位）。
+                let result = match client
+                    .update_collection(&token, subject_id, &payload, false)
+                    .await
+                {
+                    Ok(()) => Ok(()),
+                    Err(bangumi::BangumiApiError::NotFound { .. }) => {
+                        client
+                            .update_collection(&token, subject_id, &payload, true)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
+                match result {
+                    Ok(()) => {
+                        let mut state = context.state.lock().map_err(|_| "状态锁不可用")?;
+                        if dropped {
+                            // 立即写回成功 → 清出取消队列（防重复 PATCH type=5）。
+                            remove_pending_bangumi_unfollow(&mut state, subject_id);
+                        } else if let Some(index) = state["following"].as_array().and_then(|items| {
+                            items.iter().position(|item| {
+                                value_i64(item.get("id")) == subject_id
+                                    || value_i64(item.get("bangumiId")) == subject_id
+                            })
+                        }) {
+                            let hash = bangumi_sync::local_collection_hash(
+                                &state["following"][index],
+                            );
+                            state["following"][index]["lastPushedPayloadHash"] = json!(hash);
+                            state["following"][index]["lastPushedToBangumiAt"] =
+                                json!(now_seconds());
+                        }
+                        message = "收藏状态已更新并写回 Bangumi".into();
+                    }
+                    Err(error) => {
+                        // 写回失败不阻断本地生效：push_local_changes 后续重试。
+                        message = format!(
+                            "本地已生效，Bangumi 写回失败：{}",
+                            bangumi_commands::request_error_message(error)
+                        );
+                    }
+                }
+            }
+        } else {
+            message = "未连接 Bangumi，仅本地生效".into();
+        }
+        context.save_state().map_err(|error| error.to_string())?;
+        context.webdav_wakeup.notify_one();
+        // 本地变更 → 唤醒桌面自动同步（拉取对齐 + 失败兜底重试，PATCH 正确 type）。
+        notify_bangumi_sync_wakeup(true);
+        refresh_mobile_configuration(&app, &context)?;
+        emit_state(&app, &context);
+        return Ok(json!({"ok": true, "message": message, "state": context.public_state()}));
+    }
+    #[cfg(not(feature = "standard"))]
+    {
+        let _ = (&app, subject_id, status);
+        Ok(json!({
+            "ok": false,
+            "message": "Original 版不支持 Bangumi",
+            "state": context.public_state()
+        }))
     }
 }
 
@@ -6981,6 +7299,12 @@ pub fn run() {
             // 仅 standard edition；Windows 桌面启动路径零变化）。
             #[cfg(all(feature = "standard", target_os = "android"))]
             maybe_spawn_foreground_sync(app.handle(), &context);
+            // 问题 2b 跨平台化：Android 同样挂载自动 Bangumi 同步循环（追番/
+            // 评分/完成任务后约 1 分钟内写回，此前只有前台 15 分钟过期补偿）。
+            // 循环只在进程存活期间运行、随进程死亡：60 分钟周期 + 动作唤醒
+            // （30 秒静默合并），不要求常驻后台、不是高频轮询。
+            #[cfg(all(feature = "standard", target_os = "android"))]
+            start_bangumi_sync_loop(app.handle().clone(), context.clone());
             #[cfg(desktop)]
             {
                 tauri::window::WindowBuilder::new(app, "background")
@@ -6998,10 +7322,10 @@ pub fn run() {
                     warn!("failed to reconcile autostart setting: {error}");
                 }
                 start_desktop_background(app.handle().clone(), context.clone());
-                // 问题 2b：桌面自动 Bangumi 同步循环（60 分钟周期 + 动作唤醒；
-                // 仅 standard；original / Android 编译排除）。
-                #[cfg(all(feature = "standard", not(target_os = "android")))]
-                start_desktop_bangumi_sync(app.handle().clone(), context.clone());
+                // 问题 2b：桌面挂载自动 Bangumi 同步循环（60 分钟周期 + 动作
+                // 唤醒；standard 挂载点，Android 挂载见上方 Android 分支）。
+                #[cfg(feature = "standard")]
+                start_bangumi_sync_loop(app.handle().clone(), context.clone());
                 start_desktop_task_reminders(app.handle().clone(), context.clone());
                 if !start_hidden {
                     show_main_window(app.handle())?;
@@ -7040,6 +7364,7 @@ pub fn run() {
             bangumi_sync_now,
             bangumi_update_sync_settings,
             bangumi_set_rating,
+            bangumi_set_collection_status,
             toggle_task,
             update_settings,
             sync_now,
@@ -10884,6 +11209,45 @@ mod tests {
 
     #[cfg(feature = "standard")]
     #[test]
+    fn mobile_event_task_guard_skips_episodes_with_completed_history() {
+        // 问题 3（Android 原生 aired 事件建任务）内核：mobile::merge_status
+        // 依赖 AppHandle 不可直接测，抽取的"事件→应建任务"判定内核按与
+        // apply_airing_schedules 相同口径覆盖。旧版 completed 挂 anilistId
+        // 键（"21355-5"），bangumi 条目新事件按 subjectId（"140001-5"）→
+        // 仅按任务 id 查重查不到，需按已完成集合拦截。
+        let tasks = json!([
+            {"id": "21355-5", "animeId": 21355, "episode": 5, "status": "completed", "completedAt": 100, "syncUpdatedAt": 1},
+            {"id": "140001-7", "animeId": 140001, "subjectId": 140001, "episode": 7, "status": "completed", "completedAt": 200, "syncUpdatedAt": 1},
+            // pending 不入已完成集合：ep6 未看过 → 仍应建任务。
+            {"id": "140001-6", "animeId": 140001, "subjectId": 140001, "episode": 6, "status": "pending", "syncUpdatedAt": 2}
+        ]);
+        let history = completed_episode_history(&tasks);
+        assert!(history.contains(&(21355, 5)));
+        assert!(history.contains(&(140001, 7)));
+        assert!(!history.contains(&(140001, 6)));
+
+        // bangumi 条目（S=140001, A=21355）：
+        // ep5 命中旧 anilistId 完成键 → 跳过建任务（回归主场景）。
+        assert!(completed_history_blocks_event(&history, 140001, 21355, 5));
+        // ep7 命中 subjectId 完成键 → 跳过建任务。
+        assert!(completed_history_blocks_event(&history, 140001, 21355, 7));
+        // ep6 无完成历史 → 正常建任务。
+        assert!(!completed_history_blocks_event(&history, 140001, 21355, 6));
+        // anilist 键条目（A 无关联）不误伤他番同集号。
+        assert!(!completed_history_blocks_event(&history, 999, 0, 5));
+
+        // 幂等：同一事件重复判定结果一致（merge_status 侧反复灌入同一事件
+        // 另由 known id 查重兜底，内核判定不随调用次数漂移）。
+        let first = completed_history_blocks_event(&history, 140001, 21355, 5);
+        assert!(first);
+        assert_eq!(
+            first,
+            completed_history_blocks_event(&history, 140001, 21355, 5)
+        );
+    }
+
+    #[cfg(feature = "standard")]
+    #[test]
     fn canonicalize_absorbs_duplicate_pendings_with_completed_history() {
         // 原 cleanup_bangumi_duplicate_pendings 场景（问题 3：43 待看缩影）
         // 改写为规范化语义：completed 历史在场 → 重复 pending 被删，completed
@@ -11138,26 +11502,26 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "standard", not(target_os = "android")))]
+    #[cfg(feature = "standard")]
     #[test]
-    fn desktop_bangumi_sync_kernel_quiet_period_and_gate() {
+    fn bangumi_sync_loop_kernel_quiet_period_and_gate() {
         // 问题 2b 循环内核：静默期/周期等待时长 + 执行前判定。
-        use super::desktop_bangumi_sync;
+        use super::bangumi_sync_loop;
         // 动作唤醒 → 30 秒静默期；周期路径 → 60 分钟。
         assert_eq!(
-            desktop_bangumi_sync::wait_duration(false),
+            bangumi_sync_loop::wait_duration(false),
             std::time::Duration::from_secs(3_600)
         );
         assert_eq!(
-            desktop_bangumi_sync::wait_duration(true),
+            bangumi_sync_loop::wait_duration(true),
             std::time::Duration::from_secs(30)
         );
         // 静默期必须短于周期（唤醒比周期更快触达）。
-        assert!(desktop_bangumi_sync::QUIET_SECS < desktop_bangumi_sync::INTERVAL_SECS);
+        assert!(bangumi_sync_loop::QUIET_SECS < bangumi_sync_loop::INTERVAL_SECS);
         // 执行前判定：无 Token 不跑；门被占不跑；两者齐备才跑。
-        assert!(!desktop_bangumi_sync::should_execute(false, true));
-        assert!(!desktop_bangumi_sync::should_execute(true, false));
-        assert!(desktop_bangumi_sync::should_execute(true, true));
+        assert!(!bangumi_sync_loop::should_execute(false, true));
+        assert!(!bangumi_sync_loop::should_execute(true, false));
+        assert!(bangumi_sync_loop::should_execute(true, true));
     }
 
     #[cfg(feature = "standard")]
@@ -11223,6 +11587,360 @@ mod tests {
         assert_eq!(
             images.small.as_deref(),
             Some("https://lain.bgm.tv/pic/crt/s/00/00/12345_crt_Ab12C.jpg")
+        );
+    }
+
+    // -- 状态驱动追踪（任务 1-4）：门控 / 完结转 done / 收藏状态内核 / 写回 type --
+
+    /// 任务 2 门控判定本身：非空且 != doing 才拦截。
+    #[cfg(feature = "standard")]
+    #[test]
+    fn bangumi_status_blocks_tracking_only_non_doing() {
+        assert!(bangumi_status_blocks_tracking("wish"));
+        assert!(bangumi_status_blocks_tracking("on_hold"));
+        assert!(bangumi_status_blocks_tracking("done"));
+        assert!(bangumi_status_blocks_tracking("dropped"));
+        assert!(!bangumi_status_blocks_tracking("doing"));
+        assert!(!bangumi_status_blocks_tracking(""));
+    }
+
+    /// 任务 2 门控：wish/on_hold/done 新集不建任务（nextAiringEpisode 展示更新
+    /// 保留）；doing 与空状态（anilist 来源兼容）正常建任务。
+    #[cfg(all(feature = "standard", not(target_os = "android")))]
+    #[test]
+    fn airing_schedule_gates_task_creation_by_bangumi_status() {
+        let schedule = json!({
+            "mediaId": 45678, "episode": 3, "airingAt": 20,
+            "media": {"nextAiringEpisode": {"episode": 4, "airingAt": 30}}
+        });
+        let base = || -> Value {
+            let mut state = default_state(false);
+            state["following"] = json!([{
+                "id": 45678, "source": "bangumi", "bangumiId": 45678,
+                "displayTitle": "示例 45678", "followedAt": 0, "syncUpdatedAt": 1
+            }]);
+            state["tasks"] = json!([]);
+            state["seenAiringEvents"] = json!([]);
+            state
+        };
+
+        // 收录不追踪：三种非 doing 状态都不建任务，但展示字段照常更新。
+        for status in ["wish", "on_hold", "done"] {
+            let mut state = base();
+            state["following"][0]["bangumiStatus"] = json!(status);
+            let outcome = apply_airing_schedules(&mut state, &[schedule.clone()], 20);
+            assert_eq!(outcome.created, 0, "{status} must not create tasks");
+            assert!(state["tasks"].as_array().unwrap().is_empty());
+            assert_eq!(state["following"][0]["nextAiringEpisode"]["episode"], 4);
+        }
+
+        // doing：恢复追踪 → 正常建任务（subjectId 键）。
+        let mut state = base();
+        state["following"][0]["bangumiStatus"] = json!("doing");
+        let outcome = apply_airing_schedules(&mut state, &[schedule.clone()], 20);
+        assert_eq!(outcome.created, 1);
+        assert_eq!(state["tasks"][0]["id"], "45678-3");
+        assert_eq!(state["tasks"][0]["subjectId"], 45678);
+
+        // 空状态（anilist 来源 / 从未同步）：行为不变。
+        let mut state = base();
+        let outcome = apply_airing_schedules(&mut state, &[schedule], 20);
+        assert_eq!(outcome.created, 1);
+        assert_eq!(state["tasks"][0]["id"], "45678-3");
+    }
+
+    /// 任务 2 门控（离线调度链）：wish 条目仍生成离线调度（供 nextAiringEpisode
+    /// 展示），但 apply_airing_schedules 不为其创建任务。
+    #[cfg(all(feature = "standard", not(target_os = "android")))]
+    #[test]
+    fn bangumi_offline_schedules_wish_entry_updates_display_without_tasks() {
+        let mut state = default_state(false);
+        state["following"] = json!([{
+            "id": 45678, "source": "bangumi", "displayTitle": "Re:从零开始的异世界生活 第3章",
+            "episodes": 16, "bangumiStatus": "wish", "followedAt": 0, "syncUpdatedAt": 1
+        }]);
+        state["tasks"] = json!([]);
+        state["seenAiringEvents"] = json!([]);
+        let map = json!({
+            "bySubject": {
+                "45678": offline_entry(
+                    21355,
+                    json!("2026-07-08T13:00:22Z"),
+                    json!("R/2026-07-08T13:00:22.000Z/P7D"),
+                    Value::Null
+                )
+            }
+        });
+        let now = at("2026-07-19T16:00:00+00:00");
+
+        let schedules = bangumi_offline_schedules(&state, &map, now);
+        assert_eq!(schedules.len(), 2, "wish 条目调度照常生成供展示");
+        let outcome = apply_airing_schedules(&mut state, &schedules, now);
+        assert_eq!(
+            outcome,
+            AiringOutcome {
+                aired: 2,
+                created: 0
+            }
+        );
+        assert!(state["tasks"].as_array().unwrap().is_empty());
+        assert_eq!(state["following"][0]["nextAiringEpisode"]["episode"], 3);
+    }
+
+    /// 任务 1 内核：四种保留条目的状态 + dropped 取消追番语义 + 无条目报错。
+    #[cfg(feature = "standard")]
+    #[test]
+    fn bangumi_collection_status_kernel_applies_local_semantics() {
+        let base = || -> Value {
+            let mut state = default_state(false);
+            state["following"] = json!([{
+                "id": 45678, "source": "bangumi", "bangumiId": 45678,
+                "displayTitle": "示例 45678", "bangumiStatus": "doing",
+                "followedAt": 0, "syncUpdatedAt": 1
+            }]);
+            state["tasks"] = json!([
+                {"id": "45678-1", "animeId": 45678, "animeTitle": "示例 45678", "episode": 1,
+                 "airingAt": 10, "status": "pending", "createdAt": 10, "completedAt": null,
+                 "syncUpdatedAt": 1},
+                {"id": "45678-2", "animeId": 45678, "animeTitle": "示例 45678", "episode": 2,
+                 "airingAt": 10, "status": "completed", "createdAt": 10, "completedAt": 20,
+                 "syncUpdatedAt": 1},
+                {"id": "99999-1", "animeId": 99999, "animeTitle": "其他", "episode": 1,
+                 "airingAt": 10, "status": "pending", "createdAt": 10, "completedAt": null,
+                 "syncUpdatedAt": 1}
+            ]);
+            state
+        };
+
+        // wish：pending 删、completed 留、其他作品不动、lastChangedBy=local。
+        let mut state = base();
+        assert!(apply_bangumi_collection_status(&mut state, 45678, "wish"));
+        assert_eq!(state["following"][0]["bangumiStatus"], "wish");
+        assert_eq!(state["following"][0]["lastChangedBy"], "local");
+        assert!(value_i64(state["following"][0].get("syncUpdatedAt")) > 1);
+        let ids: Vec<String> = state["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|task| value_string(task.get("id")))
+            .collect();
+        assert_eq!(ids, vec!["45678-2".to_string(), "99999-1".to_string()]);
+
+        // on_hold：pending 保留。
+        let mut state = base();
+        assert!(apply_bangumi_collection_status(&mut state, 45678, "on_hold"));
+        assert_eq!(state["following"][0]["bangumiStatus"], "on_hold");
+        assert_eq!(state["tasks"].as_array().unwrap().len(), 3);
+
+        // done：该作品 pending 全部标记完成（completedAt=now 秒、
+        // lastChangedBy=local），已完成任务与其他作品不动。
+        let mut state = base();
+        assert!(apply_bangumi_collection_status(&mut state, 45678, "done"));
+        assert_eq!(state["following"][0]["bangumiStatus"], "done");
+        let tasks = state["tasks"].as_array().unwrap();
+        let first = tasks
+            .iter()
+            .find(|task| value_string(task.get("id")) == "45678-1")
+            .unwrap();
+        assert_eq!(first["status"], "completed");
+        assert!(value_i64(first.get("completedAt")) > 0);
+        assert_eq!(first["lastChangedBy"], "local");
+        let history = tasks
+            .iter()
+            .find(|task| value_string(task.get("id")) == "45678-2")
+            .unwrap();
+        assert_eq!(history["completedAt"], 20, "已完成任务不被改写");
+        let other = tasks
+            .iter()
+            .find(|task| value_string(task.get("id")) == "99999-1")
+            .unwrap();
+        assert_eq!(other["status"], "pending");
+
+        // doing：恢复追踪（pending 保留）。
+        let mut state = base();
+        assert!(apply_bangumi_collection_status(&mut state, 45678, "doing"));
+        assert_eq!(state["following"][0]["bangumiStatus"], "doing");
+        assert_eq!(state["tasks"].as_array().unwrap().len(), 3);
+
+        // dropped：复用取消追番（pending 删/completed 留/墓碑/取消队列入列）。
+        let mut state = base();
+        assert!(apply_bangumi_collection_status(&mut state, 45678, "dropped"));
+        assert!(!state["following"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| value_i64(item.get("id")) == 45678));
+        let ids: Vec<String> = state["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|task| value_string(task.get("id")))
+            .collect();
+        assert_eq!(ids, vec!["45678-2".to_string(), "99999-1".to_string()]);
+        assert!(value_i64(state["syncMetadata"]["followingDeletedAt"].get("45678")) > 0);
+        assert!(state
+            .get("pendingBangumiUnfollows")
+            .and_then(Value::as_array)
+            .is_some_and(|items| items
+                .iter()
+                .any(|item| value_i64(item.get("subjectId")) == 45678)));
+
+        // 无条目 → false（命令层返回 ok=false）。
+        let mut state = base();
+        assert!(!apply_bangumi_collection_status(&mut state, 12345, "doing"));
+
+        // bangumiId 反查定位（id 与 subjectId 不一致的旧记录）。
+        let mut state = base();
+        state["following"][0]["id"] = json!(1);
+        assert!(apply_bangumi_collection_status(&mut state, 45678, "on_hold"));
+        assert_eq!(state["following"][0]["bangumiStatus"], "on_hold");
+    }
+
+    /// 任务 3 内核：完结集完成 → 条目转 done（一次）；非完结/episodes 未知/
+    /// 已 done / wish / on_hold 不触发；anilist 键任务经 anilistId 反查。
+    #[cfg(feature = "standard")]
+    #[test]
+    fn finale_completion_marks_entry_done_once() {
+        let base = |status: Value| -> Value {
+            let mut state = default_state(false);
+            let mut entry = json!({
+                "id": 45678, "source": "bangumi", "bangumiId": 45678,
+                "displayTitle": "示例 45678", "episodes": 12, "followedAt": 0, "syncUpdatedAt": 1
+            });
+            if !status.is_null() {
+                entry["bangumiStatus"] = status;
+            }
+            state["following"] = json!([entry]);
+            state["tasks"] = json!([
+                {"id": "45678-12", "animeId": 45678, "animeTitle": "示例 45678", "episode": 12,
+                 "airingAt": 10, "status": "completed", "createdAt": 10, "completedAt": 20,
+                 "syncUpdatedAt": 1, "subjectId": 45678}
+            ]);
+            state
+        };
+        let finale_task = json!({"id": "45678-12", "animeId": 45678, "subjectId": 45678, "episode": 12});
+
+        // 完结集完成：doing → done，返回事件载荷（subjectId + displayTitle）。
+        let mut state = base(json!("doing"));
+        assert_eq!(
+            mark_entry_done_on_finale(&mut state, &finale_task),
+            Some((45678, "示例 45678".to_string()))
+        );
+        assert_eq!(state["following"][0]["bangumiStatus"], "done");
+        assert_eq!(state["following"][0]["lastChangedBy"], "local");
+
+        // 已 done：重复完成不触发（只触发一次）。
+        let mut state = base(json!("done"));
+        assert_eq!(mark_entry_done_on_finale(&mut state, &finale_task), None);
+
+        // 非完结集（episode < episodes）不触发。
+        let mut state = base(json!("doing"));
+        let mid_task = json!({"id": "45678-5", "animeId": 45678, "subjectId": 45678, "episode": 5});
+        assert_eq!(mark_entry_done_on_finale(&mut state, &mid_task), None);
+        assert_eq!(state["following"][0]["bangumiStatus"], "doing");
+
+        // episodes 未知不触发。
+        let mut state = base(json!("doing"));
+        state["following"][0]["episodes"] = Value::Null;
+        assert_eq!(mark_entry_done_on_finale(&mut state, &finale_task), None);
+
+        // wish / on_hold（收录不追踪）不触发。
+        for status in ["wish", "on_hold"] {
+            let mut state = base(json!(status));
+            assert_eq!(
+                mark_entry_done_on_finale(&mut state, &finale_task),
+                None,
+                "{status} must not trigger finale"
+            );
+        }
+
+        // 空状态（anilist 迁移条目）触发；任务无 subjectId 时经 anilistId 反查。
+        let mut state = base(Value::Null);
+        state["following"][0]["anilistId"] = json!(21355);
+        let anilist_task = json!({"id": "21355-12", "animeId": 21355, "episode": 12});
+        assert_eq!(
+            mark_entry_done_on_finale(&mut state, &anilist_task),
+            Some((45678, "示例 45678".to_string()))
+        );
+        assert_eq!(state["following"][0]["bangumiStatus"], "done");
+    }
+
+    /// 任务 4：写回 type 由条目 bangumiStatus 映射（on_hold=4 / wish=1 /
+    /// done=2 / doing=3），hash 幂等逻辑不受影响。
+    #[cfg(feature = "standard")]
+    #[test]
+    fn bangumi_push_collection_type_follows_bangumi_status() {
+        use crate::bangumi::test_support::MockBangumiServer;
+
+        let server = MockBangumiServer::spawn(Arc::new(
+            move |_method, target, _headers, _body| {
+                if target.starts_with("/v0/users/-/collections/") {
+                    return (204, vec![], String::new());
+                }
+                (404, vec![], "{}".into())
+            },
+        ));
+        let mut state = phase3_state("https://unused.example.com/v0");
+        let entry = |id: i64, status: &str| {
+            json!({
+                "id": id, "source": "bangumi", "bangumiId": id,
+                "displayTitle": format!("示例 {id}"), "followedAt": 1, "syncUpdatedAt": 1,
+                "bangumiStatus": status, "lastChangedBy": "local",
+                "lastPulledPayloadHash": "stale-baseline"
+            })
+        };
+        state["following"] = json!([
+            entry(11111, "on_hold"),
+            entry(22222, "wish"),
+            entry(33333, "done"),
+            entry(44444, "doing")
+        ]);
+        let state = std::sync::Mutex::new(state);
+        let tokens = bangumi::MemoryTokenStore::new();
+        tokens.store("type-token").unwrap();
+        let username_cache = std::sync::Mutex::new(None);
+        let client =
+            bangumi::HttpBangumiClient::with_base(bangumi_test_base(&server.url())).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio test runtime");
+
+        let report = rt.block_on(bangumi_sync::push_local_changes(
+            &client, &tokens, &username_cache, &state,
+        ));
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.pushed, 4);
+        let mut writes: Vec<(i64, u32)> = server
+            .requests()
+            .iter()
+            .filter(|request| request.method == "PATCH")
+            .filter_map(|request| {
+                let subject_id: i64 = request
+                    .target
+                    .trim_start_matches("/v0/users/-/collections/")
+                    .parse()
+                    .ok()?;
+                let payload: Value = serde_json::from_str(&request.body).ok()?;
+                Some((subject_id, payload["type"].as_u64()? as u32))
+            })
+            .collect();
+        writes.sort_unstable();
+        assert_eq!(
+            writes,
+            vec![(11111, 4), (22222, 1), (33333, 2), (44444, 3)]
+        );
+        // 推送成功后记账 hash（幂等基线更新）。
+        let guard = state.lock().unwrap();
+        let held = guard["following"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| value_i64(item.get("id")) == 11111)
+            .unwrap();
+        assert_eq!(
+            held["lastPushedPayloadHash"],
+            json!(bangumi_sync::local_collection_hash(held))
         );
     }
 }

@@ -39,7 +39,7 @@ import {
   X,
 } from 'lucide-react';
 import { api } from './api';
-import type { Anime, AppState, BangumiAuthStatus, BangumiConflictPolicy, BangumiMappingResolution, BangumiSubjectExtras, BangumiSyncReport, BangumiSyncSettingsPatch, BangumiTitleMatch, BangumiUserProfile, FollowedAnime, Season, SeasonViewMode, Settings as AppSettings, UiLanguage, ViewId, WatchTask, WebDavConfig } from './types';
+import type { Anime, AppState, BangumiAuthStatus, BangumiCollectionStatus, BangumiConflictPolicy, BangumiFinaleCompletedPayload, BangumiMappingResolution, BangumiSubjectExtras, BangumiSyncReport, BangumiSyncSettingsPatch, BangumiTitleMatch, BangumiUserProfile, FollowedAnime, Season, SeasonViewMode, Settings as AppSettings, UiLanguage, ViewId, WatchTask, WebDavConfig } from './types';
 import { IS_ORIGINAL_EDITION, productName, titleForPreference } from './edition';
 import { localizeMessage, normalizeUiLanguage, tr } from './i18n';
 import { createStateRefreshController } from './state-refresh';
@@ -86,6 +86,28 @@ const BANGUMI_STATUS_LABELS: Record<string, [string, string]> = {
   on_hold: ['搁置', 'On hold'],
   wish: ['想看', 'Wish to watch'],
 };
+// 状态驱动追踪：行内状态下拉的选项（dropped 会触发抛弃追番确认并写回 Bangumi）。
+const BANGUMI_STATUS_OPTIONS: Array<{ value: BangumiCollectionStatus; label: [string, string] }> = [
+  { value: 'doing', label: ['在看', 'Watching'] },
+  { value: 'wish', label: ['想看', 'Plan to watch'] },
+  { value: 'on_hold', label: ['搁置', 'On hold'] },
+  { value: 'done', label: ['看过', 'Watched'] },
+  { value: 'dropped', label: ['抛弃追番', 'Drop'] },
+];
+// 状态分组顺序：在看（含未标记 bangumiStatus 的旧条目）→ 想看 → 搁置 → 看完；dropped 条目已被取消追番，不展示。
+const FOLLOWING_GROUP_ORDER: Array<{ key: 'doing' | 'wish' | 'on_hold' | 'done'; label: [string, string] }> = [
+  { key: 'doing', label: ['在看', 'Watching'] },
+  { key: 'wish', label: ['想看', 'Plan to watch'] },
+  { key: 'on_hold', label: ['搁置', 'On hold'] },
+  { key: 'done', label: ['看完', 'Finished'] },
+];
+
+function followingGroupOf(item: FollowedAnime): 'doing' | 'wish' | 'on_hold' | 'done' {
+  if (item.bangumiStatus === 'wish') return 'wish';
+  if (item.bangumiStatus === 'on_hold') return 'on_hold';
+  if (item.bangumiStatus === 'done') return 'done';
+  return 'doing';
+}
 const BANGUMI_RATING_OPTIONS = Array.from({ length: 11 }, (_, value) => value);
 // Bangumi SubjectCollectionType（1 wish / 2 done / 3 doing / 4 on_hold / 5 dropped）→ 建议列表展示名。
 const BANGUMI_SUGGESTION_TYPE_LABELS: Record<number, string> = { 1: '想看', 2: '看过', 3: '在看', 4: '搁置', 5: '弃番' };
@@ -139,6 +161,30 @@ function App() {
       unsubscribeDesktop?.();
     };
   }, []);
+
+  // 状态驱动追踪：最后一话看完后弹出完结评分横幅；多部完结时显示最新一条即可。
+  const [finaleBanner, setFinaleBanner] = useState<BangumiFinaleCompletedPayload | null>(null);
+  const [finaleRatingBusy, setFinaleRatingBusy] = useState(false);
+  useEffect(() => {
+    if (!IS_TAURI_APP) return;
+    return api.onFinaleCompleted?.((payload) => setFinaleBanner(payload));
+  }, []);
+
+  const rateFinale = async (rating: number) => {
+    const current = finaleBanner;
+    if (!current || !api.bangumiSetRating) return;
+    setFinaleRatingBusy(true);
+    try {
+      const result = await api.bangumiSetRating({ subjectId: current.subjectId, rating });
+      setState(await api.getState());
+      setLastSyncMessage(localizeMessage(result.message, language));
+      setFinaleBanner(null);
+    } catch (reason) {
+      setLastSyncMessage(reason instanceof Error ? localizeMessage(reason.message, language) : t('评分同步失败', 'Rating sync failed'));
+    } finally {
+      setFinaleRatingBusy(false);
+    }
+  };
 
   useEffect(() => {
     const controller = createStateRefreshController({
@@ -284,6 +330,25 @@ function App() {
         </header>
 
         <div className="view-container">
+          {finaleBanner && (
+            <div className="finale-banner" role="status">
+              <div className="finale-copy">
+                <strong>{t(`《${finaleBanner.displayTitle}》已看完，去评分吧`, `“${finaleBanner.displayTitle}” finished — rate it now`)}</strong>
+                <small>{t('已自动标记为看过', 'Automatically marked as watched')}</small>
+              </div>
+              <div className="finale-rating" aria-label={t('评分', 'Rating')}>
+                <Star size={15} />
+                {Array.from({ length: 10 }, (_, index) => index + 1).map((value) => (
+                  <button key={value} disabled={finaleRatingBusy} onClick={() => void rateFinale(value)}>
+                    {value}
+                  </button>
+                ))}
+              </div>
+              <button className="icon-button" title={t('关闭', 'Close')} aria-label={t('关闭评分提醒', 'Dismiss rating prompt')} onClick={() => setFinaleBanner(null)}>
+                <X size={16} />
+              </button>
+            </div>
+          )}
           {view === 'season' && (
             <SeasonView
               anime={anime}
@@ -344,6 +409,23 @@ function App() {
                   setLastSyncMessage(localizeMessage(result.message, language));
                 } catch (reason) {
                   setLastSyncMessage(reason instanceof Error ? localizeMessage(reason.message, language) : t('评分同步失败', 'Rating sync failed'));
+                }
+              }}
+              onSetCollectionStatus={async (subjectId, status) => {
+                if (status === 'dropped') {
+                  const confirmed = window.confirm(t(
+                    '抛弃后将取消追番：未完成任务删除，观看历史保留。确认？',
+                    'Dropping will unfollow this title: pending tasks are deleted and watch history is kept. Confirm?',
+                  ));
+                  if (!confirmed) return;
+                }
+                if (!api.bangumiSetCollectionStatus) return;
+                try {
+                  const result = await api.bangumiSetCollectionStatus({ subjectId, status });
+                  setState(result.state || await api.getState());
+                  setLastSyncMessage(localizeMessage(result.message, language));
+                } catch (reason) {
+                  setLastSyncMessage(reason instanceof Error ? localizeMessage(reason.message, language) : t('状态同步失败', 'Status sync failed'));
                 }
               }}
             />
@@ -847,6 +929,7 @@ function FollowingView({
   onConfirmMapping,
   onSkipMapping,
   onSetRating,
+  onSetCollectionStatus,
 }: {
   items: AppState['following'];
   language: UiLanguage;
@@ -856,6 +939,7 @@ function FollowingView({
   onConfirmMapping: (animeId: number, subjectId: number) => Promise<void>;
   onSkipMapping: (animeId: number) => Promise<void>;
   onSetRating: (subjectId: number, rating: number | null) => Promise<void>;
+  onSetCollectionStatus: (subjectId: number, status: BangumiCollectionStatus) => Promise<void>;
 }) {
   const t = (chinese: string, english: string) => tr(language, chinese, english);
   const [editingId, setEditingId] = useState<number | null>(null);
@@ -863,9 +947,9 @@ function FollowingView({
   const [mappingDialogFor, setMappingDialogFor] = useState<number | null>(null);
   const [mappingBusy, setMappingBusy] = useState(false);
   const [ratingBusyId, setRatingBusyId] = useState<number | null>(null);
+  const [statusBusyId, setStatusBusyId] = useState<number | null>(null);
   const [resolutions, setResolutions] = useState<Record<number, BangumiMappingResolution>>({});
   const requestedMappings = useRef(new Set<number>());
-  const sorted = [...items].sort((a, b) => (a.nextAiringEpisode?.airingAt || Infinity) - (b.nextAiringEpisode?.airingAt || Infinity));
   const pendingItems = items.filter((item) => item.mappingPending === true);
 
   // Phase 3：Bangumi 条目的行内评分变更；subjectId 取 bangumiId，Bangumi 来源条目回落主键 id。
@@ -875,6 +959,16 @@ function FollowingView({
       await onSetRating(subjectId, value === '' ? null : Number(value));
     } finally {
       setRatingBusyId((current) => (current === item.id ? null : current));
+    }
+  };
+
+  // 状态驱动追踪：行内状态变更；dropped（抛弃追番）的确认与后端调用由 App 层的 onSetCollectionStatus 处理。
+  const handleSetStatus = async (item: FollowedAnime, subjectId: number, status: BangumiCollectionStatus) => {
+    setStatusBusyId(item.id);
+    try {
+      await onSetCollectionStatus(subjectId, status);
+    } finally {
+      setStatusBusyId((current) => (current === item.id ? null : current));
     }
   };
 
@@ -926,111 +1020,141 @@ function FollowingView({
   const dialogItem = mappingDialogFor != null ? items.find((item) => item.id === mappingDialogFor) || null : null;
   const dialogResolution = mappingDialogFor != null ? resolutions[mappingDialogFor] || null : null;
 
+  // 状态分组：在看（含 bangumiStatus 为空的旧条目）→ 想看 → 搁置 → 看完；空组不显示。
+  const groups = FOLLOWING_GROUP_ORDER
+    .map(({ key, label }) => ({
+      key,
+      label,
+      items: items.filter((item) => followingGroupOf(item) === key)
+        .sort((a, b) => (a.nextAiringEpisode?.airingAt || Infinity) - (b.nextAiringEpisode?.airingAt || Infinity)),
+    }))
+    .filter((group) => group.items.length > 0);
+
+  const renderFollowingRow = (item: FollowedAnime) => {
+    // Phase 3：standard 下 Bangumi 条目（source='bangumi' 或带 bangumiId）提供行内评分、状态徽章与状态下拉。
+    const bangumiSubjectId = !IS_ORIGINAL_EDITION && (item.source === 'bangumi' || typeof item.bangumiId === 'number')
+      ? (typeof item.bangumiId === 'number' ? item.bangumiId : item.id)
+      : null;
+    const statusBadge = item.bangumiStatus ? BANGUMI_STATUS_LABELS[item.bangumiStatus] : undefined;
+    return (
+    <article className="following-row" key={item.id}>
+      <img src={item.coverImage} alt="" />
+      <div className="following-copy">
+        <span>
+          {formatLabel(item.format, language)} · {t('通知与任务标题', 'Notification and task title')}
+          {item.mappingPending === true && (
+            <button
+              className="mapping-badge"
+              style={{ marginLeft: 8, border: '1px solid currentColor', borderRadius: 999, padding: '1px 9px', fontSize: 12, background: 'transparent', color: 'inherit', cursor: 'pointer' }}
+              title={t('确认 Bangumi 条目映射', 'Confirm the Bangumi subject mapping')}
+              onClick={() => setMappingDialogFor(item.id)}
+            >
+              {t('待确认映射', 'Mapping pending')}
+            </button>
+          )}
+          {statusBadge && (
+            <span
+              style={{ marginLeft: 8, border: '1px solid currentColor', borderRadius: 999, padding: '1px 9px', fontSize: 12, opacity: 0.75 }}
+              title={t('Bangumi 收藏状态', 'Bangumi collection status')}
+            >
+              {t(...statusBadge)}
+            </span>
+          )}
+        </span>
+        {editingId === item.id ? (
+          <div className="title-editor">
+            <input
+              value={draftTitle}
+              onChange={(event) => setDraftTitle(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Escape') setEditingId(null);
+                if (event.key === 'Enter' && draftTitle.trim()) {
+                  void onRename(item.id, draftTitle).then(() => setEditingId(null));
+                }
+              }}
+              aria-label={t(`${item.displayTitle} 的提醒标题`, `Alert title for ${item.displayTitle}`)}
+              placeholder={t('输入提醒标题', 'Enter alert title')}
+              autoFocus
+            />
+            <button
+              title={t('保存提醒名', 'Save alert title')}
+              disabled={!draftTitle.trim()}
+              onClick={() => void onRename(item.id, draftTitle).then(() => setEditingId(null))}
+            ><Check size={16} /></button>
+            <button title={t('取消修改', 'Cancel editing')} onClick={() => setEditingId(null)}><X size={16} /></button>
+          </div>
+        ) : (
+          <div className="following-name">
+            <strong>{item.displayTitle}</strong>
+            <button
+              title={t('修改提醒标题', 'Edit alert title')}
+              onClick={() => { setEditingId(item.id); setDraftTitle(item.displayTitle); }}
+            ><Pencil size={14} /></button>
+          </div>
+        )}
+        <small>{titleOf(item.title, language) !== item.displayTitle ? `${titleOf(item.title, language)} · ` : ''}{item.episodes ? t(`全 ${item.episodes} 集`, `${item.episodes} episodes`) : t('总集数待定', 'Episode count TBA')}</small>
+        {bangumiSubjectId != null && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 4, fontSize: 12 }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+              <select
+                value={item.bangumiStatus || 'doing'}
+                disabled={statusBusyId === item.id}
+                aria-label={t(`调整 ${item.displayTitle} 的状态`, `Set status for ${item.displayTitle}`)}
+                onChange={(event) => void handleSetStatus(item, bangumiSubjectId, event.target.value as BangumiCollectionStatus)}
+              >
+                {BANGUMI_STATUS_OPTIONS.map((option) => <option key={option.value} value={option.value}>{t(...option.label)}</option>)}
+              </select>
+            </label>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+              <Star size={13} />
+              <select
+                value={item.rating == null ? '' : String(item.rating)}
+                disabled={ratingBusyId === item.id}
+                aria-label={t(`评分 ${item.displayTitle}`, `Rate ${item.displayTitle}`)}
+                onChange={(event) => void handleSetRating(item, bangumiSubjectId, event.target.value)}
+              >
+                <option value="">{t('未评分', 'Unrated')}</option>
+                {BANGUMI_RATING_OPTIONS.map((value) => <option key={value} value={value}>{value}</option>)}
+              </select>
+            </label>
+            {item.watchedEpisode != null && (
+              <span style={{ opacity: 0.7 }}>
+                {t(`进度 ${item.watchedEpisode}${item.episodes ? ` / ${item.episodes}` : ''}`, `Progress ${item.watchedEpisode}${item.episodes ? ` / ${item.episodes}` : ''}`)}
+              </span>
+            )}
+          </div>
+        )}
+      </div>
+      <div className="following-next">
+        <small>{t('下次更新', 'Next episode')}</small>
+        <strong>{item.nextAiringEpisode ? t(`第 ${item.nextAiringEpisode.episode} 集`, `Episode ${item.nextAiringEpisode.episode}`) : t('暂无日程', 'No schedule')}</strong>
+        <span>{item.nextAiringEpisode ? `${formatAiring(item.nextAiringEpisode.airingAt, true, language)} · ${relativeTime(item.nextAiringEpisode.airingAt, language)}` : item.source === 'bangumi' ? t('等待 Bangumi 日程', 'Waiting for Bangumi') : t('等待 AniList 公布', 'Waiting for AniList')}</span>
+      </div>
+      <button className="icon-button danger" title={t('取消追番', 'Unfollow')} aria-label={t(`取消追番 ${item.displayTitle}`, `Unfollow ${item.displayTitle}`)} onClick={() => onUnfollow(item.id)}><Minus size={19} /></button>
+    </article>
+    );
+  };
+
   return (
     <>
       <section className="section-heading compact">
         <div><div className="eyebrow"><BellRing size={14} /> {t('自动跟踪', 'Automatic tracking')}</div><h2>{t('正在追的番剧', 'Currently following')}</h2><p>{t(`${items.length} 部作品会在播出后自动创建观看任务。`, `${items.length} title${items.length === 1 ? '' : 's'} will create watch tasks after airing.`)}</p></div>
         <button className="secondary-button" onClick={onOpenTasks}><ListChecks size={17} /> {t('查看任务', 'View tasks')}</button>
       </section>
-      {items.length === 0 ? (
+      {items.length === 0 || groups.length === 0 ? (
         <EmptyState icon={Bell} title={t('还没有添加追番', 'Nothing followed yet')} body={t('到季度新番中选择作品，更新提醒会自动开启。', 'Choose a title from Seasonal Anime to enable update alerts.')} />
       ) : (
-        <div className="following-list">
-          {sorted.map((item) => {
-            // Phase 3：standard 下 Bangumi 条目（source='bangumi' 或带 bangumiId）提供行内评分与状态徽章。
-            const bangumiSubjectId = !IS_ORIGINAL_EDITION && (item.source === 'bangumi' || typeof item.bangumiId === 'number')
-              ? (typeof item.bangumiId === 'number' ? item.bangumiId : item.id)
-              : null;
-            const statusBadge = item.bangumiStatus ? BANGUMI_STATUS_LABELS[item.bangumiStatus] : undefined;
-            return (
-            <article className="following-row" key={item.id}>
-              <img src={item.coverImage} alt="" />
-              <div className="following-copy">
-                <span>
-                  {formatLabel(item.format, language)} · {t('通知与任务标题', 'Notification and task title')}
-                  {item.mappingPending === true && (
-                    <button
-                      className="mapping-badge"
-                      style={{ marginLeft: 8, border: '1px solid currentColor', borderRadius: 999, padding: '1px 9px', fontSize: 12, background: 'transparent', color: 'inherit', cursor: 'pointer' }}
-                      title={t('确认 Bangumi 条目映射', 'Confirm the Bangumi subject mapping')}
-                      onClick={() => setMappingDialogFor(item.id)}
-                    >
-                      {t('待确认映射', 'Mapping pending')}
-                    </button>
-                  )}
-                  {statusBadge && (
-                    <span
-                      style={{ marginLeft: 8, border: '1px solid currentColor', borderRadius: 999, padding: '1px 9px', fontSize: 12, opacity: 0.75 }}
-                      title={t('Bangumi 收藏状态', 'Bangumi collection status')}
-                    >
-                      {t(...statusBadge)}
-                    </span>
-                  )}
-                </span>
-                {editingId === item.id ? (
-                  <div className="title-editor">
-                    <input
-                      value={draftTitle}
-                      onChange={(event) => setDraftTitle(event.target.value)}
-                      onKeyDown={(event) => {
-                        if (event.key === 'Escape') setEditingId(null);
-                        if (event.key === 'Enter' && draftTitle.trim()) {
-                          void onRename(item.id, draftTitle).then(() => setEditingId(null));
-                        }
-                      }}
-                      aria-label={t(`${item.displayTitle} 的提醒标题`, `Alert title for ${item.displayTitle}`)}
-                      placeholder={t('输入提醒标题', 'Enter alert title')}
-                      autoFocus
-                    />
-                    <button
-                      title={t('保存提醒名', 'Save alert title')}
-                      disabled={!draftTitle.trim()}
-                      onClick={() => void onRename(item.id, draftTitle).then(() => setEditingId(null))}
-                    ><Check size={16} /></button>
-                    <button title={t('取消修改', 'Cancel editing')} onClick={() => setEditingId(null)}><X size={16} /></button>
-                  </div>
-                ) : (
-                  <div className="following-name">
-                    <strong>{item.displayTitle}</strong>
-                    <button
-                      title={t('修改提醒标题', 'Edit alert title')}
-                      onClick={() => { setEditingId(item.id); setDraftTitle(item.displayTitle); }}
-                    ><Pencil size={14} /></button>
-                  </div>
-                )}
-                <small>{titleOf(item.title, language) !== item.displayTitle ? `${titleOf(item.title, language)} · ` : ''}{item.episodes ? t(`全 ${item.episodes} 集`, `${item.episodes} episodes`) : t('总集数待定', 'Episode count TBA')}</small>
-                {bangumiSubjectId != null && (
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 4, fontSize: 12 }}>
-                    <label style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                      <Star size={13} />
-                      <select
-                        value={item.rating == null ? '' : String(item.rating)}
-                        disabled={ratingBusyId === item.id}
-                        aria-label={t(`评分 ${item.displayTitle}`, `Rate ${item.displayTitle}`)}
-                        onChange={(event) => void handleSetRating(item, bangumiSubjectId, event.target.value)}
-                      >
-                        <option value="">{t('未评分', 'Unrated')}</option>
-                        {BANGUMI_RATING_OPTIONS.map((value) => <option key={value} value={value}>{value}</option>)}
-                      </select>
-                    </label>
-                    {item.watchedEpisode != null && (
-                      <span style={{ opacity: 0.7 }}>
-                        {t(`进度 ${item.watchedEpisode}${item.episodes ? ` / ${item.episodes}` : ''}`, `Progress ${item.watchedEpisode}${item.episodes ? ` / ${item.episodes}` : ''}`)}
-                      </span>
-                    )}
-                  </div>
-                )}
-              </div>
-              <div className="following-next">
-                <small>{t('下次更新', 'Next episode')}</small>
-                <strong>{item.nextAiringEpisode ? t(`第 ${item.nextAiringEpisode.episode} 集`, `Episode ${item.nextAiringEpisode.episode}`) : t('暂无日程', 'No schedule')}</strong>
-                <span>{item.nextAiringEpisode ? `${formatAiring(item.nextAiringEpisode.airingAt, true, language)} · ${relativeTime(item.nextAiringEpisode.airingAt, language)}` : item.source === 'bangumi' ? t('等待 Bangumi 日程', 'Waiting for Bangumi') : t('等待 AniList 公布', 'Waiting for AniList')}</span>
-              </div>
-              <button className="icon-button danger" title={t('取消追番', 'Unfollow')} aria-label={t(`取消追番 ${item.displayTitle}`, `Unfollow ${item.displayTitle}`)} onClick={() => onUnfollow(item.id)}><Minus size={19} /></button>
-            </article>
-            );
-          })}
-        </div>
+        groups.map((group) => (
+          <section key={group.key} className="following-group" aria-label={t(...group.label)}>
+            <header className="following-group-heading">
+              <h3>{t(...group.label)}</h3>
+              <span>{t(`${group.items.length} 部`, `${group.items.length} title${group.items.length === 1 ? '' : 's'}`)}</span>
+            </header>
+            <div className="following-list">
+              {group.items.map(renderFollowingRow)}
+            </div>
+          </section>
+        ))
       )}
       {dialogItem && (
         <MappingDialog

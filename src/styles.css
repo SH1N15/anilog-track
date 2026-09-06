@@ -153,6 +153,20 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
 .task-summary small { color: #939a96; font-size: 9px; }
 .task-tabs { flex: 0 0 auto; }
 .task-list, .following-list { display: grid; gap: 8px; }
+/* Bangumi 状态分组小节标题（轻量样式，不折叠） */
+.following-group-heading { min-width: 0; display: flex; align-items: baseline; justify-content: space-between; gap: 16px; margin: 18px 0 13px; padding-bottom: 8px; border-bottom: 1px solid var(--line); }
+.following-group-heading h3 { margin: 0; color: var(--ink); font-size: 16px; line-height: 1.3; }
+.following-group-heading span { flex: 0 0 auto; color: var(--muted); font-size: 10px; }
+.following-group + .following-group { margin-top: 22px; }
+/* 完结评分横幅（finale-completed 事件） */
+.finale-banner { min-width: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 10px 16px; margin-bottom: 18px; padding: 12px 16px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+.finale-banner .finale-copy { min-width: 0; flex: 1; display: grid; gap: 2px; }
+.finale-banner .finale-copy strong { font-size: 13px; }
+.finale-banner .finale-copy small { color: var(--muted); font-size: 11px; }
+.finale-rating { display: flex; align-items: center; gap: 4px; color: var(--yellow); }
+.finale-rating button { min-width: 27px; padding: 4px 7px; border: 1px solid var(--line); border-radius: 5px; color: var(--ink); background: #fff; cursor: pointer; font-size: 12px; }
+.finale-rating button:hover:not(:disabled) { color: var(--green); border-color: #b7cbbd; }
+.finale-rating button:disabled { opacity: .55; cursor: default; }
 .task-row { min-width: 0; min-height: 70px; display: grid; grid-template-columns: 34px 38px minmax(170px, 1fr) minmax(180px, .7fr) 70px; align-items: center; gap: 12px; padding: 8px 14px; border: 1px solid var(--line); border-radius: 6px; background: #fff; }
 .task-row.completed { opacity: .62; }
 .task-check { display: grid; place-items: center; padding: 0; border: 0; color: #a7afa9; background: none; cursor: pointer; }

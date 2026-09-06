@@ -645,6 +645,19 @@ pub fn collection_status_name(collection_type: u32) -> Option<&'static str> {
     }
 }
 
+/// following 条目 `bangumiStatus` 字符串 → 写回用的 v0 收藏 type 数字
+/// （状态驱动追踪，任务 4）：wish=1 / done=2 / doing=3 / on_hold=4。
+/// 空 / null / 未知值（含 dropped——条目被取消追番后不会留在 following）
+/// 视为 doing=3，维持旧版写回行为（向后兼容 anilist 来源迁移条目）。
+pub fn collection_status_value(status: &str) -> u32 {
+    match status {
+        "wish" => SubjectCollectionType::Wish.as_u32(),
+        "done" => SubjectCollectionType::Done.as_u32(),
+        "on_hold" => SubjectCollectionType::OnHold.as_u32(),
+        _ => SubjectCollectionType::Doing.as_u32(),
+    }
+}
+
 /// 收藏关心字段的规范化 payload 哈希（sha256 十六进制小写；schema §3.2）。
 ///
 /// 规范化规则（本地与远端两侧统一，保证 `H_local == H_remote` 判定可比）：

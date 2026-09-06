@@ -42,6 +42,15 @@ export interface AiringEpisode {
   timeUntilAiring?: number;
 }
 
+// Bangumi 收藏状态（SubjectCollectionType：wish/doing/done/on_hold/dropped）。
+export type BangumiCollectionStatus = 'wish' | 'doing' | 'done' | 'on_hold' | 'dropped';
+
+// finale-completed 事件 payload：最后一话看完时由后端发出（条目已自动转为“看过”）。
+export interface BangumiFinaleCompletedPayload {
+  subjectId: number;
+  displayTitle: string;
+}
+
 export interface FollowedAnime {
   id: number;
   title: AnimeTitle;
@@ -61,7 +70,7 @@ export interface FollowedAnime {
   mapping?: BangumiMapping | null;
   mappingPending?: boolean;
   // Phase 3 收藏/评分/进度同步新增（可选，Bangumi 拉取合并后由 Rust 侧填充）。
-  bangumiStatus?: 'wish' | 'doing' | 'done' | 'on_hold' | 'dropped' | null;
+  bangumiStatus?: BangumiCollectionStatus | null;
   rating?: number | null;
   watchedEpisode?: number | null;
 }
@@ -200,11 +209,13 @@ export interface DesktopApi {
   bangumiSyncNow?(): Promise<BangumiSyncResult>;
   bangumiUpdateSyncSettings?(params: BangumiSyncSettingsPatch): Promise<AppState>;
   bangumiSetRating?(params: { subjectId: number; rating: number | null }): Promise<{ ok: boolean; message: string }>;
+  bangumiSetCollectionStatus?(params: { subjectId: number; status: BangumiCollectionStatus }): Promise<{ ok: boolean; message: string; state: AppState }>;
   openExternal(url: string): Promise<void>;
   onStateChanged(callback: (state: AppState) => void): () => void;
   // stale=true 仅 standard 版 Bangumi 主链会带：网络失败后回落过期缓存兜底（无后台刷新调度）。
   onSeasonUpdated(callback: (update: { season: Season; year: number; anime: Anime[]; fetchedAt: number; stale?: boolean }) => void): () => void;
   onOpenTasks?(callback: () => void): () => void;
+  onFinaleCompleted?(callback: (payload: BangumiFinaleCompletedPayload) => void): () => void;
 }
 
 declare global {

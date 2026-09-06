@@ -148,6 +148,13 @@ fn merge_status(app: &AppHandle, context: &AppContext, status: &Value) -> anyhow
             .flatten()
             .map(|item| value_i64(item.get("id")))
             .collect();
+        // 问题 3 同款守卫（Android 原生 aired 事件建任务）：旧版完成的任务挂
+        // anilistId 键（"21355-5"），bangumi 条目新事件按 subjectId 建任务
+        // （"140001-5"），仅按任务 id 查重查不到 → 同一集重复 pending。建任务
+        // 前按"已完成集合"（与 lib.rs apply_airing_schedules 同判定口径）再
+        // 拦一层：命中即视为该集已有观看历史。
+        #[cfg(feature = "standard")]
+        let completed_history = super::completed_episode_history(&state["tasks"]);
         for event in status
             .get("events")
             .and_then(Value::as_array)
@@ -164,6 +171,50 @@ fn merge_status(app: &AppHandle, context: &AppContext, status: &Value) -> anyhow
                 || !followed_ids.contains(&anime_id)
             {
                 continue;
+            }
+            // 状态驱动追踪（任务 2 门控，Android 侧）：条目 `bangumiStatus`
+            // 非空且非 doing（wish/on_hold/done）→ 收录不追踪，不为新集创建
+            // 观看任务（播出通知不受影响，Java 层照发）。anilist 条目
+            // （bangumiStatus 为 null）与 original 不受影响。
+            #[cfg(feature = "standard")]
+            if state["following"].as_array().into_iter().flatten().any(|item| {
+                value_i64(item.get("id")) == anime_id
+                    && super::bangumi_status_blocks_tracking(&value_string(
+                        item.get("bangumiStatus"),
+                    ))
+            }) {
+                continue;
+            }
+            // 已完成历史查重（standard）：定位事件对应条目（id 或 anilistId
+            // 匹配，与 apply_airing_schedules 同口径），bangumi 条目命中
+            // (subjectId, episode) 或 (anilistId, episode) → 该集已有观看
+            // 历史，跳过创建。anilist 键条目不经过此守卫（其任务 id 查重本
+            // 就覆盖 completed）；与上方 known id 查重并存（两层防护）。
+            #[cfg(feature = "standard")]
+            {
+                let followed = state["following"].as_array().and_then(|items| {
+                    items.iter().find(|item| {
+                        value_i64(item.get("id")) == anime_id
+                            || (value_string(item.get("source")) == "bangumi"
+                                && value_i64(item.get("anilistId")) == anime_id)
+                    })
+                });
+                let bangumi_sourced =
+                    followed.is_some_and(|item| value_string(item.get("source")) == "bangumi");
+                if bangumi_sourced {
+                    let task_anime_id =
+                        followed.map(|item| value_i64(item.get("id"))).unwrap_or(anime_id);
+                    let anilist_id =
+                        followed.map(|item| value_i64(item.get("anilistId"))).unwrap_or(0);
+                    if super::completed_history_blocks_event(
+                        &completed_history,
+                        task_anime_id,
+                        anilist_id,
+                        episode,
+                    ) {
+                        continue;
+                    }
+                }
             }
             let title = state["following"]
                 .as_array()
