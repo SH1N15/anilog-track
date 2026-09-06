@@ -483,6 +483,25 @@ pub fn sync_webdav(app: &AppHandle, context: &AppContext) -> anyhow::Result<Valu
                     let (changed, merged, remote_changed) =
                         merge_document_into_state(&mut state, remote)?;
                     local_changed |= changed;
+                    // 问题 B：Android WebDAV 合并后同样做跨键去重/合并 + 自动
+                    // 映射（standard only；original 不编译该块，行为不变）。
+                    // 合并产生变更时重算上传文档与 remote 变更标记。
+                    #[cfg(feature = "standard")]
+                    let (merged, remote_changed) = {
+                        let mut merged = merged;
+                        let mut remote_changed = remote_changed;
+                        if super::reconcile_following_entries(
+                            &mut state,
+                            &context.offline_bangumi,
+                            context.original,
+                        ) {
+                            local_changed = true;
+                            merged = document_from_state(&mut state);
+                            remote_changed =
+                                comparable_document(remote)? != comparable_document(&merged)?;
+                        }
+                        (merged, remote_changed)
+                    };
                     (merged, remote_changed)
                 } else {
                     (document_from_state(&mut state), true)

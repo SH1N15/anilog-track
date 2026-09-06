@@ -1571,10 +1571,11 @@ impl HttpBangumiClient {
     }
 
     /// 自带 reqwest Client 的构造：UA `AniLog Tauri/<CARGO_PKG_VERSION>`，
-    /// 超时设置与 lib.rs 的 AniList client 保持一致（不设显式整体超时）。
+    /// 整体超时 15s（与 lib.rs 主客户端一致，防止无超时挂起）。
     pub fn with_base(base: BangumiBaseUrls) -> reqwest::Result<Self> {
         let client = reqwest::Client::builder()
             .user_agent(concat!("AniLog Tauri/", env!("CARGO_PKG_VERSION")))
+            .timeout(std::time::Duration::from_secs(15))
             .build()?;
         Ok(Self::new(client, base))
     }

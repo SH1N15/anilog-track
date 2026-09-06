@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Bell,
   BellRing,
@@ -115,6 +115,8 @@ function App() {
   const [seasonView, setSeasonView] = useState<SeasonViewMode>(initialUi.seasonView);
   const [anime, setAnime] = useState<Anime[]>([]);
   const [loading, setLoading] = useState(true);
+  // 问题 1：standard 版 season-updated 事件可能带 stale=true（Bangumi 网络失败后回落过期缓存）。
+  const [seasonStale, setSeasonStale] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState('');
   const [lastSyncMessage, setLastSyncMessage] = useState('');
@@ -170,6 +172,7 @@ function App() {
   const loadSeason = useCallback(async () => {
     const requestId = ++seasonRequest.current;
     setLoading(true);
+    setSeasonStale(false);
     setError('');
     try {
       const nextAnime = await api.fetchSeason({ season, year });
@@ -190,6 +193,7 @@ function App() {
       setAnime(update.anime);
       setError('');
       setLoading(false);
+      setSeasonStale(update.stale === true);
     }
   }), [season, year]);
 
@@ -206,6 +210,18 @@ function App() {
       setSyncing(false);
     }
   };
+
+  // 问题 2/4：回调稳定化 + 跨键追番索引（id / anilistId / bangumiId 任一命中即视为已追）。
+  const toggleFollowAnime = useCallback(async (item: Anime) => setState(await api.toggleFollow(item)), []);
+  const followedKeys = useMemo(() => {
+    const keys = new Set<number>();
+    state.following.forEach((item) => {
+      if (Number.isFinite(item.id)) keys.add(item.id);
+      if (typeof item.anilistId === 'number') keys.add(item.anilistId);
+      if (typeof item.bangumiId === 'number') keys.add(item.bangumiId);
+    });
+    return keys;
+  }, [state.following]);
 
   const pendingCount = state.tasks.filter((task) => task.status === 'pending').length;
   const isAndroid = state.runtime?.platform === 'android';
@@ -272,11 +288,12 @@ function App() {
             <SeasonView
               anime={anime}
               loading={loading}
+              seasonStale={seasonStale}
               error={error}
               season={season}
               year={year}
               seasonView={seasonView}
-              followedIds={new Set(state.following.map((item) => item.id))}
+              followedKeys={followedKeys}
               titleMatches={state.bangumiTitles}
               titlePreference={state.settings.titlePreference}
               language={language}
@@ -284,7 +301,7 @@ function App() {
               onYearChange={setYear}
               onSeasonViewChange={setSeasonView}
               onRetry={loadSeason}
-              onToggleFollow={async (item) => setState(await api.toggleFollow(item))}
+              onToggleFollow={toggleFollowAnime}
             />
           )}
           {view === 'tasks' && <TasksView tasks={state.tasks} language={language} onToggle={async (id) => setState(await api.toggleTask(id))} />}
@@ -348,11 +365,12 @@ function App() {
 function SeasonView({
   anime,
   loading,
+  seasonStale,
   error,
   season,
   year,
   seasonView,
-  followedIds,
+  followedKeys,
   titleMatches,
   titlePreference,
   language,
@@ -364,11 +382,12 @@ function SeasonView({
 }: {
   anime: Anime[];
   loading: boolean;
+  seasonStale: boolean;
   error: string;
   season: Season;
   year: number;
   seasonView: SeasonViewMode;
-  followedIds: Set<number>;
+  followedKeys: Set<number>;
   titleMatches: Record<string, BangumiTitleMatch>;
   titlePreference: AppSettings['titlePreference'];
   language: UiLanguage;
@@ -398,22 +417,31 @@ function SeasonView({
     void api.resolveBangumiTitle(item).catch(() => {});
   }, []);
 
+  // 问题 4：追番判重跨键——同一部番可能以旧 anilist 键或新 subjectId 键存在。
+  const isFollowed = useCallback((item: Anime) => followedKeys.has(item.id)
+    || (typeof item.bangumiSubjectId === 'number' && followedKeys.has(item.bangumiSubjectId))
+    || (typeof item.anilistId === 'number' && followedKeys.has(item.anilistId)), [followedKeys]);
+
   const visible = useMemo(() => {
     const normalized = query.trim().toLowerCase();
     return anime.filter((item) => {
       const matchesQuery = !normalized || [IS_ORIGINAL_EDITION ? undefined : titleMatches[String(item.id)]?.nameCn, item.title.native, item.title.english, item.title.romaji, item.studios?.nodes[0]?.name]
         .some((value) => value?.toLowerCase().includes(normalized));
       const matchesFormat = format === 'ALL' || item.format === format;
-      const matchesFollowing = !onlyFollowing || followedIds.has(item.id);
+      const matchesFollowing = !onlyFollowing || isFollowed(item);
       return matchesQuery && matchesFormat && matchesFollowing;
     });
-  }, [anime, query, format, onlyFollowing, followedIds, titleMatches]);
+  }, [anime, query, format, onlyFollowing, isFollowed, titleMatches]);
 
   const weekdayGroups = useMemo(() => {
     const groups = Array.from({ length: 8 }, () => [] as Anime[]);
     visible.forEach((item) => groups[localAiringWeekday(item)].push(item));
     return groups;
   }, [visible]);
+
+  // 问题 2：稳定回调，配合 memo 化的 AnimeCard 避免滚动时整列表重渲染。
+  const openAnime = useCallback((item: Anime) => setSelected(item), []);
+  const toggleFollowCard = useCallback((item: Anime) => { void onToggleFollow(item); }, [onToggleFollow]);
 
   const weekdayLabels: Array<[string, string]> = [
     ['周一', 'Monday'], ['周二', 'Tuesday'], ['周三', 'Wednesday'], ['周四', 'Thursday'],
@@ -427,10 +455,10 @@ function SeasonView({
       titleMatch={titleMatches[String(item.id)]}
       titlePreference={titlePreference}
       language={language}
-      followed={followedIds.has(item.id)}
+      followed={isFollowed(item)}
       onVisible={requestChineseTitle}
-      onOpen={() => setSelected(item)}
-      onToggle={() => onToggleFollow(item)}
+      onOpen={openAnime}
+      onToggle={toggleFollowCard}
     />
   );
 
@@ -457,7 +485,9 @@ function SeasonView({
         <div>
           <div className="eyebrow"><Sparkles size={14} /> {seasonLabel(season, year, language)}</div>
           <h2>{t('新番更新时间表', 'Seasonal release schedule')}</h2>
-          <p>{loading ? t('正在读取 AniList…', 'Loading AniList…') : t(`${anime.length} 部作品 · 时间按本机时区显示`, `${anime.length} titles · Times shown in your local time zone`)}</p>
+          <p>{loading ? (IS_ORIGINAL_EDITION ? t('正在读取 AniList…', 'Loading AniList…') : t('正在读取新番数据…', 'Loading seasonal data…')) : t(`${anime.length} 部作品 · 时间按本机时区显示`, `${anime.length} titles · Times shown in your local time zone`)}
+            {!loading && seasonStale && <span style={{ display: 'block', fontSize: 12, opacity: 0.75 }}>{t('网络暂时不可用，已显示缓存数据', 'Network unavailable — showing cached data')}</span>}
+          </p>
         </div>
         <div className="filter-row">
           <label className="search-field">
@@ -523,7 +553,7 @@ function SeasonView({
           titleMatch={titleMatches[String(selected.id)]}
           titlePreference={titlePreference}
           language={language}
-          followed={followedIds.has(selected.id)}
+          followed={isFollowed(selected)}
           onClose={() => setSelected(null)}
           onToggle={() => onToggleFollow(selected)}
         />
@@ -539,7 +569,10 @@ function localizedTitle(anime: Anime, match?: BangumiTitleMatch, preference: App
   return match?.status === 'matched' && match.nameCn ? match.nameCn : reminderTitleOf(anime.title);
 }
 
-function AnimeCard({
+// 问题 2：memo 化卡片。父层所有 props 均为稳定引用（回调走 useCallback、数据来自
+// useMemo 的列表/索引），滚动与工具栏输入变化时未受影响的卡片不会重渲染。
+// 问题 3：Bangumi 评分为 0-10（一位小数），不能用 AniList 的百分比样式。
+const AnimeCard = memo(function AnimeCard({
   anime,
   titleMatch,
   titlePreference,
@@ -554,8 +587,8 @@ function AnimeCard({
   titlePreference: AppSettings['titlePreference'];
   language: UiLanguage;
   followed: boolean;
-  onOpen: () => void;
-  onToggle: () => void;
+  onOpen: (anime: Anime) => void;
+  onToggle: (anime: Anime) => void;
   onVisible: (anime: Anime) => void;
 }) {
   const t = (chinese: string, english: string) => tr(language, chinese, english);
@@ -563,6 +596,12 @@ function AnimeCard({
   const cardRef = useRef<HTMLElement>(null);
   const displayTitle = localizedTitle(anime, titleMatch, titlePreference, language);
   const originalTitle = titleOf(anime.title, language);
+  // Bangumi 条目评分 0-10；无 source 的旧数据用 averageScore<=10 且带 subjectId 兜底判断。
+  const bangumiScore = anime.source === 'bangumi'
+    || (!anime.source && typeof anime.bangumiSubjectId === 'number' && (anime.averageScore ?? 0) <= 10);
+  const scoreText = anime.averageScore
+    ? (bangumiScore ? `★ ${anime.averageScore.toFixed(1)}` : `${anime.averageScore}%`)
+    : 'NEW';
 
   useEffect(() => {
     if (IS_ORIGINAL_EDITION || titleMatch || !cardRef.current) return;
@@ -583,26 +622,27 @@ function AnimeCard({
 
   return (
     <article className="anime-card" ref={cardRef}>
-      <button className="poster-button" onClick={onOpen} aria-label={t(`查看 ${displayTitle} 详情`, `View details for ${displayTitle}`)}>
-        <img src={anime.coverImage?.extraLarge || anime.coverImage?.medium} alt="" loading="lazy" />
-        <span className="score">{anime.averageScore ? `${anime.averageScore}%` : 'NEW'}</span>
+      <button className="poster-button" onClick={() => onOpen(anime)} aria-label={t(`查看 ${displayTitle} 详情`, `View details for ${displayTitle}`)}>
+        {/* 问题 2：卡片封面固定用 medium（extraLarge 只给详情弹窗）；宽高比由 .poster-button 的 aspect-ratio 固定。 */}
+        <img src={anime.coverImage?.medium || anime.coverImage?.extraLarge} alt="" loading="lazy" decoding="async" />
+        <span className="score">{scoreText}</span>
       </button>
       <div className="anime-card-body">
         <div className="anime-meta"><span>{formatLabel(anime.format, language)}</span><span>{anime.episodes ? t(`${anime.episodes} 集`, `${anime.episodes} episodes`) : t('集数待定', 'Episodes TBA')}</span></div>
-        <button className="anime-title" onClick={onOpen}>{displayTitle}</button>
+        <button className="anime-title" onClick={() => onOpen(anime)}>{displayTitle}</button>
         <p className="anime-subtitle">{originalTitle !== displayTitle ? originalTitle : secondaryTitle(anime.title, language) || anime.studios?.nodes[0]?.name || t('制作信息待定', 'Studio TBA')}</p>
         <div className="airing-line">
           <Clock3 size={15} />
           <span>{next ? t(`第 ${next.episode} 集 · ${formatAiring(next.airingAt, true, language)}`, `Episode ${next.episode} · ${formatAiring(next.airingAt, true, language)}`) : anime.status === 'FINISHED' ? t('本季已完结', 'Finished') : t('更新时间待定', 'Schedule TBA')}</span>
         </div>
-        <button className={`follow-button ${followed ? 'followed' : ''}`} onClick={onToggle}>
+        <button className={`follow-button ${followed ? 'followed' : ''}`} onClick={() => onToggle(anime)}>
           {followed ? <Check size={17} /> : <Bell size={17} />}
           {followed ? t('已加入追番', 'Following') : t('加入追番', 'Follow')}
         </button>
       </div>
     </article>
   );
-}
+});
 
 function AnimeDetail({ anime, titleMatch, titlePreference, language, followed, onClose, onToggle }: { anime: Anime; titleMatch?: BangumiTitleMatch; titlePreference: AppSettings['titlePreference']; language: UiLanguage; followed: boolean; onClose: () => void; onToggle: () => void }) {
   const t = (chinese: string, english: string) => tr(language, chinese, english);
@@ -1106,6 +1146,8 @@ function SettingsView({ state, language, onChange, onApplyState }: { state: AppS
   const [syncReport, setSyncReport] = useState<BangumiSyncReport | null>(null);
   const [showSuggestions, setShowSuggestions] = useState(false);
   const bangumiSyncSettings = state.bangumiSyncSettings;
+  // 问题 5：standard 版状态行追加「Bangumi 上次同步」（秒级时间戳，过去向语义用 relativePastTime）。
+  const lastBangumiSyncAt = state.bangumiSyncStatus?.lastBangumiSyncAt ?? null;
 
   useEffect(() => setProxyUrl(state.settings.bangumiApiBaseUrl), [state.settings.bangumiApiBaseUrl]);
   useEffect(() => setBangumiApiUrl(state.bangumiSyncSettings?.apiBaseUrl || state.settings.bangumiApiBaseUrl), [state.bangumiSyncSettings?.apiBaseUrl, state.settings.bangumiApiBaseUrl]);
@@ -1347,7 +1389,7 @@ function SettingsView({ state, language, onChange, onApplyState }: { state: AppS
             onChange={(event) => onChange({ dailyTaskReminderTime: event.target.value })}
           />
         </SettingRow>
-        <SettingRow title={t('同步间隔', 'Sync interval')} description={t('AniList 数据的后台检查频率', 'How often AniList is checked in the background')}>
+        <SettingRow title={t('同步间隔', 'Sync interval')} description={IS_ORIGINAL_EDITION ? t('AniList 数据的后台检查频率', 'How often AniList is checked in the background') : t('播出数据与坚果云的后台检查频率', 'How often airing data and WebDAV sync run in the background')}>
           {isAndroid ? <span className="fixed-setting-value">{t('约每 6 小时', 'About every 6 hours')}</span> : <label className="number-select"><select value={state.settings.pollIntervalMinutes} onChange={(event) => onChange({ pollIntervalMinutes: Number(event.target.value) })}><option value={1}>{t('每 1 分钟', 'Every minute')}</option><option value={5}>{t('每 5 分钟', 'Every 5 minutes')}</option><option value={10}>{t('每 10 分钟', 'Every 10 minutes')}</option><option value={15}>{t('每 15 分钟', 'Every 15 minutes')}</option></select></label>}
         </SettingRow>
         {isAndroid && <SettingRow title={t('准时通知', 'On-time notifications')} description={state.runtime?.exactSchedulingGranted ? t('已允许按播出时间准时发送通知', 'Notifications can be sent at the scheduled airing time') : t('未授权时，系统可能延迟发送通知', 'Without permission, the system may delay notifications')}>
@@ -1562,7 +1604,21 @@ function SettingsView({ state, language, onChange, onApplyState }: { state: AppS
       </section>}
       <section className="settings-section source-note">
         <SlidersHorizontal size={20} />
-        <div><h2>{t('数据与隐私', 'Data and privacy')}</h2><p>{IS_ORIGINAL_EDITION ? t('番剧、标题与播出日程均来自 AniList，不连接 Bangumi 或第三方 Bangumi 反代。默认仅保存在本机；启用 WebDAV 后，只向你配置的服务器同步追番和观看任务。', 'Anime, titles, and schedules come from AniList. This edition never connects to Bangumi or a third-party Bangumi proxy. Data stays on this device by default; WebDAV only syncs following and watch tasks to your configured server.') : '番剧与播出日程来自 AniList，中文标题来自 Bangumi。默认仅保存在本机；启用 WebDAV 后，只向你配置的服务器同步追番和观看任务。'}</p><small>{t('AniList 上次同步：', 'Last AniList sync: ')}{state.lastSyncAt ? formatAiring(state.lastSyncAt, true, language) : t('尚未同步', 'Never')}</small></div>
+        <div>
+          <h2>{t('数据与隐私', 'Data and privacy')}</h2>
+          <p>{IS_ORIGINAL_EDITION ? t('番剧、标题与播出日程均来自 AniList，不连接 Bangumi 或第三方 Bangumi 反代。默认仅保存在本机；启用 WebDAV 后，只向你配置的服务器同步追番和观看任务。', 'Anime, titles, and schedules come from AniList. This edition never connects to Bangumi or a third-party Bangumi proxy. Data stays on this device by default; WebDAV only syncs following and watch tasks to your configured server.') : t(
+            '番剧与播出日程来自 Bangumi（迁移期部分补充数据来自 AniList）；中文标题来自 Bangumi。追番与任务默认仅保存在本机；启用 WebDAV 后，只向你配置的服务器同步追番和观看任务。Bangumi 账户数据仅存于本机与你的 Bangumi 账户，Token 保存在系统安全存储。',
+            'Anime and airing schedules come from Bangumi (some supplemental data still comes from AniList during migration); Chinese titles come from Bangumi. Following and tasks stay on this device by default; when WebDAV is enabled, only your following list and watch tasks are synced to the server you configured. Bangumi account data stays on this device and in your Bangumi account, with the token kept in secure system storage.',
+          )}</p>
+          <small>
+            {IS_ORIGINAL_EDITION
+              ? <>{t('AniList 上次同步：', 'Last AniList sync: ')}{state.lastSyncAt ? formatAiring(state.lastSyncAt, true, language) : t('尚未同步', 'Never')}</>
+              : <>
+                {t('播出数据上次同步：', 'Last airing-data sync: ')}{state.lastSyncAt ? formatAiring(state.lastSyncAt, true, language) : t('尚未同步', 'Never')}
+                {lastBangumiSyncAt != null && lastBangumiSyncAt > 0 && <> · {t('Bangumi 上次同步：', 'Last Bangumi sync: ')}{relativePastTime(lastBangumiSyncAt, language)}</>}
+              </>}
+          </small>
+        </div>
       </section>
     </div>
   );

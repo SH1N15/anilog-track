@@ -202,7 +202,8 @@ export interface DesktopApi {
   bangumiSetRating?(params: { subjectId: number; rating: number | null }): Promise<{ ok: boolean; message: string }>;
   openExternal(url: string): Promise<void>;
   onStateChanged(callback: (state: AppState) => void): () => void;
-  onSeasonUpdated(callback: (update: { season: Season; year: number; anime: Anime[]; fetchedAt: number }) => void): () => void;
+  // stale=true 仅 standard 版 Bangumi 主链会带：网络失败后回落过期缓存兜底（无后台刷新调度）。
+  onSeasonUpdated(callback: (update: { season: Season; year: number; anime: Anime[]; fetchedAt: number; stale?: boolean }) => void): () => void;
   onOpenTasks?(callback: () => void): () => void;
 }
 
