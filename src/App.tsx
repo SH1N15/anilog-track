@@ -555,9 +555,17 @@ function SeasonView({
   }, []);
 
   // 问题 4：追番判重跨键——同一部番可能以旧 anilist 键或新 subjectId 键存在。
-  const isFollowed = useCallback((item: Anime) => followedKeys.has(item.id)
-    || (typeof item.bangumiSubjectId === 'number' && followedKeys.has(item.bangumiSubjectId))
-    || (typeof item.anilistId === 'number' && followedKeys.has(item.anilistId)), [followedKeys]);
+  // 验收第 5 轮修正：bangumi 来源卡片（bangumiSubjectId 或 source==='bangumi'，
+  // anime.id 即 subjectId）只按 subject 精确匹配——anilistId 可能被共享同一
+  // AniList 条目的其他季撞车（如丧失篇/夺还篇共用 189046），不能作为判定依据。
+  const isFollowed = useCallback((item: Anime) => {
+    if (item.source === 'bangumi' || typeof item.bangumiSubjectId === 'number') {
+      const subjectId = typeof item.bangumiSubjectId === 'number' ? item.bangumiSubjectId : item.id;
+      return followedKeys.has(subjectId) || followedKeys.has(item.id);
+    }
+    return followedKeys.has(item.id)
+      || (typeof item.anilistId === 'number' && followedKeys.has(item.anilistId));
+  }, [followedKeys]);
 
   const visible = useMemo(() => {
     const normalized = query.trim().toLowerCase();

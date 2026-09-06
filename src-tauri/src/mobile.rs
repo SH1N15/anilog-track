@@ -109,10 +109,23 @@ fn merge_status(app: &AppHandle, context: &AppContext, status: &Value) -> anyhow
     }
     let mut state = context.state.lock().map_err(|_| anyhow!("状态锁不可用"))?;
     let before = serde_json::to_string(&*state)?;
+    // 权威数据修复（共享 anilistId 去重，Android 侧与 lib.rs 同口径）：同一
+    // anilistId 被多个 following 条目认领（分季课程共占一个 AniList 条目）时，
+    // 只有主条目（anilistIndex 指向者优先，否则 followedAt 最早者）接受
+    // nextAiringEpisode 写回与新集任务；非主条目跳过，避免同集任务在两个
+    // 条目下重复生成。
+    #[cfg(feature = "standard")]
+    let secondary_claimants =
+        super::secondary_anilist_claimant_ids(&state, &context.offline_bangumi);
+    #[cfg(not(feature = "standard"))]
+    let secondary_claimants: HashSet<i64> = HashSet::new();
 
     if let Some(schedules) = status.get("following").and_then(Value::as_array) {
         for schedule in schedules {
             let anime_id = value_i64(schedule.get("id"));
+            if secondary_claimants.contains(&anime_id) {
+                continue;
+            }
             if let Some(followed) = state["following"].as_array_mut().and_then(|items| {
                 items
                     .iter_mut()
@@ -169,6 +182,7 @@ fn merge_status(app: &AppHandle, context: &AppContext, status: &Value) -> anyhow
                 || episode <= 0
                 || known.contains(&id)
                 || !followed_ids.contains(&anime_id)
+                || secondary_claimants.contains(&anime_id)
             {
                 continue;
             }
