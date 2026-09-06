@@ -279,13 +279,18 @@ fn merge_status(app: &AppHandle, context: &AppContext, status: &Value) -> anyhow
         }
     }
 
-    // 权威数据修复（Android 最小对齐，缺口 2）：Java 数据（含其提供的
+    // 权威数据修复（Android 专属最小对齐，缺口 2；mobile.rs 仅
+    // target_os="android" 编译，cfg 双重显式门控）：Java 数据（含其提供的
     // nextEpisode/nextAiringAt）合并完、事件任务建完后，用本地 next 值做无
     // 网络任务纠偏——pending episode >= next.episode 即未播假票，无论
     // airingAt 过去/未来都删除，与 lib.rs reconcile_following_entries 同口径
-    // （completed 观看历史一律保留）。完整 schedule 纠偏（逐集 airingAt
-    // 改写 + next 权威重写）留 Java Worker 后续接入。
-    #[cfg(feature = "standard")]
+    // （completed 观看历史一律保留）。第 6 轮误删事故后桌面已撤销该清理
+    // （桌面条目 next 可能被离线锚点污染，曾误删真实已播任务；桌面改由
+    // anilist_authority_refresh 的权威 schedule 承担纠偏 + 回填）；Android
+    // 侧 next 由 Java Worker 从 AniList 拉取、与 Rust 条目同源，无离线锚点
+    // 污染路径，保留。完整 schedule 纠偏（逐集 airingAt 改写 + next 权威
+    // 重写）留 Java Worker 后续接入。
+    #[cfg(all(feature = "standard", target_os = "android"))]
     super::reconcile_unaired_anilist_next_tasks(&mut state);
 
     let synced_at = value_i64(status.get("syncedAt"));
