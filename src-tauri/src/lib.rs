@@ -1571,6 +1571,65 @@ fn reconcile_anilist_authority_tasks(state: &mut Value, map: &Value) -> bool {
     before != tasks.len()
 }
 
+/// 第 8 轮问题 3（存量洪水清理，幂等，standard only）：有 AniList 身份条目
+/// 名下 pending 且 `airingAt < followedAt`（followedAt>0 才判）→ 删除。
+/// 背景：权威回填曾无门槛，把用户追番前已播/看完的历史整季灌成 pending
+/// （黄泉 1..16、夺还篇 1..8 等 pending 60 条）；这些集用户早已看过，本地
+/// 只是无任务记录。airingAt 与 followedAt 同为权威 AniList 时间轴（秒），
+/// 比较可信的前提是条目有 AniList 身份：anilist 条目 id 即 AniList id；
+/// bangumi 条目须 anilistId>0——纯 Bangumi 条目的 airingAt 可能是离线推算，
+/// 不判。completed 观看历史一律保留。挂载于
+/// [`reconcile_following_entries`]（每次合并后运行：云端旧文档的洪水记录
+/// merge 回来后当次即被清掉，幂等；上传文档自愈）。任务归属口径与
+/// [`reconcile_anilist_authority_tasks`] 一致：animeId 直接命中条目 id，
+/// 否则回退 bangumi 条目 anilistId（旧键）。
+#[cfg(feature = "standard")]
+fn purge_pre_follow_pending_tasks(state: &mut Value) -> bool {
+    let following = state["following"].as_array().cloned().unwrap_or_default();
+    // animeId → followedAt（条目 id 与旧键 anilistId 双键收录；两者撞键时
+    // 同属一个 AniList 作品，followedAt 取后见者，语义相近无害）。
+    let mut followed_at_by_anime_id: HashMap<i64, i64> = HashMap::new();
+    for entry in &following {
+        let id = value_i64(entry.get("id"));
+        let followed_at = value_i64(entry.get("followedAt"));
+        if id <= 0 || followed_at <= 0 {
+            continue;
+        }
+        let source = value_string(entry.get("source"));
+        let anilist_id = value_i64(entry.get("anilistId"));
+        if source == "bangumi" && anilist_id <= 0 {
+            continue; // 无 AniList 身份 → airingAt 来源不权威，不判。
+        }
+        followed_at_by_anime_id.insert(id, followed_at);
+        if anilist_id > 0 {
+            followed_at_by_anime_id.insert(anilist_id, followed_at);
+        }
+    }
+    if followed_at_by_anime_id.is_empty() {
+        return false;
+    }
+    let Some(tasks) = state
+        .get_mut("tasks")
+        .and_then(|tasks| tasks.as_array_mut())
+    else {
+        return false;
+    };
+    let before = tasks.len();
+    tasks.retain(|task| {
+        if value_string(task.get("status")) != "pending" {
+            return true; // completed 观看历史永不删除。
+        }
+        let Some(&followed_at) = followed_at_by_anime_id.get(&value_i64(task.get("animeId")))
+        else {
+            return true;
+        };
+        let airing_at = value_i64(task.get("airingAt"));
+        // 追番前已播的历史集不是待办；无 airingAt（未知）不误删。
+        !(airing_at > 0 && airing_at < followed_at)
+    });
+    before != tasks.len()
+}
+
 /// 验收第 4 轮问题 1（存量清理，幂等）：删除 pending 且 airingAt > now 的
 /// 任务——从未播出的集不应该是待看任务（此前离线锚点与 AniList 冲突时
 /// 曾为未来集建过任务）。删除后该集播出时 sync 会按调度重建；已完成任务
@@ -1693,6 +1752,9 @@ fn reconcile_following_entries(state: &mut Value, map: &Value, original: bool) -
     // 权威数据修复：eps 越界 pending 与共享 anilistId 非主条目 pending 清理
     // （completed 历史一律保留），幂等。
     reconcile_anilist_authority_tasks(state, map);
+    // 第 8 轮问题 3：追番前已播历史 pending 洪水清理（幂等，云端合并进来
+    // 的存量假票当次清掉，上传文档自愈）。
+    purge_pre_follow_pending_tasks(state);
     let after = (
         state.get("following").cloned().unwrap_or(Value::Null),
         state.get("tasks").cloned().unwrap_or(Value::Null),
@@ -1824,6 +1886,17 @@ fn document_from_state(state: &mut Value) -> Value {
         value_i64(item.get("id")) > 0 && item.get("title").is_some_and(Value::is_object)
     });
     following.sort_by_key(|item| value_i64(item.get("id")));
+    // 第 8 轮问题 1（治本）：nextAiringEpisode 转设备本地数据，不再进坚果云
+    // 文档。导出时剥键 → 本端上传文档干净；读取侧 normalize_document 走同一
+    // 函数 → 云端文档携带的旧污染 next（黄泉 ep24@9/13 等）在参与合并前就
+    // 被剥离，webdav LWW 平局不再翻盘、本端权威重写后也不会被云端旧值复活。
+    // 各设备 next 由本端调度管道/权威 refresh（桌面）/Java Worker（Android）
+    // 自行维护；SYNC_VERSION 保持 1（v0.6 上传的带 next 文档读取侧忽略）。
+    for item in &mut following {
+        if let Some(object) = item.as_object_mut() {
+            object.remove("nextAiringEpisode");
+        }
+    }
     let mut tasks = state["tasks"].as_array().cloned().unwrap_or_default();
     tasks.retain(|task| {
         !value_string(task.get("id")).is_empty()
@@ -1869,6 +1942,24 @@ fn merge_document_into_state(
     state: &mut Value,
     remote: &Value,
 ) -> anyhow::Result<(bool, Value, bool)> {
+    // 第 8 轮问题 1：合并前快照本地 nextAiringEpisode（设备本地数据）。
+    // document_from_state 导出已剥键，故 local/remote 两份合并底稿都不含该
+    // 键——incoming next 全程不参与合并（实现方式选"合并后从本地 pre-merge
+    // 快照恢复"，因为剥键后合并产物天然无 next，必须恢复本地值）；合并落盘
+    // 后按条目 id 原样还原（含显式 null；远端复活记录无本地 next → 保持无
+    // 键，由本端调度/权威路径重建）。
+    let local_next: HashMap<i64, Option<Value>> = state["following"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|item| {
+            (
+                value_i64(item.get("id")),
+                item.get("nextAiringEpisode").cloned(),
+            )
+        })
+        .collect();
     let before = comparable_document(&document_from_state(state))?;
     let local = document_from_state(state);
     let remote = normalize_document(remote)?;
@@ -1963,6 +2054,15 @@ fn merge_document_into_state(
             .then_with(|| value_string(left.get("id")).cmp(&value_string(right.get("id"))))
     });
     state["following"] = json!(following);
+    // 第 8 轮问题 1：恢复设备本地 next（快照原样还原，云端污染值进不来）。
+    if let Some(items) = state["following"].as_array_mut() {
+        for item in items.iter_mut() {
+            let id = value_i64(item.get("id"));
+            if let Some(Some(next)) = local_next.get(&id) {
+                item["nextAiringEpisode"] = next.clone();
+            }
+        }
+    }
     state["tasks"] = json!(tasks);
     state["syncMetadata"]["followingDeletedAt"] = json!(deleted);
     let merged = document_from_state(state);
@@ -3967,6 +4067,10 @@ async fn fetch_anilist_authority_media(
 ///    删除之后执行且跳过 >= next 的集（含 next 本集，其时间仅存在于纠偏
 ///    映射的 next 补充项），绝不复活假票。回填任务的 id 经
 ///    ensure_sync_metadata 自然进入 seenAiringEvents，无需额外处理。
+///    第 8 轮问题 3 回填门槛：E 的 airingAt < followedAt（followedAt>0 才
+///    判）→ 跳过（追番前的历史不是待办，曾把存量灌成约 60 条 pending 洪
+///    流）；条目 watchedEpisode 已知（>0）且 E <= watchedEpisode → 跳过
+///    （已看过的集不回填）。
 /// 任一变更返回 true。本窗口刚建的已播任务 episode < next.episode 不受影响。
 #[cfg(all(feature = "standard", not(target_os = "android")))]
 fn apply_anilist_authority_media(
@@ -4003,6 +4107,10 @@ fn apply_anilist_authority_media(
         let entry_bangumi_status = value_string(entry.get("bangumiStatus"));
         let entry_title = value_string(entry.get("displayTitle"));
         let entry_cover = value_string(entry.get("coverImage"));
+        // 第 8 轮问题 3 回填门槛：追番时间与已看进度（followedAt 秒；
+        // watchedEpisode null → 0 视为未知）。
+        let entry_followed_at = value_i64(entry.get("followedAt"));
+        let entry_watched_episode = value_i64(entry.get("watchedEpisode"));
         // 1) next 全量重写（无条件替换治愈污染；完结 → null）。
         let raw_next = media
             .get("nextAiringEpisode")
@@ -4111,6 +4219,11 @@ fn apply_anilist_authority_media(
         //    （animeId==anilistId）记录时不动（旧键由 canonicalize_cross_key_tasks
         //    归一）。回填只处理映射内已播集（perPage 50），不处理未来集、
         //    不触碰既有 completed。
+        //    第 8 轮问题 3 回填门槛（回填洪流治理）：a) airingAt < followedAt
+        //    （followedAt>0 才判）→ 追番前已播的历史不是待办（用户早已看过，
+        //    本地只是无任务记录，曾把黄泉 1..16 等约 60 条存量灌成 pending）；
+        //    b) 条目 watchedEpisode 已知（>0）且 episode <= watchedEpisode →
+        //    已看过的集不回填。
         if create_tasks && !bangumi_status_blocks_tracking(&entry_bangumi_status) {
             let mut known_episodes: HashSet<i64> = tasks
                 .iter()
@@ -4135,6 +4248,8 @@ fn apply_anilist_authority_media(
             for (episode, airing_at) in aired_airing {
                 if (next_episode > 0 && episode >= next_episode)
                     || known_episodes.contains(&episode)
+                    || (entry_followed_at > 0 && airing_at < entry_followed_at)
+                    || (entry_watched_episode > 0 && episode <= entry_watched_episode)
                 {
                     continue;
                 }
@@ -4168,11 +4283,11 @@ fn apply_anilist_authority_media(
 }
 
 /// 权威数据修复本轮入口（desktop sync_now_inner 接线）：先**不持锁**全量抓取
-/// （std MutexGuard 绝不能跨 await——Tauri 命令 future 必须 Send），再持锁应用
-/// （持锁段内无 await）。失败（网络/解析/锁）静默 false。签名按规格标注的
-/// (state, map, endpoint, http, ids)——state 为共享状态锁本体，await 只发生在
-/// 抓取段。Android 无此路径（最小对齐走 reconcile_unaired_anilist_next_tasks，
-/// 完整 schedule 纠偏留 Java Worker 后续）。
+/// （std MutexGuard 绝不能跨 await——Tauri 命令 future 必须 Send），抓取成功即
+/// 落缓存（第 8 轮问题 1 止血：供 perform_webdav_sync 云端合并后免网络套用），
+/// 再持锁应用（持锁段内无 await）。失败（网络/解析/锁）静默 false。state 为
+/// 共享状态锁本体，await 只发生在抓取段。Android 无此路径（最小对齐走
+/// reconcile_unaired_anilist_next_tasks，完整 schedule 纠偏留 Java Worker 后续）。
 #[cfg(all(feature = "standard", not(target_os = "android")))]
 async fn anilist_authority_refresh(
     state: &Mutex<Value>,
@@ -4180,15 +4295,80 @@ async fn anilist_authority_refresh(
     endpoint: &str,
     client: &reqwest::Client,
     ids: &[i64],
+    cache_dir: &Path,
     now: i64,
 ) -> bool {
     let Some(media_by_id) = fetch_anilist_authority_media(client, endpoint, ids).await else {
         return false;
     };
+    // 缓存 best-effort：写失败只影响本轮 webdav 合并后的免网络纠偏，
+    // 下一轮 sync_now 成功抓取会重写。
+    write_anilist_authority_cache(cache_dir, &media_by_id);
     let Ok(mut state) = state.lock() else {
         return false;
     };
     apply_anilist_authority_media(&mut state, map, &media_by_id, now)
+}
+
+/// 第 8 轮问题 1：AniList 权威 media 缓存文件（bangumi-cache/ 下，纳入
+/// clear_cache 清理范围）。形状 {fetchedAt: 毫秒, media: [原始 JSON]}。
+#[cfg(all(feature = "standard", not(target_os = "android")))]
+const ANILIST_AUTHORITY_CACHE_FILE: &str = "anilist-authority.json";
+/// 第 8 轮问题 1：权威 media 缓存 TTL（30 分钟）。
+#[cfg(all(feature = "standard", not(target_os = "android")))]
+const ANILIST_AUTHORITY_CACHE_TTL_SECS: i64 = 1_800;
+
+/// 第 8 轮问题 1：抓取成功的权威 media 序列化落盘（毫秒时间戳 + 原始 JSON
+/// 数组，与 AniList 响应同形，重放无需任何转换）。
+#[cfg(all(feature = "standard", not(target_os = "android")))]
+fn write_anilist_authority_cache(cache_dir: &Path, media_by_id: &HashMap<i64, Value>) {
+    let cache = json!({
+        "fetchedAt": now_millis(),
+        "media": media_by_id.values().collect::<Vec<&Value>>(),
+    });
+    let payload = serde_json::to_string(&cache).unwrap_or_default();
+    if payload.is_empty() {
+        return;
+    }
+    let _ = fs::write(cache_dir.join(ANILIST_AUTHORITY_CACHE_FILE), payload);
+}
+
+/// 第 8 轮问题 1 止血（桌面）：读取 fresh 缓存（TTL [`ANILIST_AUTHORITY_CACHE_TTL_SECS`]
+/// 内）并复用 [`apply_anilist_authority_media`] 同一应用逻辑（不重新抓取、
+/// 不触网）。无缓存/过期/解析失败/媒体空 → false 不阻塞（webdav 合并照旧
+/// 上传，权威纠正等下一轮 sync_now 重新抓取）。now 为秒，缓存 fetchedAt 为
+/// 毫秒。
+#[cfg(all(feature = "standard", not(target_os = "android")))]
+fn apply_cached_anilist_authority(
+    state: &mut Value,
+    map: &Value,
+    cache_dir: &Path,
+    now: i64,
+) -> bool {
+    let Ok(raw) = fs::read_to_string(cache_dir.join(ANILIST_AUTHORITY_CACHE_FILE)) else {
+        return false;
+    };
+    let Ok(cache) = serde_json::from_str::<Value>(&raw) else {
+        return false;
+    };
+    let fetched_at = value_i64(cache.get("fetchedAt"));
+    let fresh_floor = (now - ANILIST_AUTHORITY_CACHE_TTL_SECS) * 1_000;
+    if fetched_at <= 0 || fetched_at < fresh_floor {
+        return false;
+    }
+    let media_by_id: HashMap<i64, Value> = cache["media"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|media| {
+            let id = value_i64(media.get("id"));
+            (id > 0).then_some((id, media.clone()))
+        })
+        .collect();
+    if media_by_id.is_empty() {
+        return false;
+    }
+    apply_anilist_authority_media(state, map, &media_by_id, now)
 }
 
 #[cfg(not(target_os = "android"))]
@@ -4300,6 +4480,7 @@ async fn sync_now_inner(app: &AppHandle, context: &AppContext) -> Result<Value, 
         ANILIST_API,
         &context.client,
         &ids,
+        &bangumi_cache_dir(context),
         now,
     )
     .await;
@@ -6536,13 +6717,15 @@ fn maybe_spawn_foreground_sync(app: &AppHandle, context: &AppContext) {
 // 此前 run_full_bangumi_sync 只有手动命令（bangumi_sync_now）与 Android 前台
 // 15 分钟过期补偿，追番/完成任务/评分的写回（push_local_changes）只能等用户
 // 手动点"立即同步 Bangumi"。新增两条触发路径：
-// - 周期：每 60 分钟调用 run_full_bangumi_sync（内部开关自会 skip：同步未
-//   启用/无 Token 时只做坚果云与播出数据按需刷新，与现有后台兼容）；
+// - 周期：每 max(pollIntervalMinutes, 15) 分钟调用一次 run_full_bangumi_sync
+//   （内部开关自会 skip：同步未启用/无 Token 时只做坚果云与播出数据按需刷新，
+//   与现有后台兼容）。设置页"同步间隔"现有选择 1/5/10/15 分钟，直接透传会
+//   对 Bangumi API 形成高频轮询，统一抬到下限 15 分钟保护；
 // - 动作唤醒：toggle_follow（新增/取消）、toggle_task（bangumi 任务完成）、
 //   bangumi_set_rating 触发 [`BANGUMI_SYNC_WAKEUP`]，进入 30 秒静默期（静默
 //   期内再次唤醒则重新计时，合并密集动作，同 start_webdav_background 的
 //   5 秒静默合并写法）后执行一轮。
-// Android 约束：循环只在进程存活期间运行、随进程死亡——60 分钟周期 + 动作
+// Android 约束：循环只在进程存活期间运行、随进程死亡——≥15 分钟周期 + 动作
 // 唤醒，不要求常驻后台，也不是高频轮询。
 // 执行前检查 Token 存在（load Ok(Some)），否则跳过本轮（坚果云/播出刷新由
 // 各自的后台循环负责，不在此重复触发）。single-flight 门防本循环重入；手动
@@ -6554,19 +6737,30 @@ fn maybe_spawn_foreground_sync(app: &AppHandle, context: &AppContext) {
 mod bangumi_sync_loop {
     use std::time::Duration;
 
-    /// 周期全量同步间隔：60 分钟。
-    pub const INTERVAL_SECS: u64 = 3_600;
+    /// 周期下限（分钟）：设置页"同步间隔"选择 1/5/10/15，下限 15 保护
+    /// Bangumi API（旧固定值为 60 分钟，第 8 轮问题 3 改为跟随设置）。
+    pub const MIN_INTERVAL_MINUTES: i64 = 15;
+    /// 周期上限（分钟）：与桌面主同步循环的 1..=1440 钳制同口径。
+    pub const MAX_INTERVAL_MINUTES: i64 = 1_440;
     /// 动作唤醒后的静默期：30 秒内后续唤醒合并为一次执行。
     pub const QUIET_SECS: u64 = 30;
 
+    /// 周期内核（纯函数）：settings.pollIntervalMinutes → 周期秒数 =
+    /// max(值, 15) 分钟（另设 1440 分钟上限）。缺失/无法读取设置（<=0，
+    /// 与 value_i64 缺省一致）→ 15 分钟兜底。
+    pub fn interval_secs(poll_interval_minutes: i64) -> u64 {
+        (poll_interval_minutes.clamp(MIN_INTERVAL_MINUTES, MAX_INTERVAL_MINUTES) as u64) * 60
+    }
+
     /// 循环内核（纯函数，静默期/节流可测）：下一次等待时长。
     /// - 处于静默期（刚收到动作唤醒）→ 等 [`QUIET_SECS`]；
-    /// - 否则等周期 [`INTERVAL_SECS`]（动作唤醒可提前打断）。
-    pub fn wait_duration(quiet_pending: bool) -> Duration {
+    /// - 否则等周期 interval_secs（由 [`interval_secs`] 按
+    ///   settings.pollIntervalMinutes 现值计算，动作唤醒可提前打断）。
+    pub fn wait_duration(quiet_pending: bool, interval_secs: u64) -> Duration {
         Duration::from_secs(if quiet_pending {
             QUIET_SECS
         } else {
-            INTERVAL_SECS
+            interval_secs
         })
     }
 
@@ -6591,8 +6785,22 @@ fn start_bangumi_sync_loop(app: AppHandle, context: AppContext) {
     tauri::async_runtime::spawn(async move {
         let mut quiet_pending = false;
         loop {
+            // 第 8 轮问题 3：周期每次迭代运行时读取设置（INTERVAL_SECS 常量
+            // 改为 interval_secs 函数）——设置页调整"同步间隔"后下一轮生效，
+            // 无需重启；读取失败（锁不可用）按缺失 0 处理 → 15 分钟兜底。
+            let poll_interval_minutes = {
+                let state = context.state.lock().ok();
+                state
+                    .as_ref()
+                    .and_then(|state| state["settings"].get("pollIntervalMinutes"))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0)
+            };
             let wait_elapsed = tokio::time::timeout(
-                bangumi_sync_loop::wait_duration(quiet_pending),
+                bangumi_sync_loop::wait_duration(
+                    quiet_pending,
+                    bangumi_sync_loop::interval_secs(poll_interval_minutes),
+                ),
                 BANGUMI_SYNC_WAKEUP.notified(),
             )
             .await
@@ -6603,7 +6811,7 @@ fn start_bangumi_sync_loop(app: AppHandle, context: AppContext) {
                 quiet_pending = true;
                 continue;
             }
-            // 静默期无新唤醒后到期，或 60 分钟周期到期 → 执行一轮。
+            // 静默期无新唤醒后到期，或周期到期 → 执行一轮。
             quiet_pending = false;
             let has_token = context
                 .bangumi_tokens
@@ -7645,6 +7853,22 @@ async fn perform_webdav_sync(app: &AppHandle, context: &AppContext) -> anyhow::R
                         remote_changed =
                             comparable_document(remote)? != comparable_document(&merged)?;
                     }
+                    // 第 8 轮问题 1（桌面止血）：云端合并 + reconcile 之后、构建
+                    // 上传文档之前，套用缓存的 AniList 权威数据（TTL 30 分钟内
+                    // 不触网）——云端复活的小时级假票当次上传前再死一次，上传
+                    // 文档自愈；无/过期缓存 → false 跳过（权威纠正由 sync_now
+                    // 重新抓取承担）。
+                    if apply_cached_anilist_authority(
+                        &mut state,
+                        &context.offline_bangumi,
+                        &bangumi_cache_dir(context),
+                        now_seconds(),
+                    ) {
+                        local_changed = true;
+                        merged = document_from_state(&mut state);
+                        remote_changed =
+                            comparable_document(remote)? != comparable_document(&merged)?;
+                    }
                     (merged, remote_changed)
                 };
                 (merged, remote_changed)
@@ -7823,6 +8047,45 @@ async fn perform_platform_webdav_sync(
     perform_webdav_sync(app, context).await
 }
 
+/// 问题 3（同步节奏）：后台 tick 的完整同步 + `bangumiSyncStatus.lastWebDavSyncAt`
+/// 记账。完整同步循环（下载→merge→reconcile→上传，无变化时上传自动跳过）
+/// 本就由 [`perform_platform_webdav_sync`] 承担；此前缺的是记账——该时间戳
+/// 只在 run_full_bangumi_sync 步骤 1 写入，后台 15 分钟空闲 tick 即使完整
+/// 执行了同步，UI"上次坚果云同步"也最长停滞一个 Bangumi 周期。现在后台
+/// 循环每次 tick（动作唤醒或空闲超时）成功后即记账并保存/广播本地-only
+/// 状态（绝不进坚果云文档）。锁语义不变：仍经
+/// [`perform_platform_webdav_sync`] 的 webdav_sync_lock 与手动同步互斥。
+/// original 不编译记账段（无 bangumiSyncStatus 块），行为不变。
+async fn perform_webdav_sync_tracked(
+    app: &AppHandle,
+    context: &AppContext,
+) -> anyhow::Result<Value> {
+    let result = perform_platform_webdav_sync(app, context).await;
+    if result.is_ok() {
+        #[cfg(feature = "standard")]
+        match context.state.lock() {
+            Ok(mut state) => {
+                merge_bangumi_sync_status(
+                    &mut state,
+                    bangumi::BangumiSyncStatus {
+                        last_web_dav_sync_at: Some(now_seconds()),
+                        ..bangumi::BangumiSyncStatus::default()
+                    },
+                );
+                drop(state);
+                if let Err(error) = context.save_state() {
+                    warn!("failed to persist lastWebDavSyncAt: {error}");
+                }
+                emit_state(app, context);
+            }
+            Err(_) => warn!("background WebDAV sync: 状态锁不可用，跳过 lastWebDavSyncAt 记账"),
+        }
+        #[cfg(not(feature = "standard"))]
+        let _ = app;
+    }
+    result
+}
+
 fn webdav_is_enabled(app: &AppHandle, context: &AppContext) -> bool {
     #[cfg(target_os = "android")]
     {
@@ -7860,7 +8123,10 @@ fn start_webdav_background(app: AppHandle, context: AppContext) {
                 {}
             }
             if webdav_is_enabled(&app, &context) {
-                if let Err(error) = perform_platform_webdav_sync(&app, &context).await {
+                // 问题 3：空闲 tick 与唤醒 tick 一律走完整同步循环（下载→
+                // merge→reconcile→上传；无变化时上传自动跳过），成功后记账
+                // lastWebDavSyncAt 真实前进；不与手动同步并发的锁语义不变。
+                if let Err(error) = perform_webdav_sync_tracked(&app, &context).await {
                     warn!("background WebDAV sync failed: {error}");
                 }
             }
@@ -8246,8 +8512,9 @@ pub fn run() {
                     warn!("failed to reconcile autostart setting: {error}");
                 }
                 start_desktop_background(app.handle().clone(), context.clone());
-                // 问题 2b：桌面挂载自动 Bangumi 同步循环（60 分钟周期 + 动作
-                // 唤醒；standard 挂载点，Android 挂载见上方 Android 分支）。
+                // 问题 2b：桌面挂载自动 Bangumi 同步循环（max(pollIntervalMinutes,
+                // 15) 分钟周期 + 动作唤醒；standard 挂载点，Android 挂载见上方
+                // Android 分支）。
                 #[cfg(feature = "standard")]
                 start_bangumi_sync_loop(app.handle().clone(), context.clone());
                 start_desktop_task_reminders(app.handle().clone(), context.clone());
@@ -11789,6 +12056,138 @@ mod tests {
 
     #[cfg(feature = "standard")]
     #[test]
+    fn anilist_authority_backfill_skips_pre_follow_history_and_watched_episodes() {
+        // 第 8 轮问题 3 回填门槛（回填洪流治理）：
+        // a) followedAt=9/6 时 9/4 播的集不回填（追番前的历史不是待办），
+        //    9/8 播的集照常回填；
+        // b) watchedEpisode=3 时 ep1-3 不回填、追番后播且未看的 ep4 照常回填。
+        let map = json!({"bySubject": {}, "anilistIndex": {"200637": 598058}});
+        let now = at("2026-09-08T22:00:00+08:00");
+
+        // a) airingAt < followedAt 不回填。
+        let mut state = default_state(false);
+        state["following"] = json!([{
+            "id": 598058, "source": "bangumi", "anilistId": 200637, "bangumiId": 598058,
+            "displayTitle": "100 女友 S3", "episodes": 12,
+            "followedAt": at("2026-09-06T00:00:00+08:00"), "syncUpdatedAt": 1,
+            "nextAiringEpisode": {"episode": 5, "airingAt": at("2026-09-13T21:30:00+08:00")}
+        }]);
+        state["tasks"] = json!([]);
+        let media = HashMap::from([authority_media(
+            200637,
+            json!({"episode": 5, "airingAt": at("2026-09-13T21:30:00+08:00")}),
+            json!([
+                {"episode": 3, "airingAt": at("2026-09-04T21:30:00+08:00")},
+                {"episode": 4, "airingAt": at("2026-09-08T21:30:00+08:00")}
+            ]),
+        )]);
+
+        assert!(apply_anilist_authority_media(&mut state, &map, &media, now));
+
+        let episodes: Vec<i64> = state["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|task| value_i64(task.get("episode")))
+            .collect();
+        assert_eq!(episodes, vec![4], "只回填追番后播出的 ep4");
+
+        // b) watchedEpisode=3：ep1-3 已看不回填。
+        let mut state = default_state(false);
+        state["following"] = json!([{
+            "id": 598058, "source": "bangumi", "anilistId": 200637, "bangumiId": 598058,
+            "displayTitle": "100 女友 S3", "episodes": 12,
+            "followedAt": at("2026-08-01T00:00:00+08:00"), "syncUpdatedAt": 1,
+            "watchedEpisode": 3,
+            "nextAiringEpisode": {"episode": 5, "airingAt": at("2026-09-13T21:30:00+08:00")}
+        }]);
+        state["tasks"] = json!([]);
+        let media = HashMap::from([authority_media(
+            200637,
+            json!({"episode": 5, "airingAt": at("2026-09-13T21:30:00+08:00")}),
+            json!([
+                {"episode": 1, "airingAt": at("2026-08-02T21:30:00+08:00")},
+                {"episode": 2, "airingAt": at("2026-08-09T21:30:00+08:00")},
+                {"episode": 3, "airingAt": at("2026-08-16T21:30:00+08:00")},
+                {"episode": 4, "airingAt": at("2026-08-23T21:30:00+08:00")}
+            ]),
+        )]);
+
+        assert!(apply_anilist_authority_media(&mut state, &map, &media, now));
+
+        let episodes: Vec<i64> = state["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|task| value_i64(task.get("episode")))
+            .collect();
+        assert_eq!(episodes, vec![4], "ep1-3 已看不回填，追番后播的 ep4 照常回填");
+    }
+
+    #[cfg(feature = "standard")]
+    #[test]
+    fn reconcile_purges_pre_follow_flood_pending_and_is_idempotent() {
+        // 第 8 轮问题 3 存量洪水清理：anilistId 条目（含旧键 animeId=anilistId）
+        // 的 pending 且 airingAt < followedAt → 删除（黄泉 1..16 洪水形态）；
+        // completed 历史保留；纯 Bangumi 条目（无 anilistId）与 followedAt=0
+        // 的条目不判；幂等。
+        let followed_at = at("2026-09-06T00:00:00+08:00");
+        let mut state = default_state(false);
+        state["following"] = json!([
+            {"id": 568572, "source": "bangumi", "anilistId": 195600, "bangumiId": 568572,
+             "displayTitle": "黄泉的使者",
+             "followedAt": followed_at, "syncUpdatedAt": 1},
+            {"id": 140001, "source": "bangumi", "anilistId": null,
+             "displayTitle": "纯Bangumi条目",
+             "followedAt": followed_at, "syncUpdatedAt": 1},
+            {"id": 200001, "source": "bangumi", "anilistId": 999001,
+             "displayTitle": "未知追番时间", "followedAt": 0, "syncUpdatedAt": 1}
+        ]);
+        state["tasks"] = json!([
+            // 洪水：追番前已播的历史 pending → 删除。
+            {"id": "568572-1", "animeId": 568572, "episode": 1,
+             "airingAt": followed_at - 86_400, "status": "pending",
+             "createdAt": 1, "completedAt": Value::Null, "syncUpdatedAt": 1},
+            // 旧键（animeId=anilistId 195600）洪水 → 同样删除。
+            {"id": "195600-16", "animeId": 195600, "episode": 16,
+             "airingAt": followed_at - 3_600, "status": "pending",
+             "createdAt": 1, "completedAt": Value::Null, "syncUpdatedAt": 1},
+            // 追番后已播 pending → 保留。
+            {"id": "568572-3", "animeId": 568572, "episode": 3,
+             "airingAt": followed_at + 3_600, "status": "pending",
+             "createdAt": 1, "completedAt": Value::Null, "syncUpdatedAt": 1},
+            // 追番前已播的 completed → 观看历史，保留。
+            {"id": "568572-2", "animeId": 568572, "episode": 2,
+             "airingAt": followed_at - 3_600, "status": "completed",
+             "createdAt": 1, "completedAt": 2, "syncUpdatedAt": 1},
+            // 纯 Bangumi 条目（无 anilistId）：airingAt 非权威来源，不判。
+            {"id": "140001-1", "animeId": 140001, "episode": 1,
+             "airingAt": followed_at - 3_600, "status": "pending",
+             "createdAt": 1, "completedAt": Value::Null, "syncUpdatedAt": 1},
+            // followedAt=0（未知追番时间）：不判。
+            {"id": "200001-1", "animeId": 200001, "episode": 1, "airingAt": 50,
+             "status": "pending", "createdAt": 1, "completedAt": Value::Null,
+             "syncUpdatedAt": 1}
+        ]);
+        let map = json!({"bySubject": {}, "anilistIndex": {}});
+
+        assert!(reconcile_following_entries(&mut state, &map, false));
+        let ids: Vec<String> = state["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|task| value_string(task.get("id")))
+            .collect();
+        assert_eq!(ids, vec!["568572-3", "568572-2", "140001-1", "200001-1"]);
+
+        // 幂等：再次 reconcile 任务集不再变化。
+        let before = state["tasks"].clone();
+        assert!(!reconcile_following_entries(&mut state, &map, false));
+        assert_eq!(state["tasks"], before);
+    }
+
+    #[cfg(feature = "standard")]
+    #[test]
     fn anilist_authority_refresh_silently_fails_on_network_errors() {
         use crate::bangumi::test_support::MockBangumiServer;
 
@@ -11803,6 +12202,7 @@ mod tests {
             .enable_all()
             .build()
             .expect("tokio test runtime");
+        let cache_dir = authority_cache_dir("refresh-network-errors");
 
         // a) 连接不可达（127.0.0.1:9 discard 端口）→ 静默 false，状态不动。
         let refreshed = runtime.block_on(anilist_authority_refresh(
@@ -11811,6 +12211,7 @@ mod tests {
             "http://127.0.0.1:9/",
             &client,
             &[195600],
+            &cache_dir,
             at("2026-09-06T12:00:00+08:00"),
         ));
         assert!(!refreshed);
@@ -11832,10 +12233,160 @@ mod tests {
             &erroring.url(),
             &client,
             &[195600],
+            &cache_dir,
             at("2026-09-06T12:00:00+08:00"),
         ));
         assert!(!refreshed);
         assert!(state.lock().unwrap()["following"][0]["nextAiringEpisode"].is_null());
+    }
+
+    /// 第 8 轮测试辅助：每用例独立的权威缓存目录（防缓存串扰），返回前清空
+    /// 残留并建目录。
+    #[cfg(all(feature = "standard", not(target_os = "android")))]
+    fn authority_cache_dir(tag: &str) -> std::path::PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "anilog-test-authority-cache-{}-{tag}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        let _ = fs::create_dir_all(&directory);
+        directory
+    }
+
+    #[cfg(all(feature = "standard", not(target_os = "android")))]
+    #[test]
+    fn anilist_authority_cache_roundtrip_ttl_and_webdav_resurrection_heal() {
+        // 第 8 轮问题 1（桌面止血）+ 问题 2 测试：
+        // 1) 抓取缓存落盘后可免网络重放（apply_cached_anilist_authority 无
+        //    HTTP 客户端参数，结构性不触网）；TTL 内应用成功，过期返回 false
+        //    不阻塞；缓存目录为空/损坏 JSON 同样 false。
+        // 2) webdav 复活愈合序列：本地已删 ep23 假票 → 云端文档 merge 加回 →
+        //    apply cached（fresh）→ 再删 → 上传文档无 ep23、无 nextAiringEpisode。
+        let map = json!({"bySubject": {}, "anilistIndex": {"195600": 568572}});
+        let now = at("2026-09-06T12:00:00+08:00");
+        let media = authority_media(
+            195600,
+            json!({"episode": 23, "airingAt": at("2026-09-12T22:30:00+08:00")}),
+            json!([
+                {"episode": 22, "airingAt": at("2026-09-05T22:30:00+08:00")},
+                {"episode": 23, "airingAt": at("2026-09-12T22:30:00+08:00")}
+            ]),
+        )
+        .1;
+        // 本地形态：黄泉 next 仍为污染值 ep24@9/13；ep23 假票已被本地删除
+        // （只剩 ep22 completed 观看历史）。
+        let local_state = || {
+            let mut state = default_state(false);
+            state["following"] = json!([{
+                "id": 568572, "source": "bangumi", "anilistId": 195600, "bangumiId": 568572,
+                "title": {"native": "黄泉の使者", "english": null, "romaji": null},
+                "displayTitle": "黄泉的使者",
+                "episodes": 13, "followedAt": at("2026-08-20T00:00:00+08:00"), "syncUpdatedAt": 1,
+                "nextAiringEpisode": {"episode": 24, "airingAt": at("2026-09-13T00:00:00+08:00")}
+            }]);
+            state["tasks"] = json!([
+                {"id": "568572-22", "animeId": 568572, "episode": 22,
+                 "airingAt": at("2026-09-05T22:30:00+08:00"), "status": "completed",
+                 "createdAt": 1, "completedAt": 2, "syncUpdatedAt": 1}
+            ]);
+            state
+        };
+        // 云端文档：携带复活假票 ep23@9/6（任务无墓碑，LWW 会加回）与污染 next。
+        let remote = json!({
+            "version": SYNC_VERSION,
+            "following": [{
+                "id": 568572, "source": "bangumi", "anilistId": 195600, "bangumiId": 568572,
+                "title": {"native": "黄泉の使者", "english": null, "romaji": null},
+                "displayTitle": "黄泉的使者",
+                "episodes": 13, "followedAt": at("2026-08-20T00:00:00+08:00"),
+                "syncUpdatedAt": 9_000,
+                "nextAiringEpisode": {"episode": 24, "airingAt": at("2026-09-13T00:00:00+08:00")}
+            }],
+            "tasks": [{
+                "id": "568572-23", "animeId": 568572, "animeTitle": "黄泉的使者",
+                "episode": 23, "airingAt": at("2026-09-06T00:00:00+08:00"),
+                "status": "pending", "createdAt": 1, "completedAt": null,
+                "syncUpdatedAt": 9_000
+            }],
+            "followingDeletedAt": {}
+        });
+        let cache_dir = authority_cache_dir("roundtrip-heal");
+
+        // 1a) 缓存目录为空 → false 不阻塞。
+        let mut state = local_state();
+        assert!(!apply_cached_anilist_authority(&mut state, &map, &cache_dir, now));
+        assert_eq!(state["tasks"].as_array().unwrap().len(), 1);
+
+        // 1b) 抓取缓存写入 → TTL 内（真实时钟 fetchedAt=now 毫秒）免网络应用：
+        //     next 重写为权威值 ep23@9/12、复活的 ep23 假票删除；再次应用零变更。
+        write_anilist_authority_cache(&cache_dir, &HashMap::from([(195600, media.clone())]));
+        let mut state = local_state();
+        assert!(apply_cached_anilist_authority(&mut state, &map, &cache_dir, now_seconds()));
+        assert_eq!(state["following"][0]["nextAiringEpisode"]["episode"], 23);
+        assert!(!state["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| value_string(task.get("id")) == "568572-23"));
+        assert!(!apply_cached_anilist_authority(&mut state, &map, &cache_dir, now_seconds()));
+
+        // 1c) 过期缓存（fetchedAt = now - 1 小时）→ false 不阻塞、状态不动。
+        let stale = json!({
+            "fetchedAt": (now - 3_600) * 1_000,
+            "media": [media.clone()]
+        });
+        fs::write(
+            cache_dir.join(ANILIST_AUTHORITY_CACHE_FILE),
+            stale.to_string(),
+        )
+        .unwrap();
+        let mut state = local_state();
+        assert!(!apply_cached_anilist_authority(&mut state, &map, &cache_dir, now));
+        assert_eq!(state["following"][0]["nextAiringEpisode"]["episode"], 24);
+
+        // 1d) 损坏 JSON → false 不阻塞。
+        fs::write(cache_dir.join(ANILIST_AUTHORITY_CACHE_FILE), "not-json").unwrap();
+        let mut state = local_state();
+        assert!(!apply_cached_anilist_authority(&mut state, &map, &cache_dir, now));
+
+        // 2) webdav 复活愈合序列（perform_webdav_sync 合并段复刻）。缓存改用
+        //    测试 now 手写 fresh 时间戳，断言与真实时钟解耦。
+        let fresh = json!({"fetchedAt": now * 1_000, "media": [media]});
+        fs::write(
+            cache_dir.join(ANILIST_AUTHORITY_CACHE_FILE),
+            fresh.to_string(),
+        )
+        .unwrap();
+        let mut state = local_state();
+        let (changed, _, _) = merge_document_into_state(&mut state, &remote).unwrap();
+        assert!(changed, "云端假票经 LWW 加回本地");
+        assert!(state["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| value_string(task.get("id")) == "568572-23"));
+        // 合并后套用缓存权威数据 → 假票当次再死一次、污染 next 治愈。
+        assert!(apply_cached_anilist_authority(
+            &mut state,
+            &map,
+            &cache_dir,
+            now
+        ));
+        let tasks = state["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["id"], "568572-22");
+        assert_eq!(tasks[0]["status"], "completed");
+        assert_eq!(state["following"][0]["nextAiringEpisode"]["episode"], 23);
+        // 上传文档自愈：无 ep23 假票、无 nextAiringEpisode。
+        let document = document_from_state(&mut state);
+        assert!(!document["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| value_string(task.get("id")) == "568572-23"));
+        assert!(document["following"][0]
+            .get("nextAiringEpisode")
+            .is_none());
     }
 
     #[cfg(feature = "standard")]
@@ -12181,6 +12732,52 @@ mod tests {
         assert!(original["following"][0].get("bangumiStatus").is_none());
         assert!(original["following"][0].get("rating").is_none());
         assert!(original["following"][0].get("watchedEpisode").is_none());
+    }
+
+    #[cfg(feature = "standard")]
+    #[test]
+    fn webdav_merge_keeps_local_next_and_upload_doc_strips_next() {
+        // 第 8 轮问题 1（治本）：nextAiringEpisode 转设备本地数据。
+        // a) 云端文档携带旧污染 next（黄泉 ep24@9/13）且 LWW 由远端记录胜出 →
+        //    合并后本地 next 保持本地值（合并前剥远端键 + 合并后恢复本地快照）；
+        // b) 上传文档（document_from_state 输出）不含 nextAiringEpisode；
+        // c) 远端复活记录（本地无该条目）不带 next 进入本地状态。
+        let local_next = json!({"episode": 23, "airingAt": at("2026-09-12T22:30:00+08:00")});
+        let remote = json!({
+            "version": SYNC_VERSION,
+            "following": [{
+                "id": 568572, "source": "bangumi", "anilistId": 195600, "bangumiId": 568572,
+                "title": {"native": "黄泉の使者", "english": null, "romaji": null},
+                "displayTitle": "黄泉的使者",
+                "followedAt": 1_000, "syncUpdatedAt": 9_000,
+                "nextAiringEpisode": {"episode": 24, "airingAt": at("2026-09-13T00:00:00+08:00")}
+            }],
+            "tasks": [],
+            "followingDeletedAt": {}
+        });
+
+        // a) 本地已有条目（syncUpdatedAt 较旧 → LWW 远端胜出）。
+        let mut state = default_state(false);
+        state["following"] = json!([{
+            "id": 568572, "source": "bangumi", "anilistId": 195600, "bangumiId": 568572,
+            "title": {"native": "黄泉の使者", "english": null, "romaji": null},
+            "displayTitle": "黄泉的使者",
+            "followedAt": 1_000, "syncUpdatedAt": 1_000,
+            "nextAiringEpisode": local_next
+        }]);
+        let (_, merged, _) = merge_document_into_state(&mut state, &remote).unwrap();
+        // 本地 next 保持本地值，不被远端污染值覆盖。
+        assert_eq!(state["following"][0]["nextAiringEpisode"], local_next);
+        // 上传文档不含 nextAiringEpisode。
+        assert!(merged["following"][0].get("nextAiringEpisode").is_none());
+
+        // c) 本地无该条目 → 云端记录复活进本地，但不携带 next（由本端调度/
+        //    权威路径重建）。
+        let mut state = default_state(false);
+        let (_, merged, _) = merge_document_into_state(&mut state, &remote).unwrap();
+        assert_eq!(state["following"].as_array().unwrap().len(), 1);
+        assert!(state["following"][0].get("nextAiringEpisode").is_none());
+        assert!(merged["following"][0].get("nextAiringEpisode").is_none());
     }
 
     #[cfg(feature = "standard")]
@@ -12531,7 +13128,7 @@ mod tests {
                 "displayTitle": "Mushoku Tensei III",
                 "coverImage": "https://anilist.example/cover.jpg",
                 "episodes": 12, "format": "TV", "seasonYear": 2026,
-                "followedAt": 1_000, "syncUpdatedAt": 5_000
+                "followedAt": 0, "syncUpdatedAt": 5_000
             },
             {
                 "id": 45678, "source": "bangumi", "anilistId": 21355, "bangumiId": 45678,
@@ -12539,7 +13136,7 @@ mod tests {
                 "displayTitle": "无职转生 III",
                 "coverImage": "",
                 "episodes": null, "format": "TV", "seasonYear": 2026,
-                "followedAt": 2_000, "syncUpdatedAt": 6_000
+                "followedAt": 0, "syncUpdatedAt": 6_000
             }
         ]);
         state["tasks"] = json!([
@@ -13746,23 +14343,43 @@ mod tests {
     #[cfg(feature = "standard")]
     #[test]
     fn bangumi_sync_loop_kernel_quiet_period_and_gate() {
-        // 问题 2b 循环内核：静默期/周期等待时长 + 执行前判定。
+        // 问题 2b 循环内核：静默期/周期等待时长 + 执行前判定。周期自第 8 轮
+        // 起运行时读取设置（wait_duration 第二参数），不再有固定 INTERVAL_SECS。
         use super::bangumi_sync_loop;
-        // 动作唤醒 → 30 秒静默期；周期路径 → 60 分钟。
+        // 动作唤醒 → 30 秒静默期；周期路径 → interval_secs 现值。
         assert_eq!(
-            bangumi_sync_loop::wait_duration(false),
+            bangumi_sync_loop::wait_duration(false, 3_600),
             std::time::Duration::from_secs(3_600)
         );
         assert_eq!(
-            bangumi_sync_loop::wait_duration(true),
+            bangumi_sync_loop::wait_duration(true, 3_600),
             std::time::Duration::from_secs(30)
         );
-        // 静默期必须短于周期（唤醒比周期更快触达）。
-        assert!(bangumi_sync_loop::QUIET_SECS < bangumi_sync_loop::INTERVAL_SECS);
+        // 静默期必须短于下限周期（唤醒比周期更快触达）。
+        assert!(bangumi_sync_loop::QUIET_SECS < bangumi_sync_loop::interval_secs(5));
         // 执行前判定：无 Token 不跑；门被占不跑；两者齐备才跑。
         assert!(!bangumi_sync_loop::should_execute(false, true));
         assert!(!bangumi_sync_loop::should_execute(true, false));
         assert!(bangumi_sync_loop::should_execute(true, true));
+    }
+
+    #[cfg(feature = "standard")]
+    #[test]
+    fn bangumi_sync_loop_interval_floor_follows_settings() {
+        // 第 8 轮问题 3：周期 = max(pollIntervalMinutes, 15) 分钟。设置页
+        // "同步间隔"现有选择 1/5/10/15 → 统一抬到下限 15 分钟保护 Bangumi
+        // API；缺失/无法读取设置（0/负数）→ 15 分钟兜底；更大的设置值原样
+        // 透传（上限 1440 分钟与桌面主同步循环钳制同口径）。
+        use super::bangumi_sync_loop;
+        assert_eq!(bangumi_sync_loop::interval_secs(5), 15 * 60);
+        assert_eq!(bangumi_sync_loop::interval_secs(1), 15 * 60);
+        assert_eq!(bangumi_sync_loop::interval_secs(10), 15 * 60);
+        assert_eq!(bangumi_sync_loop::interval_secs(15), 15 * 60);
+        assert_eq!(bangumi_sync_loop::interval_secs(0), 15 * 60);
+        assert_eq!(bangumi_sync_loop::interval_secs(-3), 15 * 60);
+        assert_eq!(bangumi_sync_loop::interval_secs(30), 30 * 60);
+        assert_eq!(bangumi_sync_loop::interval_secs(1_440), 1_440 * 60);
+        assert_eq!(bangumi_sync_loop::interval_secs(5_000), 1_440 * 60);
     }
 
     #[cfg(feature = "standard")]
