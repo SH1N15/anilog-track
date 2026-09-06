@@ -751,6 +751,13 @@ const browserApi: DesktopApi = {
     }
     },
   } : {}),
+  // Phase 1：浏览器/Electron 回退路径不接入 Bangumi 账户，不新增任何 Bangumi 网络代码。
+  async bangumiAuthStatus() { return { supported: false, hasToken: false, apiBaseUrl: '' }; },
+  async bangumiSaveToken() { return { ok: false, message: '当前平台不支持 Bangumi 账户同步' }; },
+  async bangumiDisconnect() { return { ok: false, message: '当前平台不支持 Bangumi 账户同步' }; },
+  async bangumiTestConnection() { return { ok: false, message: '当前平台不支持 Bangumi 账户同步', username: null, nickname: null }; },
+  async bangumiGetUserProfile() { return null; },
+  async bangumiGetUserCollections() { return { total: 0, items: [] }; },
   async toggleTask(taskId) {
     const task = browserState.tasks.find((item) => item.id === taskId);
     if (task) {

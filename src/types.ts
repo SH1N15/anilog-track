@@ -174,6 +174,12 @@ export interface DesktopApi {
   testWebDavConnection(): Promise<{ ok: boolean; message: string }>;
   syncWebDav(): Promise<WebDavSyncResult>;
   requestExactScheduling?(): Promise<void>;
+  bangumiAuthStatus?(): Promise<BangumiAuthStatus>;
+  bangumiSaveToken?(params: { token: string }): Promise<{ ok: boolean; message: string }>;
+  bangumiDisconnect?(): Promise<{ ok: boolean; message: string }>;
+  bangumiTestConnection?(params: { baseUrl?: string | null }): Promise<BangumiConnectionTestResult>;
+  bangumiGetUserProfile?(): Promise<BangumiUserProfile | null>;
+  bangumiGetUserCollections?(params: { offset?: number; limit?: number }): Promise<{ total: number; items: BangumiCollectionItem[] }>;
   openExternal(url: string): Promise<void>;
   onStateChanged(callback: (state: AppState) => void): () => void;
   onSeasonUpdated(callback: (update: { season: Season; year: number; anime: Anime[]; fetchedAt: number }) => void): () => void;
@@ -269,6 +275,42 @@ export interface BangumiUserSummary {
   username: string;
   nickname: string;
   avatarUrl?: string | null;
+}
+
+// —— Phase 1（Token + 连接 + 只读，Rust 命令镜像，camelCase）——
+export interface BangumiAuthStatus {
+  supported: boolean;
+  hasToken: boolean;
+  apiBaseUrl: string;
+}
+
+export interface BangumiUserProfile {
+  id: number;
+  username: string;
+  nickname: string;
+  avatar?: { large?: string | null; medium?: string | null; small?: string | null } | null;
+  sign?: string | null;
+  userGroup?: number | null;
+}
+
+export interface BangumiCollectionItem {
+  subjectId: number;
+  subjectType: number;
+  rate?: number | null;
+  collectionType: number;
+  tags: string[];
+  epStatus?: number | null;
+  volStatus?: number | null;
+  updatedAt?: string | null;
+  private?: boolean | null;
+  comment?: string | null;
+}
+
+export interface BangumiConnectionTestResult {
+  ok: boolean;
+  message: string;
+  username?: string | null;
+  nickname?: string | null;
 }
 
 // Phase 2 计划（主键迁移，当前不改动现有字段）：

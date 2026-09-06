@@ -15,6 +15,7 @@ import app.tauri.plugin.Invoke
 import app.tauri.plugin.JSObject
 import app.tauri.plugin.Plugin
 import org.json.JSONArray
+import org.json.JSONObject
 
 @TauriPlugin
 class AniLogPlugin(private val activity: Activity) : Plugin(activity) {
@@ -121,6 +122,18 @@ class AniLogPlugin(private val activity: Activity) : Plugin(activity) {
     WebDavStore.finishSync(activity.applicationContext, if (args.has("error")) args.optString("error") else null)
     invoke.resolve(WebDavStore.publicConfig(activity.applicationContext))
   }
+
+  @Command
+  fun bangumiGetToken(invoke: Invoke) { invoke.resolve(JSObject().put("token", BangumiTokenStore.load(activity.applicationContext) ?: JSONObject.NULL)) }
+
+  @Command
+  fun bangumiSaveToken(invoke: Invoke) {
+    val token = invoke.getArgs().optString("token", "")
+    invoke.resolve(JSObject().put("ok", BangumiTokenStore.save(activity.applicationContext, token)))
+  }
+
+  @Command
+  fun bangumiClearToken(invoke: Invoke) { invoke.resolve(JSObject().put("ok", BangumiTokenStore.clear(activity.applicationContext))) }
 
   private fun status(events: JSONArray, consumeOpenTasks: Boolean): JSObject {
     val alarms = activity.getSystemService(AlarmManager::class.java)

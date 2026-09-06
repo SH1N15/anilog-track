@@ -46,6 +46,14 @@ const BACKEND_MESSAGES: Array<[RegExp, string]> = [
   [/无法读取本季番剧/g, 'Could not load this season'],
   [/无法读取缓存大小/g, 'Could not calculate cache size'],
   [/无法读取 WebDAV 设置/g, 'Could not read WebDAV settings'],
+  [/Original 版不支持 Bangumi/g, 'Bangumi is not supported in the Original edition'],
+  [/当前平台不支持 Bangumi Token 存储/g, 'Bangumi token storage is not supported on this platform'],
+  [/Token 不能为空/g, 'Token cannot be empty'],
+  [/尚未保存 Bangumi Token/g, 'No Bangumi token saved yet'],
+  [/Bangumi 授权失败，Token 可能已失效/g, 'Bangumi authorization failed; the token may have expired'],
+  [/无法连接 Bangumi 服务/g, 'Cannot reach the Bangumi service'],
+  [/Bangumi 安全存储不可用/g, 'Bangumi secure storage is unavailable'],
+  [/当前平台不支持 Bangumi 账户同步/g, 'Bangumi account sync is not supported on this platform'],
 ];
 
 export function localizeMessage(message: string, language: UiLanguage): string {

@@ -336,6 +336,105 @@ pub fn test_webdav_connection(app: &AppHandle) -> anyhow::Result<Value> {
         .run("testWebDavConnection", json!({}))
 }
 
+// ---------------------------------------------------------------------------
+// Bangumi Token 桥（Phase 1，仅 standard edition）。
+//
+// Kotlin 侧方法名固定：bangumiGetToken / bangumiSaveToken / bangumiClearToken，
+// 返回 JSON 约定：getToken → {token: string|null}；save → {ok: bool}；clear → {ok: bool}。
+// 决策 12：Java 层 BangumiTokenStore 只做 Keystore 凭据存取，绝不发起任何
+// Bangumi 网络请求；HTTP 全部由 Rust 层发起且 original 的 Rust 永不调用。
+// ---------------------------------------------------------------------------
+
+/// 读取 Bangumi Token；无 Token 时返回 `None`。
+#[cfg(feature = "standard")]
+pub fn bangumi_get_token(app: &AppHandle) -> anyhow::Result<Option<String>> {
+    let value = app.state::<MobileBridge>().run("bangumiGetToken", json!({}))?;
+    Ok(value
+        .get("token")
+        .and_then(Value::as_str)
+        .map(str::to_string))
+}
+
+/// 写入 Bangumi Token；返回插件是否确认成功。
+#[cfg(feature = "standard")]
+pub fn bangumi_save_token(app: &AppHandle, token: &str) -> anyhow::Result<bool> {
+    let value = app
+        .state::<MobileBridge>()
+        .run("bangumiSaveToken", json!({ "token": token }))?;
+    Ok(value_bool(value.get("ok")))
+}
+
+/// 清除 Bangumi Token；返回插件是否确认成功。
+#[cfg(feature = "standard")]
+pub fn bangumi_clear_token(app: &AppHandle) -> anyhow::Result<bool> {
+    let value = app.state::<MobileBridge>().run("bangumiClearToken", json!({}))?;
+    Ok(value_bool(value.get("ok")))
+}
+
+/// 桥实现 [`BangumiTokenStore`]：Rust 命令层经此在 Android Keystore 中读写
+/// Bangumi Token（仿 WebDAV 桥的现有写法）。桥失败统一映射为固定文案
+/// “Bangumi 安全存储不可用”，不透传底层细节。
+#[cfg(feature = "standard")]
+pub struct MobileBangumiTokenStore {
+    bridge: MobileBridge,
+}
+
+#[cfg(feature = "standard")]
+impl MobileBangumiTokenStore {
+    pub fn new(bridge: MobileBridge) -> Self {
+        Self { bridge }
+    }
+
+    fn bridge_error() -> crate::bangumi::TokenStoreError {
+        crate::bangumi::TokenStoreError::Platform("Bangumi 安全存储不可用".into())
+    }
+}
+
+#[cfg(feature = "standard")]
+impl crate::bangumi::BangumiTokenStore for MobileBangumiTokenStore {
+    fn load(&self) -> Result<Option<String>, crate::bangumi::TokenStoreError> {
+        let value = self
+            .bridge
+            .run("bangumiGetToken", json!({}))
+            .map_err(|_| Self::bridge_error())?;
+        Ok(value
+            .get("token")
+            .and_then(Value::as_str)
+            .map(str::to_string))
+    }
+
+    fn store(&self, token: &str) -> Result<(), crate::bangumi::TokenStoreError> {
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            return Err(crate::bangumi::TokenStoreError::Other(
+                "Bangumi Token 不能为空".into(),
+            ));
+        }
+        let value = self
+            .bridge
+            .run("bangumiSaveToken", json!({ "token": trimmed }))
+            .map_err(|_| Self::bridge_error())?;
+        if value_bool(value.get("ok")) {
+            Ok(())
+        } else {
+            Err(Self::bridge_error())
+        }
+    }
+
+    fn clear(&self) -> Result<(), crate::bangumi::TokenStoreError> {
+        let value = self
+            .bridge
+            .run("bangumiClearToken", json!({}))
+            .map_err(|_| Self::bridge_error())?;
+        if value_bool(value.get("ok")) {
+            Ok(())
+        } else {
+            Err(Self::bridge_error())
+        }
+    }
+}
+
+
 fn finish_webdav_sync(app: &AppHandle, error: Option<&str>) {
     let payload = error.map_or_else(|| json!({}), |message| json!({"error": message}));
     let _ = app.state::<MobileBridge>().run("finishWebDavSync", payload);

@@ -30,10 +30,11 @@ import {
   SlidersHorizontal,
   Sparkles,
   Trash2,
+  User,
   X,
 } from 'lucide-react';
 import { api } from './api';
-import type { Anime, AppState, BangumiTitleMatch, Season, SeasonViewMode, Settings as AppSettings, UiLanguage, ViewId, WatchTask, WebDavConfig } from './types';
+import type { Anime, AppState, BangumiAuthStatus, BangumiTitleMatch, BangumiUserProfile, Season, SeasonViewMode, Settings as AppSettings, UiLanguage, ViewId, WatchTask, WebDavConfig } from './types';
 import { IS_ORIGINAL_EDITION, productName, titleForPreference } from './edition';
 import { localizeMessage, normalizeUiLanguage, tr } from './i18n';
 import { createStateRefreshController } from './state-refresh';
@@ -741,8 +742,15 @@ function SettingsView({ state, language, onChange }: { state: AppState; language
   const [webDavPassword, setWebDavPassword] = useState('');
   const [webDavStatus, setWebDavStatus] = useState('');
   const [webDavBusy, setWebDavBusy] = useState(false);
+  const [bangumiAuth, setBangumiAuth] = useState<BangumiAuthStatus | null>(null);
+  const [bangumiProfile, setBangumiProfile] = useState<BangumiUserProfile | null>(null);
+  const [bangumiToken, setBangumiToken] = useState('');
+  const [bangumiApiUrl, setBangumiApiUrl] = useState(state.bangumiSyncSettings?.apiBaseUrl || state.settings.bangumiApiBaseUrl);
+  const [bangumiStatus, setBangumiStatus] = useState('');
+  const [bangumiBusy, setBangumiBusy] = useState(false);
 
   useEffect(() => setProxyUrl(state.settings.bangumiApiBaseUrl), [state.settings.bangumiApiBaseUrl]);
+  useEffect(() => setBangumiApiUrl(state.bangumiSyncSettings?.apiBaseUrl || state.settings.bangumiApiBaseUrl), [state.bangumiSyncSettings?.apiBaseUrl, state.settings.bangumiApiBaseUrl]);
 
   useEffect(() => {
     let active = true;
@@ -770,8 +778,70 @@ function SettingsView({ state, language, onChange }: { state: AppState; language
     return () => { active = false; };
   }, [language]);
 
-  const webDavPayload = (enabled: boolean) => ({
-    enabled,
+  const loadBangumiStatus = async () => {
+    if (!api.bangumiAuthStatus) return;
+    const status = await api.bangumiAuthStatus();
+    setBangumiAuth(status);
+    setBangumiProfile(status.hasToken && api.bangumiGetUserProfile ? await api.bangumiGetUserProfile() : null);
+  };
+
+  useEffect(() => {
+    if (!api.bangumiAuthStatus) return;
+    let active = true;
+    loadBangumiStatus().catch((reason) => { if (active) setBangumiStatus(message(reason, '无法读取 Bangumi 连接状态', 'Could not read Bangumi connection status')); });
+    return () => { active = false; };
+  }, [language]);
+
+  const saveBangumiToken = async () => {
+    if (!api.bangumiSaveToken || !api.bangumiTestConnection) return;
+    setBangumiBusy(true);
+    setBangumiStatus(t('正在保存…', 'Saving…'));
+    try {
+      const saved = await api.bangumiSaveToken({ token: bangumiToken.trim() });
+      if (!saved.ok) {
+        setBangumiStatus(localizeMessage(saved.message, language));
+        return;
+      }
+      setBangumiToken('');
+      const result = await api.bangumiTestConnection({ baseUrl: bangumiApiUrl.trim() || null });
+      setBangumiStatus(localizeMessage(result.message, language));
+      await loadBangumiStatus();
+    } catch (reason) {
+      setBangumiStatus(message(reason, 'Bangumi 连接失败', 'Bangumi connection failed'));
+    } finally {
+      setBangumiBusy(false);
+    }
+  };
+
+  const saveBangumiApiUrl = async () => {
+    const next = bangumiApiUrl.trim();
+    const current = state.bangumiSyncSettings?.apiBaseUrl || state.settings.bangumiApiBaseUrl || '';
+    if (next === current.trim()) return;
+    try {
+      await onChange({ bangumiApiBaseUrl: next });
+      setBangumiStatus(next ? t('API 地址已保存', 'API address saved') : t('已恢复使用官方 API', 'Restored to the official API'));
+    } catch (reason) {
+      setBangumiStatus(message(reason, 'API 地址无效', 'Invalid API address'));
+    }
+  };
+
+  const disconnectBangumi = async () => {
+    if (!api.bangumiDisconnect) return;
+    if (!window.confirm(t('确认断开 Bangumi 账户连接吗？\n\n本地观看记录与追番清单会保留。', 'Disconnect the Bangumi account?\n\nLocal watch history and the following list are kept.'))) return;
+    setBangumiBusy(true);
+    setBangumiStatus(t('正在断开…', 'Disconnecting…'));
+    try {
+      const result = await api.bangumiDisconnect();
+      setBangumiStatus(localizeMessage(result.message, language));
+      await loadBangumiStatus();
+    } catch (reason) {
+      setBangumiStatus(message(reason, 'Bangumi 断开失败', 'Could not disconnect Bangumi'));
+    } finally {
+      setBangumiBusy(false);
+    }
+  };
+
+  const webDavPayload = (enabled: boolean) => ({    enabled,
     baseUrl: webDavUrl,
     username: webDavUsername,
     ...(webDavPassword ? { password: webDavPassword } : {}),
@@ -942,6 +1012,7 @@ function SettingsView({ state, language, onChange }: { state: AppState; language
           </SettingRow>
         </section>
       ) : (
+        <>
         <section className="settings-section">
           <div className="settings-title"><Network size={20} /><div><h2>中文标题网络</h2><p>默认使用公共反代，也可改为自建地址；清空则使用官方 API。</p></div></div>
           <div className="proxy-setting">
@@ -953,6 +1024,41 @@ function SettingsView({ state, language, onChange }: { state: AppState; language
             <p className={proxyStatus === '连接成功' ? 'proxy-status success' : 'proxy-status'}>{proxyStatus || '反代服务可见你的网络地址和搜索标题，但不会收到追番清单或账号信息。'}</p>
           </div>
         </section>
+        <section className="settings-section">
+          <div className="settings-title"><User size={20} /><div><h2>Bangumi 账户</h2><p>连接 Bangumi 账户以读取资料与收藏；本阶段为只读接入。</p></div></div>
+          <SettingRow title="连接状态" description="Token 保存在系统安全存储中，不会写入追番数据或同步文件。">
+            {bangumiAuth?.hasToken ? (
+              <span className="fixed-setting-value">
+                {(() => {
+                  const avatar = bangumiProfile?.avatar?.medium || bangumiProfile?.avatar?.small;
+                  return avatar ? <img src={avatar} alt="" style={{ width: 20, height: 20, borderRadius: '50%', objectFit: 'cover' }} /> : null;
+                })()}
+                {bangumiProfile ? `${bangumiProfile.username} · ${bangumiProfile.nickname}` : '已连接'}
+              </span>
+            ) : (
+              <span className="fixed-setting-value">{bangumiAuth?.supported === false ? '当前平台不支持' : '未连接'}</span>
+            )}
+          </SettingRow>
+          {bangumiAuth?.hasToken && (
+            <SettingRow title="账户资料" description="只读信息，来自 Bangumi 授权账户">
+              <span className="fixed-setting-value">{bangumiProfile?.username || '—'}{bangumiProfile?.nickname ? ` · ${bangumiProfile.nickname}` : ''}</span>
+            </SettingRow>
+          )}
+          <div className="webdav-setting">
+            <div className="webdav-fields">
+              <label><span>Access Token</span><input type="password" value={bangumiToken} placeholder="粘贴 Bangumi Access Token" autoComplete="new-password" onChange={(event) => { setBangumiToken(event.target.value); setBangumiStatus(''); }} /></label>
+              <label><span>API 地址</span><input type="url" value={bangumiApiUrl} placeholder="留空使用官方 API" onChange={(event) => { setBangumiApiUrl(event.target.value); setBangumiStatus(''); }} onBlur={() => void saveBangumiApiUrl()} /></label>
+            </div>
+            <div className="webdav-actions">
+              <button className="secondary-button" disabled={bangumiBusy} onClick={() => void saveBangumiToken()}><Save size={15} /><span>保存并测试</span></button>
+              <button className="secondary-button" disabled={bangumiBusy || !bangumiAuth?.hasToken} onClick={() => void disconnectBangumi()}><X size={15} /><span>断开连接</span></button>
+            </div>
+            <p className={/成功|已连接|已保存|已恢复|succeeded|saved|connected|restored/i.test(bangumiStatus) ? 'proxy-status success' : 'proxy-status'}>
+              {bangumiStatus || '留空 API 地址时使用官方接口；此地址与上方中文标题反代共用同一设置。'}
+            </p>
+          </div>
+        </section>
+        </>
       )}
       {isAndroid ? (
         <section className="settings-section">

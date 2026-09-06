@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 // ---------------------------------------------------------------------------
@@ -844,6 +845,8 @@ fn official_base_urls() -> BangumiBaseUrls {
     }
 }
 
+/// 收藏读取/写入的固定 subject_type：2 = 动画（schema §5）。
+pub const SUBJECT_TYPE_ANIME: u32 = 2;
 /// 季度列表分页 limit 上限。
 pub const SEASON_SUBJECTS_LIMIT_MAX: u32 = 50;
 /// 集数列表分页 limit 上限（注意：集数是 `/v0/episodes`）。
@@ -1382,9 +1385,640 @@ impl BangumiClient for FixtureBangumiClient {
 }
 
 // ---------------------------------------------------------------------------
+// H. HttpBangumiClient（Phase 1）：真实 HTTP 版 BangumiClient
+// ---------------------------------------------------------------------------
+
+/// `Authorization: Bearer <token>` 请求头的构造。
+///
+/// 该串**只**用于请求头：任何日志、错误 Display/Debug、状态 JSON 都不得包含它
+/// （由 `error_display_never_contains_token_material` 系列测试锁定）。
+pub fn bearer(token: &str) -> String {
+    format!("Bearer {token}")
+}
+
+/// 全局并发限流许可数（schema §7 纪律：1-2；独立于标题 resolver 的 450ms 串行锁）。
+pub const HTTP_CLIENT_CONCURRENCY: usize = 2;
+
+/// [`BangumiClient`] 的真实 HTTP 实现（reqwest + rustls）。
+///
+/// 凭据纪律：
+/// - 客户端本体**不持久化任何 Token**；Token 每次请求经参数传入，仅在发送瞬间
+///   注入 `Authorization` 头，绝不进入日志或错误信息；
+/// - 并发纪律：tokio::sync::Semaphore 全局限流（[`HTTP_CLIENT_CONCURRENCY`]）；
+///   **Phase 1 不做自动重试**：429 直接返回
+///   [`BangumiApiError::RateLimited`]（含 `Retry-After`），**调用方决定退避**
+///   （尊重 Retry-After + 指数退避，schema §7）；
+/// - 错误映射：HTTP 状态码经 [`from_status`]（解析 ErrorBody）；reqwest 错误
+///   `is_timeout` → Timeout、`is_connect`/`is_request` → Network。错误信息只含
+///   方法与 URL 路径（不含 query；本客户端 query 无敏感信息，Authorization 头
+///   则绝不入错误）。
+pub struct HttpBangumiClient {
+    client: reqwest::Client,
+    /// 主基址（反代或官方）。
+    base: BangumiBaseUrls,
+    /// `/calendar` 回落基址（默认官方；测试注入 mock 以验证回落语义）。
+    fallback: BangumiBaseUrls,
+    limiter: Arc<tokio::sync::Semaphore>,
+}
+
+impl HttpBangumiClient {
+    /// 以现有 reqwest::Client 构造（推荐：复用 AppContext.client，保持 UA 与连接池一致）。
+    /// 回落基址为官方 `https://api.bgm.tv`。
+    pub fn new(client: reqwest::Client, base: BangumiBaseUrls) -> Self {
+        Self::with_fallback(client, base, official_base_urls())
+    }
+
+    /// 显式指定回落基址（`/calendar` 反代回落测试用；生产一律走 [`Self::new`]）。
+    pub fn with_fallback(
+        client: reqwest::Client,
+        base: BangumiBaseUrls,
+        fallback: BangumiBaseUrls,
+    ) -> Self {
+        Self {
+            client,
+            base,
+            fallback,
+            limiter: Arc::new(tokio::sync::Semaphore::new(HTTP_CLIENT_CONCURRENCY)),
+        }
+    }
+
+    /// 自带 reqwest Client 的构造：UA `AniLog Tauri/<CARGO_PKG_VERSION>`，
+    /// 超时设置与 lib.rs 的 AniList client 保持一致（不设显式整体超时）。
+    pub fn with_base(base: BangumiBaseUrls) -> reqwest::Result<Self> {
+        let client = reqwest::Client::builder()
+            .user_agent(concat!("AniLog Tauri/", env!("CARGO_PKG_VERSION")))
+            .build()?;
+        Ok(Self::new(client, base))
+    }
+
+    pub fn base(&self) -> &BangumiBaseUrls {
+        &self.base
+    }
+
+    /// 将 Token 与客户端绑定成一个实现 [`BangumiClient`] 的视图。
+    /// Token 只存在于该视图引用中，不进入 HttpBangumiClient 本体。
+    pub fn bind<'a>(&'a self, token: &'a str) -> TokenBoundBangumiClient<'a> {
+        TokenBoundBangumiClient {
+            client: self,
+            token,
+        }
+    }
+
+    /// 统一请求入口：限流 → 注入 Bearer → 发送 → 状态码映射。
+    async fn send(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        token: Option<&str>,
+        body: Option<&Value>,
+    ) -> Result<reqwest::Response, BangumiApiError> {
+        // Phase 1 不做自动重试；429 直接返回 RateLimited{retry_after}，调用方决定退避。
+        let _permit = self
+            .limiter
+            .acquire()
+            .await
+            .map_err(|_| BangumiApiError::Network("Bangumi 并发信号量已关闭".into()))?;
+        let mut request = self
+            .client
+            .request(method.clone(), url)
+            .header(reqwest::header::ACCEPT, "application/json");
+        // Token 只在请求时经参数注入，客户端不持久化；该头绝不进入日志/错误。
+        if let Some(token) = token {
+            request = request.header(reqwest::header::AUTHORIZATION, bearer(token));
+        }
+        if let Some(body) = body {
+            request = request
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .json(body);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| map_request_error(&method, url, error))?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response);
+        }
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let text = response
+            .text()
+            .await
+            .map_err(|error| map_request_error(&method, url, error))?;
+        Err(from_status(status.as_u16(), &text, retry_after.as_deref()))
+    }
+
+    async fn send_json<T: DeserializeOwned>(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        token: Option<&str>,
+        body: Option<&Value>,
+    ) -> Result<T, BangumiApiError> {
+        let response = self.send(method.clone(), url, token, body).await?;
+        let text = response
+            .text()
+            .await
+            .map_err(|error| map_request_error(&method, url, error))?;
+        serde_json::from_str(&text)
+            .map_err(|error| BangumiApiError::Parse(format!("Bangumi 响应解析失败：{error}")))
+    }
+
+    async fn send_unit(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        token: &str,
+        body: &Value,
+    ) -> Result<(), BangumiApiError> {
+        // 官方写端点成功返回 204 无响应体。
+        self.send(method, url, Some(token), Some(body))
+            .await
+            .map(|_| ())
+    }
+
+    /// `GET {root}/calendar`。
+    ///
+    /// **唯一具有回落语义的方法**：主基址为反代（root ≠ 回落基址）时先请求反代
+    /// root；遇 Network/Timeout/ServerError(5xx) 再请求官方 root 一次；两次都失败
+    /// 才返回错误（优先返回反代错误）。主数据拉取的回落策略 Phase 2 另行设计，
+    /// 不得复用此处逻辑。
+    pub async fn get_calendar(&self) -> Result<Vec<BangumiCalendarDay>, BangumiApiError> {
+        if self.base.root == self.fallback.root {
+            return self.get_calendar_from(&calendar_url(&self.base)).await;
+        }
+        let primary_error = match self.get_calendar_from(&calendar_url(&self.base)).await {
+            Ok(days) => return Ok(days),
+            Err(error) => error,
+        };
+        // 只有网络层失败与 5xx 才回落官方一次；401/404/429 等直接透传。
+        match primary_error {
+            BangumiApiError::Network(_)
+            | BangumiApiError::Timeout
+            | BangumiApiError::ServerError(_) => {
+                self.get_calendar_from(&calendar_url(&self.fallback))
+                    .await
+                    .map_err(|_fallback_error| primary_error)
+            }
+            other => Err(other),
+        }
+    }
+
+    async fn get_calendar_from(
+        &self,
+        url: &str,
+    ) -> Result<Vec<BangumiCalendarDay>, BangumiApiError> {
+        self.send_json(reqwest::Method::GET, url, None, None).await
+    }
+
+    /// `GET {v0}/subjects?type=2&year=&month=&limit=&offset=`（公开端点）。
+    pub async fn get_season_subjects(
+        &self,
+        year: u32,
+        month: u32,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Paged<BangumiSubject>, BangumiApiError> {
+        let url = season_subjects_url(&self.base, year, month, limit, offset);
+        self.send_json(reqwest::Method::GET, &url, None, None).await
+    }
+
+    /// `GET {v0}/subjects/{id}`（公开端点）。
+    pub async fn get_subject_detail(
+        &self,
+        subject_id: i64,
+    ) -> Result<BangumiSubject, BangumiApiError> {
+        let url = subject_detail_url(&self.base, subject_id);
+        self.send_json(reqwest::Method::GET, &url, None, None).await
+    }
+
+    /// `GET {v0}/episodes?subject_id=&limit=&offset=`（公开端点；集数是 /v0/episodes）。
+    pub async fn get_subject_episodes(
+        &self,
+        subject_id: i64,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Paged<BangumiEpisode>, BangumiApiError> {
+        let url = subject_episodes_url(&self.base, subject_id, limit, offset);
+        self.send_json(reqwest::Method::GET, &url, None, None).await
+    }
+
+    /// `GET {v0}/subjects/{id}/characters`（公开端点）。
+    pub async fn get_subject_characters(
+        &self,
+        subject_id: i64,
+    ) -> Result<Vec<BangumiCharacter>, BangumiApiError> {
+        let url = subject_characters_url(&self.base, subject_id);
+        self.send_json(reqwest::Method::GET, &url, None, None).await
+    }
+
+    /// `GET {v0}/subjects/{id}/subjects`（公开端点）。
+    pub async fn get_subject_related(
+        &self,
+        subject_id: i64,
+    ) -> Result<Vec<BangumiRelatedSubject>, BangumiApiError> {
+        let url = subject_related_url(&self.base, subject_id);
+        self.send_json(reqwest::Method::GET, &url, None, None).await
+    }
+
+    /// `GET {v0}/me`（Bearer 认证）。
+    pub async fn get_user_profile(
+        &self,
+        token: &str,
+    ) -> Result<BangumiUserProfile, BangumiApiError> {
+        let url = me_url(&self.base);
+        self.send_json(reqwest::Method::GET, &url, Some(token), None)
+            .await
+    }
+
+    /// `GET {v0}/users/{username}/collections?subject_type=&limit=&offset=`（Bearer）。
+    pub async fn get_user_collections(
+        &self,
+        token: &str,
+        username: &str,
+        subject_type: u32,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Paged<BangumiCollection>, BangumiApiError> {
+        let url = user_collections_url(&self.base, username, subject_type, limit, offset);
+        self.send_json(reqwest::Method::GET, &url, Some(token), None)
+            .await
+    }
+
+    /// `GET {v0}/users/{username}/collections/{subject_id}`（Bearer；复数 collections）。
+    pub async fn get_user_collection(
+        &self,
+        token: &str,
+        username: &str,
+        subject_id: i64,
+    ) -> Result<BangumiCollection, BangumiApiError> {
+        let url = user_collection_url(&self.base, username, subject_id);
+        self.send_json(reqwest::Method::GET, &url, Some(token), None)
+            .await
+    }
+
+    /// `POST|PATCH {v0}/users/-/collections/{subject_id}`（Bearer）。
+    /// `create=true`（无收藏记录）→ POST；否则 PATCH。官方以 `-` 占位当前 token 用户。
+    pub async fn update_collection(
+        &self,
+        token: &str,
+        subject_id: i64,
+        payload: &Value,
+        create: bool,
+    ) -> Result<(), BangumiApiError> {
+        let url = update_collection_url(&self.base, subject_id);
+        let method = if create {
+            reqwest::Method::POST
+        } else {
+            reqwest::Method::PATCH
+        };
+        self.send_unit(method, &url, token, payload).await
+    }
+
+    /// `PUT {v0}/users/-/collections/-/episodes/{episode_id}`，body `{"type": N}`（Bearer）。
+    pub async fn update_episode_progress(
+        &self,
+        token: &str,
+        episode_id: i64,
+        collection_type: EpisodeCollectionType,
+    ) -> Result<(), BangumiApiError> {
+        let url = episode_progress_url(&self.base, episode_id);
+        let body = serde_json::json!({"type": collection_type.as_u32()});
+        self.send_unit(reqwest::Method::PUT, &url, token, &body).await
+    }
+
+    /// `PATCH {v0}/users/-/collections/{subject_id}/episodes`，
+    /// body `{"episode_id": [...], "type": N}`（Bearer）。
+    pub async fn update_episode_progress_batch(
+        &self,
+        token: &str,
+        subject_id: i64,
+        episode_ids: &[i64],
+        collection_type: EpisodeCollectionType,
+    ) -> Result<(), BangumiApiError> {
+        let url = episode_progress_batch_url(&self.base, subject_id);
+        let body = serde_json::json!({"episode_id": episode_ids, "type": collection_type.as_u32()});
+        self.send_unit(reqwest::Method::PATCH, &url, token, &body)
+            .await
+    }
+
+    /// 连通性测试（等价 `GET {v0}/me`，Bearer 认证）。
+    pub async fn test_connection(
+        &self,
+        token: &str,
+    ) -> Result<BangumiUserProfile, BangumiApiError> {
+        self.get_user_profile(token).await
+    }
+}
+
+/// reqwest 错误 → [`BangumiApiError`]。信息只含方法与 URL 路径（不含 query），
+/// 绝不包含 Authorization 头或 Token。
+fn map_request_error(method: &reqwest::Method, url: &str, error: reqwest::Error) -> BangumiApiError {
+    if error.is_timeout() {
+        return BangumiApiError::Timeout;
+    }
+    let path = url.split('?').next().unwrap_or(url);
+    let detail = if error.is_connect() {
+        "连接失败"
+    } else {
+        "请求失败"
+    };
+    BangumiApiError::Network(format!("HTTP {method} {path}：{detail}"))
+}
+
+/// Token 绑定视图：[`HttpBangumiClient::bind`] 的返回值，实现完整 [`BangumiClient`]。
+/// Token 以引用持有，不复制、不持久化。
+pub struct TokenBoundBangumiClient<'a> {
+    client: &'a HttpBangumiClient,
+    token: &'a str,
+}
+
+impl BangumiClient for TokenBoundBangumiClient<'_> {
+    async fn get_calendar(&self) -> Result<Vec<BangumiCalendarDay>, BangumiApiError> {
+        self.client.get_calendar().await
+    }
+
+    async fn get_season_subjects(
+        &self,
+        year: u32,
+        month: u32,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Paged<BangumiSubject>, BangumiApiError> {
+        self.client
+            .get_season_subjects(year, month, limit, offset)
+            .await
+    }
+
+    async fn get_subject_detail(
+        &self,
+        subject_id: i64,
+    ) -> Result<BangumiSubject, BangumiApiError> {
+        self.client.get_subject_detail(subject_id).await
+    }
+
+    async fn get_subject_episodes(
+        &self,
+        subject_id: i64,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Paged<BangumiEpisode>, BangumiApiError> {
+        self.client.get_subject_episodes(subject_id, limit, offset).await
+    }
+
+    async fn get_subject_characters(
+        &self,
+        subject_id: i64,
+    ) -> Result<Vec<BangumiCharacter>, BangumiApiError> {
+        self.client.get_subject_characters(subject_id).await
+    }
+
+    async fn get_subject_related(
+        &self,
+        subject_id: i64,
+    ) -> Result<Vec<BangumiRelatedSubject>, BangumiApiError> {
+        self.client.get_subject_related(subject_id).await
+    }
+
+    async fn get_user_profile(&self) -> Result<BangumiUserProfile, BangumiApiError> {
+        self.client.get_user_profile(self.token).await
+    }
+
+    async fn get_user_collections(
+        &self,
+        username: &str,
+        subject_type: u32,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Paged<BangumiCollection>, BangumiApiError> {
+        self.client
+            .get_user_collections(self.token, username, subject_type, limit, offset)
+            .await
+    }
+
+    async fn get_user_collection(
+        &self,
+        username: &str,
+        subject_id: i64,
+    ) -> Result<BangumiCollection, BangumiApiError> {
+        self.client
+            .get_user_collection(self.token, username, subject_id)
+            .await
+    }
+
+    async fn update_collection(
+        &self,
+        subject_id: i64,
+        payload: &Value,
+    ) -> Result<(), BangumiApiError> {
+        // 绑定视图默认 PATCH（更新语义）；Phase 3 由业务层先查记录再决定
+        // POST（无记录）/ PATCH，通过 HttpBangumiClient::update_collection 的
+        // create 参数表达。
+        self.client
+            .update_collection(self.token, subject_id, payload, false)
+            .await
+    }
+
+    async fn update_episode_progress(
+        &self,
+        episode_id: i64,
+        collection_type: EpisodeCollectionType,
+    ) -> Result<(), BangumiApiError> {
+        self.client
+            .update_episode_progress(self.token, episode_id, collection_type)
+            .await
+    }
+
+    async fn update_episode_progress_batch(
+        &self,
+        subject_id: i64,
+        episode_ids: &[i64],
+        collection_type: EpisodeCollectionType,
+    ) -> Result<(), BangumiApiError> {
+        self.client
+            .update_episode_progress_batch(self.token, subject_id, episode_ids, collection_type)
+            .await
+    }
+
+    async fn test_connection(&self) -> Result<BangumiUserProfile, BangumiApiError> {
+        self.client.get_user_profile(self.token).await
+    }
+}
+
+/// [`BangumiUserProfile`] → 前端 camelCase JSON（命令 `bangumi_get_user_profile`）。
+pub fn bangumi_profile_json(profile: &BangumiUserProfile) -> Value {
+    serde_json::json!({
+        "id": profile.id,
+        "username": profile.username,
+        "nickname": profile.nickname,
+        "avatar": profile.avatar.as_ref().map(|avatar| {
+            serde_json::json!({
+                "large": avatar.large,
+                "medium": avatar.medium,
+                "small": avatar.small,
+            })
+        }),
+        "sign": profile.sign,
+        "userGroup": profile.user_group,
+    })
+}
+
+/// [`BangumiCollection`] → 前端 camelCase JSON（命令 `bangumi_get_user_collections`）。
+/// 注意 `type`（收藏状态枚举）键名保持 `type` 不变。
+pub fn bangumi_collection_json(collection: &BangumiCollection) -> Value {
+    serde_json::json!({
+        "subjectId": collection.subject_id,
+        "subjectType": collection.subject_type,
+        "rate": collection.rate,
+        "type": collection.collection_type,
+        "tags": collection.tags,
+        "epStatus": collection.ep_status,
+        "volStatus": collection.vol_status,
+        "updatedAt": collection.updated_at,
+        "private": collection.private,
+        "comment": collection.comment,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // 测试（cfg(test)）；整个模块仅在 standard feature 下编译，
 // 因此这些测试只进 standard 门禁。
 // ---------------------------------------------------------------------------
+
+/// 本地 mock HTTP server（std TcpListener + 手写最小响应，不引新依赖）。
+/// 供本模块与 lib.rs 的 Phase 1 命令测试共用；每次连接一个线程，
+/// handler 为纯同步闭包 `(method, target, headers, body) -> (status, headers, body)`。
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::collections::HashMap;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{SocketAddr, TcpListener};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    /// 一次被捕获的请求（header 名为小写）。
+    #[derive(Debug, Clone)]
+    pub struct RequestRecord {
+        pub method: String,
+        pub target: String,
+        pub headers: HashMap<String, String>,
+        pub body: String,
+    }
+
+    pub type MockHandler = Arc<
+        dyn Fn(&str, &str, &HashMap<String, String>, &str) -> (u16, Vec<(String, String)>, String)
+            + Send
+            + Sync,
+    >;
+
+    pub struct MockBangumiServer {
+        addr: SocketAddr,
+        requests: Arc<Mutex<Vec<RequestRecord>>>,
+    }
+
+    impl MockBangumiServer {
+        pub fn spawn(handler: MockHandler) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+            let addr = listener.local_addr().expect("mock server addr");
+            let requests: Arc<Mutex<Vec<RequestRecord>>> = Arc::new(Mutex::new(Vec::new()));
+            let captured = requests.clone();
+            thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(stream) = stream else { continue };
+                    let handler = handler.clone();
+                    let captured = captured.clone();
+                    thread::spawn(move || {
+                        handle_connection(stream, &handler, &captured);
+                    });
+                }
+            });
+            Self { addr, requests }
+        }
+
+        pub fn url(&self) -> String {
+            format!("http://{}", self.addr)
+        }
+
+        pub fn requests(&self) -> Vec<RequestRecord> {
+            self.requests
+                .lock()
+                .expect("mock server request log")
+                .clone()
+        }
+    }
+
+    fn handle_connection(stream: std::net::TcpStream, handler: &MockHandler, captured: &Mutex<Vec<RequestRecord>>) {
+        let mut reader = BufReader::new(match stream.try_clone() {
+            Ok(reader) => reader,
+            Err(_) => return,
+        });
+        let mut request_line = String::new();
+        if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
+            return;
+        }
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap_or_default().to_string();
+        let target = parts.next().unwrap_or_default().to_string();
+        let mut headers = HashMap::new();
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                break;
+            }
+            let trimmed = line.trim_end();
+            if trimmed.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = trimmed.split_once(':') {
+                headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+            }
+        }
+        let length: usize = headers
+            .get("content-length")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        let mut body = vec![0u8; length];
+        if length > 0 {
+            reader.read_exact(&mut body).ok();
+        }
+        let body = String::from_utf8_lossy(&body).to_string();
+        captured
+            .lock()
+            .expect("mock server request log")
+            .push(RequestRecord {
+                method: method.clone(),
+                target: target.clone(),
+                headers: headers.clone(),
+                body: body.clone(),
+            });
+        let (status, extra_headers, response_body) = handler(&method, &target, &headers, &body);
+        let reason = match status {
+            200 => "OK",
+            204 => "No Content",
+            401 => "Unauthorized",
+            404 => "Not Found",
+            429 => "Too Many Requests",
+            500 => "Internal Server Error",
+            502 => "Bad Gateway",
+            _ => "Response",
+        };
+        let mut response = format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+            response_body.len()
+        );
+        for (name, value) in extra_headers {
+            response.push_str(&format!("{name}: {value}\r\n"));
+        }
+        response.push_str("\r\n");
+        response.push_str(&response_body);
+        let mut stream = stream;
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -2028,5 +2662,361 @@ mod tests {
         ] {
             assert!(matches!(error, TokenStoreError::Platform(_)));
         }
+    }
+
+    // -- 9. HttpBangumiClient（Phase 1，本地 mock HTTP server）------------------
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// HTTP 测试用 tokio current-thread runtime（reqwest 需要 tokio reactor）。
+    fn http_block_on<F: Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio test runtime")
+            .block_on(future)
+    }
+
+    fn mock_base(url: &str) -> BangumiBaseUrls {
+        BangumiBaseUrls {
+            root: url.to_string(),
+            v0: format!("{url}/v0"),
+        }
+    }
+
+    #[test]
+    fn bearer_prefixes_token_without_trimming() {
+        assert_eq!(bearer("abc"), "Bearer abc");
+        assert_eq!(bearer(" a b "), "Bearer  a b ");
+    }
+
+    #[test]
+    fn http_client_sends_bearer_header_and_parses_me_fixture() {
+        let body = include_str!("../fixtures/bangumi/user-profile.json").to_string();
+        let server = test_support::MockBangumiServer::spawn(std::sync::Arc::new(
+            move |method, target, headers, _request_body| {
+                assert_eq!(method, "GET");
+                assert_eq!(target, "/v0/me");
+                // Authorization 头必须被发送且形如 "Bearer xxx"。
+                assert_eq!(
+                    headers.get("authorization").map(String::as_str),
+                    Some("Bearer roundtrip-token-abc")
+                );
+                // UA 与 lib.rs AniList client 一致。
+                assert!(
+                    headers
+                        .get("user-agent")
+                        .map(String::as_str)
+                        .unwrap_or_default()
+                        .starts_with("AniLog Tauri/")
+                );
+                (200, vec![], body.clone())
+            },
+        ));
+        let client = HttpBangumiClient::with_base(mock_base(&server.url())).unwrap();
+        let profile = http_block_on(client.get_user_profile("roundtrip-token-abc")).unwrap();
+        assert_eq!(profile.username, "anilog_dev");
+        assert_eq!(profile.nickname, "阿罗");
+        assert_eq!(profile.user_group, Some(10));
+        // Token 不被客户端持久化：再次请求仍需显式传入。
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    #[test]
+    fn http_client_maps_401_to_unauthorized() {
+        let body = include_str!("../fixtures/bangumi/error-401.json").to_string();
+        let server = test_support::MockBangumiServer::spawn(std::sync::Arc::new(
+            move |_method, _target, _headers, _request_body| (401, vec![], body.clone()),
+        ));
+        let client = HttpBangumiClient::with_base(mock_base(&server.url())).unwrap();
+        let error = http_block_on(client.get_user_profile("stale-token")).unwrap_err();
+        assert!(matches!(error, BangumiApiError::Unauthorized { .. }));
+        assert!(error.to_string().contains("Unauthorized"));
+    }
+
+    #[test]
+    fn http_client_maps_429_with_retry_after_to_rate_limited() {
+        let body = include_str!("../fixtures/bangumi/error-429.json").to_string();
+        let server = test_support::MockBangumiServer::spawn(std::sync::Arc::new(
+            move |_method, _target, _headers, _request_body| {
+                (
+                    429,
+                    vec![("Retry-After".to_string(), "120".to_string())],
+                    body.clone(),
+                )
+            },
+        ));
+        let client = HttpBangumiClient::with_base(mock_base(&server.url())).unwrap();
+        let error = http_block_on(client.get_user_profile("throttled-token")).unwrap_err();
+        match error {
+            BangumiApiError::RateLimited { retry_after, .. } => {
+                assert_eq!(retry_after, Some(StdDuration::from_secs(120)));
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn http_client_parses_collections_paged_envelope() {
+        let body = include_str!("../fixtures/bangumi/user-collections-page.json").to_string();
+        let server = test_support::MockBangumiServer::spawn(std::sync::Arc::new(
+            move |_method, target, headers, _request_body| {
+                assert!(target.starts_with("/v0/users/anilog_dev/collections?"));
+                assert!(target.contains("subject_type=2"));
+                assert!(
+                    headers
+                        .get("authorization")
+                        .map(String::as_str)
+                        .unwrap_or_default()
+                        .starts_with("Bearer ")
+                );
+                (200, vec![], body.clone())
+            },
+        ));
+        let client = HttpBangumiClient::with_base(mock_base(&server.url())).unwrap();
+        let page = http_block_on(
+            client.get_user_collections(
+                "collections-token",
+                "anilog_dev",
+                SUBJECT_TYPE_ANIME,
+                30,
+                0,
+            ),
+        )
+        .unwrap();
+        assert_eq!(page.total, 2);
+        assert_eq!(page.limit, 30);
+        assert_eq!(page.data.len(), 2);
+        assert_eq!(page.data[0].subject_id, 45678);
+        assert_eq!(page.data[0].collection_type, SubjectCollectionType::Doing.as_u32());
+        assert_eq!(page.data[1].collection_type, SubjectCollectionType::Dropped.as_u32());
+        // camelCase 前端投影。
+        let item = bangumi_collection_json(&page.data[0]);
+        assert_eq!(item["subjectId"], 45678);
+        assert_eq!(item["type"], 3);
+        assert_eq!(item["epStatus"], 3);
+        assert_eq!(item["subjectType"], 2);
+    }
+
+    #[test]
+    fn http_client_parses_me_profile_to_camel_case_json() {
+        let body = include_str!("../fixtures/bangumi/user-profile.json").to_string();
+        let server = test_support::MockBangumiServer::spawn(std::sync::Arc::new(
+            move |_method, _target, _headers, _request_body| (200, vec![], body.clone()),
+        ));
+        let client = HttpBangumiClient::with_base(mock_base(&server.url())).unwrap();
+        let profile = http_block_on(client.get_user_profile("profile-token")).unwrap();
+        let value = bangumi_profile_json(&profile);
+        assert_eq!(value["id"], 876543);
+        assert_eq!(value["username"], "anilog_dev");
+        assert_eq!(value["nickname"], "阿罗");
+        assert_eq!(value["userGroup"], 10);
+        assert!(value["avatar"]["large"].is_string());
+    }
+
+    #[test]
+    fn http_client_calendar_falls_back_from_proxy_to_official() {
+        // 反代 /calendar 返回 500（ServerError）→ 回落官方一次成功。
+        let proxy = test_support::MockBangumiServer::spawn(std::sync::Arc::new(
+            |_method, target, _headers, _request_body| {
+                assert_eq!(target, "/calendar");
+                (500, vec![], "proxy boom".into())
+            },
+        ));
+        let calendar = include_str!("../fixtures/bangumi/calendar.json").to_string();
+        let official = test_support::MockBangumiServer::spawn(std::sync::Arc::new(
+            move |_method, target, _headers, _request_body| {
+                assert_eq!(target, "/calendar");
+                (200, vec![], calendar.clone())
+            },
+        ));
+        let client = HttpBangumiClient::with_fallback(
+            reqwest::Client::new(),
+            mock_base(&proxy.url()),
+            mock_base(&official.url()),
+        );
+        let days = http_block_on(client.get_calendar()).unwrap();
+        assert_eq!(days.len(), 2);
+        assert_eq!(proxy.requests().len(), 1);
+        assert_eq!(official.requests().len(), 1);
+
+        // 4xx（404）不回落，直接透传。
+        let proxy = test_support::MockBangumiServer::spawn(std::sync::Arc::new(
+            |_method, _target, _headers, _request_body| (404, vec![], "{}".into()),
+        ));
+        let official = test_support::MockBangumiServer::spawn(std::sync::Arc::new(
+            |_method, _target, _headers, _request_body| (200, vec![], "[]".into()),
+        ));
+        let client = HttpBangumiClient::with_fallback(
+            reqwest::Client::new(),
+            mock_base(&proxy.url()),
+            mock_base(&official.url()),
+        );
+        let error = http_block_on(client.get_calendar()).unwrap_err();
+        assert!(matches!(error, BangumiApiError::NotFound { .. }));
+        assert_eq!(proxy.requests().len(), 1);
+        assert_eq!(official.requests().len(), 0);
+
+        // 两次都失败：优先返回反代（主路径）错误。
+        let proxy = test_support::MockBangumiServer::spawn(std::sync::Arc::new(
+            |_method, _target, _headers, _request_body| (502, vec![], "proxy down".into()),
+        ));
+        let official = test_support::MockBangumiServer::spawn(std::sync::Arc::new(
+            |_method, _target, _headers, _request_body| (500, vec![], "official down".into()),
+        ));
+        let client = HttpBangumiClient::with_fallback(
+            reqwest::Client::new(),
+            mock_base(&proxy.url()),
+            mock_base(&official.url()),
+        );
+        let error = http_block_on(client.get_calendar()).unwrap_err();
+        assert_eq!(error, BangumiApiError::ServerError(502));
+        assert_eq!(proxy.requests().len(), 1);
+        assert_eq!(official.requests().len(), 1);
+
+        // 官方基址（base == fallback）只请求一次，无回落。
+        let official = test_support::MockBangumiServer::spawn(std::sync::Arc::new(
+            |_method, _target, _headers, _request_body| (200, vec![], "[]".into()),
+        ));
+        let base = mock_base(&official.url());
+        let client = HttpBangumiClient::with_fallback(
+            reqwest::Client::new(),
+            base.clone(),
+            base,
+        );
+        assert!(http_block_on(client.get_calendar()).is_ok());
+        assert_eq!(official.requests().len(), 1);
+    }
+
+    #[test]
+    fn http_client_write_paths_send_official_bodies() {
+        let server = test_support::MockBangumiServer::spawn(std::sync::Arc::new(
+            |method, target, _headers, request_body| {
+                let payload: Value = serde_json::from_str(request_body).expect("json body");
+                match (method, target) {
+                    ("POST", "/v0/users/-/collections/45678") => {
+                        assert_eq!(payload["type"], 3);
+                    }
+                    ("PATCH", "/v0/users/-/collections/45678") => {
+                        assert_eq!(payload["rate"], 8);
+                    }
+                    ("PUT", "/v0/users/-/collections/-/episodes/98765") => {
+                        assert_eq!(payload["type"], 2);
+                    }
+                    ("PATCH", "/v0/users/-/collections/45678/episodes") => {
+                        assert_eq!(payload["episode_id"], serde_json::json!([98765, 98766]));
+                        assert_eq!(payload["type"], 2);
+                    }
+                    other => panic!("unexpected request {other:?}"),
+                }
+                (204, vec![], String::new())
+            },
+        ));
+        let client = HttpBangumiClient::with_base(mock_base(&server.url())).unwrap();
+        http_block_on(async {
+            client
+                .update_collection("write-token", 45678, &serde_json::json!({"type": 3}), true)
+                .await
+                .unwrap();
+            client
+                .update_collection("write-token", 45678, &serde_json::json!({"rate": 8}), false)
+                .await
+                .unwrap();
+            client
+                .update_episode_progress("write-token", 98765, EpisodeCollectionType::Watched)
+                .await
+                .unwrap();
+            client
+                .update_episode_progress_batch(
+                    "write-token",
+                    45678,
+                    &[98765, 98766],
+                    EpisodeCollectionType::Watched,
+                )
+                .await
+                .unwrap();
+        });
+        assert_eq!(server.requests().len(), 4);
+    }
+
+    #[test]
+    fn http_client_error_paths_never_leak_token_material() {
+        const TOKEN: &str = "super-secret-bangumi-token-42";
+        let assert_clean = |rendered: &str| {
+            assert!(!rendered.contains("Bearer"), "leaks Bearer: {rendered}");
+            assert!(!rendered.contains("token"), "leaks token: {rendered}");
+            assert!(!rendered.contains("Authorization"), "leaks header: {rendered}");
+            assert!(!rendered.contains(TOKEN), "leaks token value: {rendered}");
+        };
+
+        // 401 错误路径。
+        let body = include_str!("../fixtures/bangumi/error-401.json").to_string();
+        let server = test_support::MockBangumiServer::spawn(std::sync::Arc::new(
+            move |_method, _target, _headers, _request_body| (401, vec![], body.clone()),
+        ));
+        let client = HttpBangumiClient::with_base(mock_base(&server.url())).unwrap();
+        let error = http_block_on(client.get_user_profile(TOKEN)).unwrap_err();
+        assert_clean(&error.to_string());
+        assert_clean(&format!("{error:?}"));
+
+        // 429 错误路径（含 Retry-After）。
+        let body = include_str!("../fixtures/bangumi/error-429.json").to_string();
+        let server = test_support::MockBangumiServer::spawn(std::sync::Arc::new(
+            move |_method, _target, _headers, _request_body| {
+                (
+                    429,
+                    vec![("Retry-After".to_string(), "30".to_string())],
+                    body.clone(),
+                )
+            },
+        ));
+        let client = HttpBangumiClient::with_base(mock_base(&server.url())).unwrap();
+        let error = http_block_on(client.test_connection(TOKEN)).unwrap_err();
+        assert_clean(&error.to_string());
+        assert_clean(&format!("{error:?}"));
+
+        // 网络层错误路径（连接被拒绝端口）。
+        let base = mock_base("http://127.0.0.1:9");
+        let client = HttpBangumiClient::with_base(base).unwrap();
+        let error = http_block_on(client.get_user_profile(TOKEN)).unwrap_err();
+        assert!(matches!(error, BangumiApiError::Network(_)));
+        assert_clean(&error.to_string());
+        assert_clean(&format!("{error:?}"));
+    }
+
+    #[test]
+    fn http_client_limits_global_concurrency_to_two() {
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let body = include_str!("../fixtures/bangumi/user-profile.json").to_string();
+        let server = test_support::MockBangumiServer::spawn({
+            let in_flight = in_flight.clone();
+            let max_in_flight = max_in_flight.clone();
+            std::sync::Arc::new(move |_method, _target, _headers, _request_body| {
+                let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                max_in_flight.fetch_max(current, Ordering::SeqCst);
+                std::thread::sleep(StdDuration::from_millis(80));
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                (200, vec![], body.clone())
+            })
+        });
+        let client = Arc::new(HttpBangumiClient::with_base(mock_base(&server.url())).unwrap());
+        http_block_on(async {
+            let mut handles = Vec::new();
+            for _ in 0..4 {
+                let client = client.clone();
+                handles.push(tokio::spawn(async move {
+                    client.get_user_profile("concurrent-token").await
+                }));
+            }
+            for handle in handles {
+                handle.await.unwrap().unwrap();
+            }
+        });
+        assert_eq!(server.requests().len(), 4);
+        assert!(
+            max_in_flight.load(Ordering::SeqCst) <= HTTP_CLIENT_CONCURRENCY,
+            "global concurrency must stay within the semaphore limit"
+        );
     }
 }

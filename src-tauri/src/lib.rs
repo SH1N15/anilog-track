@@ -75,6 +75,15 @@ pub struct AppContext {
     bangumi_lookup_lock: Arc<tokio::sync::Mutex<()>>,
     bangumi_unavailable_until: Arc<AtomicI64>,
     offline_bangumi: Arc<Value>,
+    /// Bangumi Token 存储契约（schema §8）：Windows → KeyringTokenStore；
+    /// Android → mobile 桥（Keystore）；其他平台 → UnsupportedTokenStore。
+    /// AppContext derive Clone，Arc 克隆零成本。
+    #[cfg(feature = "standard")]
+    bangumi_tokens: Arc<dyn bangumi::BangumiTokenStore + Send + Sync>,
+    /// /v0/me → username 的进程内缓存（bangumi_get_user_collections 使用；
+    /// disconnect 时清空）。
+    #[cfg(feature = "standard")]
+    bangumi_username_cache: Arc<Mutex<Option<String>>>,
 }
 
 fn now_seconds() -> i64 {
@@ -317,6 +326,10 @@ fn load_context(app: &AppHandle, original: bool) -> anyhow::Result<AppContext> {
             serde_json::from_str(include_str!(concat!(env!("OUT_DIR"), "/bangumi-map.json")))
                 .unwrap_or_else(|_| json!({})),
         ),
+        #[cfg(feature = "standard")]
+        bangumi_tokens: bangumi_token_store(app),
+        #[cfg(feature = "standard")]
+        bangumi_username_cache: Arc::new(Mutex::new(None)),
     };
     #[cfg(not(target_os = "android"))]
     if let Err(error) = migrate_legacy_webdav_config(&context) {
@@ -324,6 +337,63 @@ fn load_context(app: &AppHandle, original: bool) -> anyhow::Result<AppContext> {
     }
     context.save_state()?;
     Ok(context)
+}
+
+/// 按平台选择 Bangumi Token 存储实现（schema §8）：
+/// Windows → Credential Manager（KeyringTokenStore）；Android → mobile 桥
+/// （Keystore，决策 12：桥只做凭据存取，不发起任何 Bangumi 请求）；
+/// 其他平台 → UnsupportedTokenStore。
+#[cfg(feature = "standard")]
+fn bangumi_token_store(app: &AppHandle) -> Arc<dyn bangumi::BangumiTokenStore + Send + Sync> {
+    let _ = app;
+    #[cfg(target_os = "android")]
+    {
+        let bridge = app.state::<mobile::MobileBridge>().inner().clone();
+        return Arc::new(mobile::MobileBangumiTokenStore::new(bridge));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return Arc::new(bangumi::KeyringTokenStore::default());
+    }
+    #[cfg(not(any(target_os = "android", target_os = "windows")))]
+    {
+        Arc::new(bangumi::UnsupportedTokenStore)
+    }
+}
+
+/// 主客户端基址解析（决策 11）：读顶层 `bangumi.apiBaseUrl`，为空回落
+/// `settings.bangumiApiBaseUrl`，再为空用官方 `https://api.bgm.tv`。
+#[cfg(feature = "standard")]
+fn bangumi_base_urls(state: &Value) -> bangumi::BangumiBaseUrls {
+    let from_block = value_string(state.get("bangumi").and_then(|block| block.get("apiBaseUrl")));
+    let configured = if from_block.trim().is_empty() {
+        value_string(state["settings"].get("bangumiApiBaseUrl"))
+    } else {
+        from_block
+    };
+    bangumi::resolve_base_urls(&configured)
+}
+
+/// 决策 11 的正向同步：把 `settings.bangumiApiBaseUrl` 的当前值镜像到顶层
+/// `bangumi.apiBaseUrl`（update_settings 编辑旧字段时调用；
+/// `bangumi_set_api_base_url` 命令则负责反向入口，两处同写）。
+#[cfg(feature = "standard")]
+fn sync_bangumi_api_base_url_into_block(state: &mut Value) {
+    let url = value_string(state["settings"].get("bangumiApiBaseUrl"));
+    if let Some(block) = state.get_mut("bangumi").and_then(Value::as_object_mut) {
+        block.insert("apiBaseUrl".into(), json!(url));
+    }
+}
+
+/// Original 版 `bangumi_auth_status` 的统一拒绝返回（双 edition 编译，
+/// original 下 6 个 bangumi 命令运行即走拒绝路径；永不回传 Token 本体）。
+fn bangumi_auth_status_rejected() -> Value {
+    json!({"supported": false, "hasToken": false, "apiBaseUrl": ""})
+}
+
+/// Original 版其余 bangumi 命令的统一拒绝返回（固定文案，前端 i18n 按此映射）。
+fn bangumi_command_rejected() -> Value {
+    json!({"ok": false, "message": "Original 版不支持 Bangumi"})
 }
 
 impl AppContext {
@@ -1025,6 +1095,13 @@ fn update_settings(
                 target.insert("dailyTaskReminderTime".into(), json!("20:00"));
             }
         }
+        // 决策 11：standard 版用户编辑 settings.bangumiApiBaseUrl 时，同步写入
+        // 顶层 bangumi.apiBaseUrl，保持两处一致（original 不写 bangumi 块，
+        // 行为不变：仍然拒绝 bangumiApiBaseUrl 写入并强制为空）。
+        #[cfg(feature = "standard")]
+        if !context.original && patch.contains_key("bangumiApiBaseUrl") {
+            sync_bangumi_api_base_url_into_block(&mut state);
+        }
         if context.original && patch.contains_key("titlePreference") {
             refresh_original_followed_titles(&mut state);
         }
@@ -1703,6 +1780,425 @@ async fn test_bangumi_connection(
     match bangumi_search(&context, &endpoint, "CLANNAD").await {
         Ok(_) => Ok(json!({"ok": true, "message": "Bangumi 连接成功", "baseUrl": endpoint})),
         Err(error) => Ok(json!({"ok": false, "message": error.to_string(), "baseUrl": endpoint})),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1 Bangumi 命令（Token + 连接 + 只读）。命令契约（前端按此对接）：
+// - bangumi_auth_status() -> { supported, hasToken, apiBaseUrl }（永不回传 Token 本体）
+// - bangumi_save_token({ token }) -> { ok, message }
+// - bangumi_disconnect() -> { ok, message }
+// - bangumi_test_connection({ baseUrl? }) -> { ok, message, username, nickname }
+// - bangumi_get_user_profile() -> 用户 camelCase JSON | null
+// - bangumi_get_user_collections({ offset?, limit? }) -> { total, items }
+// - bangumi_set_api_base_url({ baseUrl }) -> public_state（决策 11 双向同步的另一入口）
+// Original edition 下全部编译且运行即拒绝（固定文案 "Original 版不支持 Bangumi"）。
+// 命令逻辑抽在 bangumi_commands 模块的内部函数中，测试以 MemoryTokenStore +
+// mock server 直接调用，不依赖真实 keyring。
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "standard")]
+mod bangumi_commands {
+    use super::{AppContext, value_string};
+    use crate::bangumi::{
+        BangumiApiError, BangumiTokenStore, HttpBangumiClient, TokenStoreError,
+        SUBJECT_TYPE_ANIME, bangumi_collection_json, bangumi_profile_json,
+    };
+    use serde_json::{Value, json};
+    use std::sync::Mutex;
+
+    /// 当前平台是否接入了安全凭据存储（Windows keyring / Android 桥）。
+    pub(super) fn token_store_supported() -> bool {
+        cfg!(any(target_os = "windows", target_os = "android"))
+    }
+
+    /// TokenStore 错误 → 用户文案。Android 桥失败与不支持平台使用固定文案
+    /// （前端 i18n 按此映射）；Windows Credential Manager 的平台错误不含
+    /// Token，可透传排障。
+    pub(super) fn store_error_message(error: &TokenStoreError) -> String {
+        if cfg!(target_os = "android") {
+            "Bangumi 安全存储不可用".into()
+        } else if !token_store_supported() {
+            "当前平台不支持 Bangumi Token 存储".into()
+        } else {
+            format!("Bangumi Token 存储失败：{error}")
+        }
+    }
+
+    /// BangumiApiError → 用户文案：401 与网络层失败使用固定文案，
+    /// 其余错误直接使用 Display（不含任何 Token 材料，由 bangumi.rs 测试锁定）。
+    pub(super) fn request_error_message(error: BangumiApiError) -> String {
+        match error {
+            BangumiApiError::Unauthorized { .. } => "Bangumi 授权失败，Token 可能已失效".into(),
+            BangumiApiError::Network(_) | BangumiApiError::Timeout => {
+                "无法连接 Bangumi 服务".into()
+            }
+            other => other.to_string(),
+        }
+    }
+
+    fn profile_error_payload(message: &str) -> Value {
+        json!({"ok": false, "message": message, "username": Value::Null, "nickname": Value::Null})
+    }
+
+    fn collections_error_payload(message: &str) -> Value {
+        json!({"ok": false, "message": message, "total": 0, "items": []})
+    }
+
+    /// `bangumi_auth_status`：supported / hasToken / apiBaseUrl。
+    pub(super) fn auth_status(state: &Value, tokens: &dyn BangumiTokenStore) -> Value {
+        let supported = token_store_supported();
+        let has_token = supported
+            && tokens
+                .load()
+                .ok()
+                .flatten()
+                .is_some_and(|token| !token.trim().is_empty());
+        // apiBaseUrl 展示值与 bangumi_base_urls 的读取顺序一致（决策 11）。
+        let from_block = value_string(state.get("bangumi").and_then(|block| block.get("apiBaseUrl")));
+        let api_base_url = if from_block.trim().is_empty() {
+            value_string(state["settings"].get("bangumiApiBaseUrl"))
+        } else {
+            from_block
+        };
+        json!({"supported": supported, "hasToken": has_token, "apiBaseUrl": api_base_url})
+    }
+
+    /// `bangumi_save_token`：trim 后为空 → "Token 不能为空"；成功不回显 Token。
+    pub(super) fn save_token(tokens: &dyn BangumiTokenStore, token: &str) -> Value {
+        if !token_store_supported() {
+            return json!({"ok": false, "message": "当前平台不支持 Bangumi Token 存储"});
+        }
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            return json!({"ok": false, "message": "Token 不能为空"});
+        }
+        match tokens.store(trimmed) {
+            Ok(()) => json!({"ok": true, "message": "Bangumi Token 已保存"}),
+            Err(error) => json!({"ok": false, "message": store_error_message(&error)}),
+        }
+    }
+
+    /// `bangumi_disconnect`：清除 Token 并清空 username 缓存。
+    pub(super) fn disconnect(tokens: &dyn BangumiTokenStore, username_cache: &Mutex<Option<String>>) -> Value {
+        if !token_store_supported() {
+            return json!({"ok": false, "message": "当前平台不支持 Bangumi Token 存储"});
+        }
+        if let Ok(mut cache) = username_cache.lock() {
+            *cache = None;
+        }
+        match tokens.clear() {
+            Ok(()) => json!({"ok": true, "message": "已断开 Bangumi 连接"}),
+            Err(error) => json!({"ok": false, "message": store_error_message(&error)}),
+        }
+    }
+
+    /// 读取 Token；错误时返回固定文案载荷。
+    fn load_token(tokens: &dyn BangumiTokenStore) -> Result<String, Value> {
+        match tokens.load() {
+            Ok(Some(token)) if !token.trim().is_empty() => Ok(token),
+            Ok(_) => Err(json!({"ok": false, "message": "尚未保存 Bangumi Token"})),
+            Err(error) => Err(json!({"ok": false, "message": store_error_message(&error)})),
+        }
+    }
+
+    /// `bangumi_test_connection`：有 Token 时 `GET /v0/me`。
+    pub(super) async fn test_connection(
+        tokens: &dyn BangumiTokenStore,
+        client: &HttpBangumiClient,
+        username_cache: &Mutex<Option<String>>,
+    ) -> Value {
+        let token = match load_token(tokens) {
+            Ok(token) => token,
+            Err(payload) => return profile_error_payload(payload["message"].as_str().unwrap_or_default()),
+        };
+        match client.test_connection(&token).await {
+            Ok(profile) => {
+                if let Ok(mut cache) = username_cache.lock() {
+                    if !profile.username.trim().is_empty() {
+                        *cache = Some(profile.username.clone());
+                    }
+                }
+                json!({
+                    "ok": true,
+                    "message": "Bangumi 连接成功",
+                    "username": profile.username,
+                    "nickname": profile.nickname,
+                })
+            }
+            Err(error) => profile_error_payload(&request_error_message(error)),
+        }
+    }
+
+    /// `bangumi_get_user_profile`：无 Token / 失败 → `Value::Null`（Option 语义）。
+    pub(super) async fn user_profile(
+        tokens: &dyn BangumiTokenStore,
+        client: &HttpBangumiClient,
+    ) -> Value {
+        let token = match load_token(tokens) {
+            Ok(token) => token,
+            Err(_) => return Value::Null,
+        };
+        match client.get_user_profile(&token).await {
+            Ok(profile) => bangumi_profile_json(&profile),
+            Err(_) => Value::Null,
+        }
+    }
+
+    /// /v0/me → username 的进程内缓存读取（bangumi_get_user_collections 用）。
+    async fn ensure_username(
+        tokens: &dyn BangumiTokenStore,
+        client: &HttpBangumiClient,
+        username_cache: &Mutex<Option<String>>,
+    ) -> Result<String, String> {
+        if let Ok(cache) = username_cache.lock() {
+            if let Some(username) = cache.as_ref().filter(|name| !name.trim().is_empty()) {
+                return Ok(username.clone());
+            }
+        }
+        let token = load_token(tokens).map_err(|payload| {
+            payload["message"].as_str().unwrap_or_default().to_string()
+        })?;
+        let profile = client
+            .get_user_profile(&token)
+            .await
+            .map_err(request_error_message)?;
+        let username = profile.username.trim().to_string();
+        if username.is_empty() {
+            return Err("Bangumi 授权失败，Token 可能已失效".into());
+        }
+        if let Ok(mut cache) = username_cache.lock() {
+            *cache = Some(username.clone());
+        }
+        Ok(username)
+    }
+
+    /// `bangumi_get_user_collections`：固定 subject_type=2（动画），
+    /// 读端点 `/v0/users/{username}/collections`（username 先经 /v0/me 取得）。
+    pub(super) async fn user_collections(
+        tokens: &dyn BangumiTokenStore,
+        client: &HttpBangumiClient,
+        username_cache: &Mutex<Option<String>>,
+        offset: Option<u32>,
+        limit: Option<u32>,
+    ) -> Value {
+        if let Err(payload) = load_token(tokens) {
+            return collections_error_payload(payload["message"].as_str().unwrap_or_default());
+        }
+        let username = match ensure_username(tokens, client, username_cache).await {
+            Ok(username) => username,
+            Err(message) => return collections_error_payload(&message),
+        };
+        let token = match load_token(tokens) {
+            Ok(token) => token,
+            Err(payload) => return collections_error_payload(payload["message"].as_str().unwrap_or_default()),
+        };
+        match client
+            .get_user_collections(
+                &token,
+                &username,
+                SUBJECT_TYPE_ANIME,
+                limit.unwrap_or(30),
+                offset.unwrap_or(0),
+            )
+            .await
+        {
+            Ok(page) => json!({
+                "total": page.total,
+                "items": page
+                    .data
+                    .iter()
+                    .map(bangumi_collection_json)
+                    .collect::<Vec<_>>(),
+            }),
+            Err(error) => collections_error_payload(&request_error_message(error)),
+        }
+    }
+
+    /// `bangumi_set_api_base_url`（决策 11 的反向入口）：规范化后同时写入
+    /// settings.bangumiApiBaseUrl 与顶层 bangumi.apiBaseUrl。
+    pub(super) fn set_api_base_url(context: &AppContext, base_url: &str) -> Result<(), String> {
+        let normalized = if base_url.trim().is_empty() {
+            String::new()
+        } else {
+            super::normalize_url(base_url, Some("/v0")).map_err(|error| error.to_string())?
+        };
+        {
+            let mut state = context.state.lock().map_err(|_| "状态锁不可用")?;
+            state["settings"]["bangumiApiBaseUrl"] = json!(normalized);
+            if let Some(block) = state.get_mut("bangumi").and_then(Value::as_object_mut) {
+                block.insert("apiBaseUrl".into(), json!(normalized));
+            }
+        }
+        context.save_state().map_err(|error| error.to_string())?;
+        Ok(())
+    }
+}
+
+#[tauri::command]
+fn bangumi_auth_status(context: State<'_, AppContext>) -> Result<Value, String> {
+    if context.original {
+        return Ok(bangumi_auth_status_rejected());
+    }
+    #[cfg(feature = "standard")]
+    {
+        let state = context.state.lock().map_err(|_| "状态锁不可用")?;
+        return Ok(bangumi_commands::auth_status(
+            &state,
+            context.bangumi_tokens.as_ref(),
+        ));
+    }
+    #[cfg(not(feature = "standard"))]
+    Ok(bangumi_auth_status_rejected())
+}
+
+#[tauri::command]
+fn bangumi_save_token(context: State<'_, AppContext>, token: String) -> Result<Value, String> {
+    if context.original {
+        return Ok(bangumi_command_rejected());
+    }
+    #[cfg(feature = "standard")]
+    {
+        return Ok(bangumi_commands::save_token(
+            context.bangumi_tokens.as_ref(),
+            &token,
+        ));
+    }
+    #[cfg(not(feature = "standard"))]
+    {
+        let _ = token;
+        Ok(bangumi_command_rejected())
+    }
+}
+
+#[tauri::command]
+fn bangumi_disconnect(context: State<'_, AppContext>) -> Result<Value, String> {
+    if context.original {
+        return Ok(bangumi_command_rejected());
+    }
+    #[cfg(feature = "standard")]
+    {
+        return Ok(bangumi_commands::disconnect(
+            context.bangumi_tokens.as_ref(),
+            &context.bangumi_username_cache,
+        ));
+    }
+    #[cfg(not(feature = "standard"))]
+    Ok(bangumi_command_rejected())
+}
+
+#[tauri::command]
+async fn bangumi_test_connection(
+    context: State<'_, AppContext>,
+    base_url: Option<String>,
+) -> Result<Value, String> {
+    if context.original {
+        return Ok(bangumi_command_rejected());
+    }
+    #[cfg(feature = "standard")]
+    {
+        // baseUrl 参数优先（测试连接按钮可先验证未保存的地址），否则按状态解析。
+        let base = match base_url.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+            Some(configured) => bangumi::resolve_base_urls(configured),
+            None => {
+                let state = context.state.lock().map_err(|_| "状态锁不可用")?;
+                bangumi_base_urls(&state)
+            }
+        };
+        let client = bangumi::HttpBangumiClient::new(context.client.clone(), base);
+        return Ok(bangumi_commands::test_connection(
+            context.bangumi_tokens.as_ref(),
+            &client,
+            &context.bangumi_username_cache,
+        )
+        .await);
+    }
+    #[cfg(not(feature = "standard"))]
+    {
+        let _ = base_url;
+        Ok(bangumi_command_rejected())
+    }
+}
+
+#[tauri::command]
+async fn bangumi_get_user_profile(context: State<'_, AppContext>) -> Result<Value, String> {
+    if context.original {
+        return Ok(Value::Null);
+    }
+    #[cfg(feature = "standard")]
+    {
+        let base = {
+            let state = context.state.lock().map_err(|_| "状态锁不可用")?;
+            bangumi_base_urls(&state)
+        };
+        let client = bangumi::HttpBangumiClient::new(context.client.clone(), base);
+        return Ok(bangumi_commands::user_profile(
+            context.bangumi_tokens.as_ref(),
+            &client,
+        )
+        .await);
+    }
+    #[cfg(not(feature = "standard"))]
+    Ok(Value::Null)
+}
+
+#[tauri::command]
+async fn bangumi_get_user_collections(
+    context: State<'_, AppContext>,
+    offset: Option<u32>,
+    limit: Option<u32>,
+) -> Result<Value, String> {
+    if context.original {
+        return Ok(json!({
+            "ok": false,
+            "message": "Original 版不支持 Bangumi",
+            "total": 0,
+            "items": []
+        }));
+    }
+    #[cfg(feature = "standard")]
+    {
+        let base = {
+            let state = context.state.lock().map_err(|_| "状态锁不可用")?;
+            bangumi_base_urls(&state)
+        };
+        let client = bangumi::HttpBangumiClient::new(context.client.clone(), base);
+        return Ok(bangumi_commands::user_collections(
+            context.bangumi_tokens.as_ref(),
+            &client,
+            &context.bangumi_username_cache,
+            offset,
+            limit,
+        )
+        .await);
+    }
+    #[cfg(not(feature = "standard"))]
+    {
+        let _ = (offset, limit);
+        Ok(json!({"total": 0, "items": []}))
+    }
+}
+
+#[tauri::command]
+fn bangumi_set_api_base_url(
+    app: AppHandle,
+    context: State<'_, AppContext>,
+    base_url: String,
+) -> Result<Value, String> {
+    if context.original {
+        return Ok(bangumi_command_rejected());
+    }
+    #[cfg(feature = "standard")]
+    {
+        bangumi_commands::set_api_base_url(&context, &base_url)?;
+        refresh_mobile_configuration(&app, &context)?;
+        emit_state(&app, &context);
+        Ok(context.public_state())
+    }
+    #[cfg(not(feature = "standard"))]
+    {
+        let _ = (&app, base_url);
+        Ok(bangumi_command_rejected())
     }
 }
 
@@ -2644,6 +3140,13 @@ pub fn run() {
             update_follow_title,
             resolve_bangumi_title,
             test_bangumi_connection,
+            bangumi_auth_status,
+            bangumi_save_token,
+            bangumi_disconnect,
+            bangumi_test_connection,
+            bangumi_get_user_profile,
+            bangumi_get_user_collections,
+            bangumi_set_api_base_url,
             toggle_task,
             update_settings,
             sync_now,
@@ -3307,5 +3810,201 @@ mod tests {
             claim_daily_task_reminder(&mut state, "2026-07-29", "21:00"),
             None
         );
+    }
+
+    // -- Phase 1 Bangumi 命令 ---------------------------------------------------
+
+    #[cfg(feature = "standard")]
+    fn bangumi_test_base(url: &str) -> bangumi::BangumiBaseUrls {
+        bangumi::BangumiBaseUrls {
+            root: url.to_string(),
+            v0: format!("{url}/v0"),
+        }
+    }
+
+    #[cfg(feature = "standard")]
+    #[test]
+    fn bangumi_base_urls_prefers_block_then_settings_then_official() {
+        // 决策 11：顶层 bangumi.apiBaseUrl 优先。
+        assert_eq!(
+            bangumi_base_urls(&json!({
+                "bangumi": {"apiBaseUrl": "https://a.example.com/v0"},
+                "settings": {"bangumiApiBaseUrl": "https://b.example.com/v0"}
+            }))
+            .v0,
+            "https://a.example.com/v0"
+        );
+        // 顶层为空回落 settings.bangumiApiBaseUrl。
+        assert_eq!(
+            bangumi_base_urls(&json!({
+                "bangumi": {"apiBaseUrl": ""},
+                "settings": {"bangumiApiBaseUrl": "https://b.example.com/v0"}
+            }))
+            .v0,
+            "https://b.example.com/v0"
+        );
+        // 再为空用官方。
+        assert_eq!(
+            bangumi_base_urls(&json!({"bangumi": {}, "settings": {}})).root,
+            "https://api.bgm.tv"
+        );
+    }
+
+    #[cfg(feature = "standard")]
+    #[test]
+    fn bangumi_api_base_url_mirror_writes_block_from_settings() {
+        let mut state = default_state(false);
+        state["settings"]["bangumiApiBaseUrl"] = json!("https://proxy.example.com/v0");
+        state["bangumi"]["apiBaseUrl"] = json!("");
+
+        sync_bangumi_api_base_url_into_block(&mut state);
+
+        assert_eq!(state["bangumi"]["apiBaseUrl"], "https://proxy.example.com/v0");
+        assert_eq!(
+            state["settings"]["bangumiApiBaseUrl"],
+            "https://proxy.example.com/v0"
+        );
+    }
+
+    #[cfg(feature = "standard")]
+    #[test]
+    fn bangumi_commands_round_trip_with_memory_store() {
+        use crate::bangumi::test_support::MockBangumiServer;
+        use std::sync::Arc;
+
+        let profile = include_str!("../fixtures/bangumi/user-profile.json").to_string();
+        let collections = include_str!("../fixtures/bangumi/user-collections-page.json").to_string();
+        let server = MockBangumiServer::spawn(Arc::new(
+            move |_method, target, headers, _request_body| {
+                if target == "/v0/me" {
+                    assert!(
+                        headers
+                            .get("authorization")
+                            .map(String::as_str)
+                            .unwrap_or_default()
+                            .starts_with("Bearer ")
+                    );
+                    (200, vec![], profile.clone())
+                } else if target.starts_with("/v0/users/anilog_dev/collections?") {
+                    assert!(target.contains("subject_type=2"));
+                    (200, vec![], collections.clone())
+                } else {
+                    (404, vec![], "{}".into())
+                }
+            },
+        ));
+        let client =
+            bangumi::HttpBangumiClient::with_base(bangumi_test_base(&server.url())).unwrap();
+        let tokens = bangumi::MemoryTokenStore::new();
+        let username_cache = std::sync::Mutex::new(None);
+        let supported = bangumi_commands::token_store_supported();
+        let empty_state = json!({"bangumi": {}, "settings": {}});
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio test runtime")
+            .block_on(async {
+                // 初始 status：无 Token，apiBaseUrl 展示值回落 settings。
+                let status = bangumi_commands::auth_status(
+                    &json!({
+                        "bangumi": {"apiBaseUrl": ""},
+                        "settings": {"bangumiApiBaseUrl": "https://proxy.example.com/v0"}
+                    }),
+                    &tokens,
+                );
+                assert_eq!(status["supported"], supported);
+                assert_eq!(status["hasToken"], false);
+                assert_eq!(status["apiBaseUrl"], "https://proxy.example.com/v0");
+
+                // 空 Token 拒绝（固定文案）。
+                let empty = bangumi_commands::save_token(&tokens, "   ");
+                assert_eq!(empty["ok"], false);
+                assert_eq!(empty["message"], "Token 不能为空");
+
+                // 保存（trim）→ hasToken=true；成功响应不回显 Token。
+                let saved = bangumi_commands::save_token(&tokens, "  roundtrip-token  ");
+                assert_eq!(saved["ok"], true);
+                assert!(!saved.to_string().contains("roundtrip-token"));
+                let status = bangumi_commands::auth_status(&empty_state, &tokens);
+                assert_eq!(status["hasToken"], supported);
+
+                // profile 走 /v0/me fixture，camelCase 投影。
+                let profile = bangumi_commands::user_profile(&tokens, &client).await;
+                assert_eq!(profile["username"], "anilog_dev");
+                assert_eq!(profile["nickname"], "阿罗");
+                assert_eq!(profile["userGroup"], 10);
+
+                // collections 分页信封 + camelCase 投影（username 缓存自 /v0/me）。
+                let collections = bangumi_commands::user_collections(
+                    &tokens,
+                    &client,
+                    &username_cache,
+                    Some(0),
+                    Some(30),
+                )
+                .await;
+                assert_eq!(collections["total"], 2);
+                assert_eq!(collections["items"][0]["subjectId"], 45678);
+                assert_eq!(collections["items"][0]["type"], 3);
+                assert_eq!(collections["items"][0]["epStatus"], 3);
+                assert_eq!(collections["items"][1]["subjectId"], 99999);
+
+                // test_connection 成功回 username/nickname。
+                let connection =
+                    bangumi_commands::test_connection(&tokens, &client, &username_cache).await;
+                assert_eq!(connection["ok"], true);
+                assert_eq!(connection["username"], "anilog_dev");
+                assert_eq!(connection["nickname"], "阿罗");
+
+                // disconnect → hasToken=false，username 缓存清空。
+                let disconnected = bangumi_commands::disconnect(&tokens, &username_cache);
+                assert_eq!(disconnected["ok"], true);
+                let status = bangumi_commands::auth_status(&empty_state, &tokens);
+                assert_eq!(status["hasToken"], false);
+                assert!(username_cache.lock().unwrap().is_none());
+            });
+        // Authorization 头始终形如 "Bearer <token>"（形制回归，不落盘不回显）。
+        for request in server.requests() {
+            let authorization = request
+                .headers
+                .get("authorization")
+                .map(String::as_str)
+                .unwrap_or_default();
+            assert!(authorization.starts_with("Bearer "), "bad auth header: {authorization:?}");
+        }
+    }
+
+    #[cfg(all(feature = "standard", target_os = "windows"))]
+    #[test]
+    fn bangumi_original_rejection_messages_are_stable() {
+        // original edition 的拒绝语义由固定文案函数承载（original 下单独测试，
+        // 这里锁定 standard 构建中的同一实现）。
+        assert_eq!(
+            bangumi_command_rejected(),
+            json!({"ok": false, "message": "Original 版不支持 Bangumi"})
+        );
+        assert_eq!(
+            bangumi_auth_status_rejected(),
+            json!({"supported": false, "hasToken": false, "apiBaseUrl": ""})
+        );
+    }
+
+    #[cfg(feature = "original")]
+    #[test]
+    fn original_bangumi_commands_reject_with_fixed_messages() {
+        // status 命令的 supported=false 语义核心函数。
+        assert_eq!(
+            bangumi_auth_status_rejected(),
+            json!({"supported": false, "hasToken": false, "apiBaseUrl": ""})
+        );
+        // 其余命令统一 ok=false + 固定文案。
+        assert_eq!(
+            bangumi_command_rejected(),
+            json!({"ok": false, "message": "Original 版不支持 Bangumi"})
+        );
+        // original 仍拒绝 bangumiApiBaseUrl 写入（默认状态强制为空、无 bangumi 块）。
+        assert_eq!(default_state(true)["settings"]["bangumiApiBaseUrl"], "");
+        assert!(default_state(true).get("bangumi").is_none());
     }
 }
