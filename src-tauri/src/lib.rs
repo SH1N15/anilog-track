@@ -3888,7 +3888,7 @@ const ANILIST_AUTHORITY_QUERY: &str = r#"query AniListAuthority($ids: [Int], $pa
     media(id_in: $ids, type: ANIME) {
       id
       nextAiringEpisode { episode airingAt }
-      airingSchedule(notYetAired: false, perPage: 25, sort: TIME_DESC) { nodes { episode airingAt } }
+      airingSchedule(notYetAired: false, perPage: 50) { nodes { episode airingAt } }
     }
   }
 }"#;
