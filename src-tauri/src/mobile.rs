@@ -279,6 +279,15 @@ fn merge_status(app: &AppHandle, context: &AppContext, status: &Value) -> anyhow
         }
     }
 
+    // 权威数据修复（Android 最小对齐，缺口 2）：Java 数据（含其提供的
+    // nextEpisode/nextAiringAt）合并完、事件任务建完后，用本地 next 值做无
+    // 网络任务纠偏——pending episode >= next.episode 即未播假票，无论
+    // airingAt 过去/未来都删除，与 lib.rs reconcile_following_entries 同口径
+    // （completed 观看历史一律保留）。完整 schedule 纠偏（逐集 airingAt
+    // 改写 + next 权威重写）留 Java Worker 后续接入。
+    #[cfg(feature = "standard")]
+    super::reconcile_unaired_anilist_next_tasks(&mut state);
+
     let synced_at = value_i64(status.get("syncedAt"));
     if synced_at > value_i64(state.get("lastSyncAt")) {
         state["lastSyncAt"] = json!(synced_at);

@@ -1592,6 +1592,63 @@ fn purge_unaired_pending_tasks(state: &mut Value, now: i64) -> bool {
     before != tasks.len()
 }
 
+/// 权威数据修复（缺口 2 无网络版任务纠偏，幂等，standard only）：条目 AniList
+/// 身份（id 或 anilistId）的 nextAiringEpisode.episode 已知时，episode >=
+/// next.episode 的 pending 任务删除——AniList 认为未播的集不该有票（播出后由
+/// 调度管道按权威时间重建）。与 [`purge_unaired_pending_tasks`] 互补：purge
+/// 只删 airingAt > now 的未来时间戳，拦不住离线锚点污染出的"过去假票"（黄泉
+/// ep23@9/6、无职 ep11@9/6 23:00 已过当晚等）；这里按 AniList 的集数权威兜底，
+/// 无论 airingAt 过去/未来都删。completed 观看历史一律保留。挂载于
+/// reconcile_following_entries（覆盖加载与 WebDAV 合并路径）与 Android
+/// merge_status（Java 提供的 next 值同口径）。任务归属口径与
+/// [`reconcile_anilist_authority_tasks`] 一致：animeId 直接命中条目 id，否则
+/// 回退 bangumi 条目 anilistId（旧键）。
+#[cfg(feature = "standard")]
+fn reconcile_unaired_anilist_next_tasks(state: &mut Value) -> bool {
+    let following = state["following"].as_array().cloned().unwrap_or_default();
+    // 任务 animeId → 已知 next.episode（条目 id 与旧键 anilistId 双键收录；
+    // 两者撞键时同属一个 AniList 作品，next 值一致，覆盖无害）。
+    let mut next_by_anime_id: HashMap<i64, i64> = HashMap::new();
+    for entry in &following {
+        let id = value_i64(entry.get("id"));
+        let next_episode = value_i64(
+            entry
+                .get("nextAiringEpisode")
+                .and_then(|next| next.get("episode")),
+        );
+        if id <= 0 || next_episode <= 0 {
+            continue;
+        }
+        next_by_anime_id.insert(id, next_episode);
+        let anilist_id = value_i64(entry.get("anilistId"));
+        if anilist_id > 0 {
+            next_by_anime_id.insert(anilist_id, next_episode);
+        }
+    }
+    if next_by_anime_id.is_empty() {
+        return false;
+    }
+    let Some(tasks) = state
+        .get_mut("tasks")
+        .and_then(|tasks| tasks.as_array_mut())
+    else {
+        return false;
+    };
+    let before = tasks.len();
+    tasks.retain(|task| {
+        if value_string(task.get("status")) != "pending" {
+            return true; // completed 观看历史永不删除。
+        }
+        let next_episode = next_by_anime_id
+            .get(&value_i64(task.get("animeId")))
+            .copied()
+            .unwrap_or(0);
+        let episode = value_i64(task.get("episode"));
+        !(next_episode > 0 && episode > 0 && episode >= next_episode)
+    });
+    before != tasks.len()
+}
+
 /// 问题 B 总入口（standard only）：跨键合并 + 既有单条自动映射。
 /// 返回是否发生任何状态变更（following/tasks/syncMetadata 任一）。
 /// 挂载点：load_context 尾部（升级原 auto_map_following 调用）与每次
@@ -1617,6 +1674,10 @@ fn reconcile_following_entries(state: &mut Value, map: &Value, original: bool) -
     // 验收第 4 轮问题 1：从未播出（airingAt > now）的 pending 任务清理，
     // 幂等；original 分支已在函数头返回，不会执行到这里。
     purge_unaired_pending_tasks(state, now_seconds());
+    // 权威数据修复（缺口 2 无网络兜底）：AniList next 已知的条目，pending
+    // episode >= next.episode 即未播假票，无论 airingAt 过去/未来都删除
+    // （purge 只删未来时间戳，拦不住锚点污染出的过去假票），幂等。
+    reconcile_unaired_anilist_next_tasks(state);
     // 权威数据修复：eps 越界 pending 与共享 anilistId 非主条目 pending 清理
     // （completed 历史一律保留），幂等。
     reconcile_anilist_authority_tasks(state, map);
@@ -3464,20 +3525,37 @@ fn primary_anilist_claimants(state: &Value, map: &Value) -> HashMap<i64, i64> {
     anilist_claimant_groups(state)
         .into_iter()
         .filter(|(_, claimants)| claimants.len() > 1)
-        .filter_map(|(anilist_id, mut claimants)| {
-            let indexed = value_i64(
-                map.get("anilistIndex")
-                    .and_then(|index| index.get(anilist_id.to_string())),
-            );
-            let primary = if indexed > 0 && claimants.iter().any(|(id, _)| *id == indexed) {
-                indexed
-            } else {
-                claimants.sort_by_key(|(id, followed_at)| (*followed_at, *id));
-                claimants[0].0
-            };
-            Some((anilist_id, primary))
+        .filter_map(|(anilist_id, claimants)| {
+            Some((
+                anilist_id,
+                primary_anilist_claimant_for(&claimants, map, anilist_id)?,
+            ))
         })
         .collect()
+}
+
+/// 主认领条目裁决的单 anilistId 版（与 [`primary_anilist_claimants`] 同规则，
+/// 但单一认领也适用）：anilistIndex 指向者优先（需在认领集合内），否则
+/// followedAt 最早（并列取小 id）。供 [`apply_anilist_authority_media`] 对每个
+/// media 定位唯一接收条目——anilistId 非共享时同样要落到唯一条目上。
+#[cfg(feature = "standard")]
+fn primary_anilist_claimant_for(
+    claimants: &[(i64, i64)],
+    map: &Value,
+    anilist_id: i64,
+) -> Option<i64> {
+    let indexed = value_i64(
+        map.get("anilistIndex")
+            .and_then(|index| index.get(anilist_id.to_string())),
+    );
+    if indexed > 0 && claimants.iter().any(|(id, _)| *id == indexed) {
+        return Some(indexed);
+    }
+    claimants
+        .iter()
+        .copied()
+        .min_by_key(|(id, followed_at)| (*followed_at, *id))
+        .map(|(id, _)| id)
 }
 
 /// 权威数据修复（共享 anilistId 去重）：非主条目集合——这些条目跳过 AniList
@@ -3795,6 +3873,226 @@ fn bangumi_offline_schedules(state: &Value, map: &Value, now: i64) -> Vec<Value>
     schedules
 }
 
+// -- 权威数据修复（缺口 1/2 网络自愈）：AniList 全量重写 + 任务纠偏 ----------
+// 第 5 轮遗留实测：AIRING_QUERY 只返回窗口内播出的集——窗口内零播出时无
+// media，nextAiringEpisode 污染（100女友 ep10@9/9、黄泉 ep24@9/13）永远等不到
+// 权威写回；purge 只删 airingAt > now，过去时间假任务留存。本组函数按
+// anilistId 无条件全量拉取 next + 已播 schedule，与播出窗口解耦。
+
+/// 权威全量重写查询（与 AIRING_QUERY 的窗口语义解耦）：nextAiringEpisode +
+/// 已播 airingSchedule（notYetAired:false，TIME_DESC 取最近 25 集）。分页
+/// ≤3（perPage 50 → 单轮 ≤150 条目）。
+#[cfg(all(feature = "standard", not(target_os = "android")))]
+const ANILIST_AUTHORITY_QUERY: &str = r#"query AniListAuthority($ids: [Int], $page: Int) {
+  Page(page: $page, perPage: 50) { pageInfo { lastPage }
+    media(id_in: $ids, type: ANIME) {
+      id
+      nextAiringEpisode { episode airingAt }
+      airingSchedule(notYetAired: false, perPage: 25, sort: TIME_DESC) { nodes { episode airingAt } }
+    }
+  }
+}"#;
+
+/// 抓取 AniList 权威 media（anilistId → media）。任一页失败（网络/解析/GraphQL
+/// errors）静默 None——调用方整体放弃本轮应用（不做半套改写）。
+#[cfg(all(feature = "standard", not(target_os = "android")))]
+async fn fetch_anilist_authority_media(
+    client: &reqwest::Client,
+    endpoint: &str,
+    ids: &[i64],
+) -> Option<HashMap<i64, Value>> {
+    if ids.is_empty() {
+        return None;
+    }
+    let mut media_by_id: HashMap<i64, Value> = HashMap::new();
+    for page in 1..=3usize {
+        let data = anilist_request_at(
+            client,
+            endpoint,
+            ANILIST_AUTHORITY_QUERY,
+            json!({"ids": ids, "page": page}),
+        )
+        .await
+        .ok()?;
+        let last_page = value_i64(data["Page"]["pageInfo"].get("lastPage")).clamp(1, 3) as usize;
+        for media in data["Page"]["media"].as_array().cloned().unwrap_or_default() {
+            let id = value_i64(media.get("id"));
+            if id > 0 {
+                media_by_id.insert(id, media);
+            }
+        }
+        if page >= last_page {
+            break;
+        }
+    }
+    Some(media_by_id)
+}
+
+/// 权威数据应用（纯同步，易测）：对每个 media 定位主认领条目
+/// （[`primary_anilist_claimant_for`]，secondary 跳过），然后——
+/// 1) **next 重写（治愈污染）**：media.nextAiringEpisode 存在 → 条目
+///    nextAiringEpisode = {episode, airingAt, timeUntilAiring: airingAt-now}
+///    无条件替换；为 null（完结）→ 条目 nextAiringEpisode = null。只比较
+///    (episode, airingAt) 判定变更（timeUntilAiring 随 now 漂移，不参与幂等
+///    比较）；
+/// 2) **任务纠偏**：schedule + next 构造 episode→airingAt 权威映射，对该条目
+///    pending 任务（animeId 命中条目 id 或旧键 anilistId）：a) episode >=
+///    next.episode → 删除（未播出不该有票，播出后 AIRING_QUERY 按权威时间
+///    重建；真实数据中已播 schedule 与 next 不相交，异常数据相交时也删除
+///    优先，避免改写成未来 airingAt 后又被 purge 删除来回抖动）；b) episode
+///    在映射中且 airingAt 不同 → 改写 airingAt + syncUpdatedAt=now 毫秒；
+///    c) 无法判定 → 保留。completed 一律不动。
+/// 任一变更返回 true。本窗口刚建的已播任务 episode < next.episode 不受影响。
+#[cfg(all(feature = "standard", not(target_os = "android")))]
+fn apply_anilist_authority_media(
+    state: &mut Value,
+    map: &Value,
+    media_by_id: &HashMap<i64, Value>,
+    now: i64,
+) -> bool {
+    if media_by_id.is_empty() {
+        return false;
+    }
+    let groups = anilist_claimant_groups(state);
+    let mut changed = false;
+    for (anilist_id, media) in media_by_id {
+        let Some(claimants) = groups.get(anilist_id) else {
+            continue; // 不再追番 / 无认领条目 → 不改写。
+        };
+        let Some(entry_id) = primary_anilist_claimant_for(claimants, map, *anilist_id) else {
+            continue;
+        };
+        let Some(entry) = state["following"].as_array().and_then(|items| {
+            items
+                .iter()
+                .find(|item| value_i64(item.get("id")) == entry_id)
+        }) else {
+            continue;
+        };
+        let entry_source = value_string(entry.get("source"));
+        let entry_anilist_id = value_i64(entry.get("anilistId"));
+        // 1) next 全量重写（无条件替换治愈污染；完结 → null）。
+        let raw_next = media
+            .get("nextAiringEpisode")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let desired_next = if raw_next.is_null() {
+            Value::Null
+        } else {
+            let episode = value_i64(raw_next.get("episode"));
+            let airing_at = value_i64(raw_next.get("airingAt"));
+            if episode > 0 && airing_at > 0 {
+                json!({
+                    "episode": episode,
+                    "airingAt": airing_at,
+                    "timeUntilAiring": (airing_at - now).max(0)
+                })
+            } else {
+                Value::Null
+            }
+        };
+        let next_episode = value_i64(desired_next.get("episode"));
+        let next_airing_at = value_i64(desired_next.get("airingAt"));
+        let current_key = entry
+            .get("nextAiringEpisode")
+            .map(|current| (value_i64(current.get("episode")), value_i64(current.get("airingAt"))))
+            .unwrap_or((0, 0));
+        let desired_key = if desired_next.is_null() {
+            (0, 0)
+        } else {
+            (next_episode, next_airing_at)
+        };
+        if current_key != desired_key {
+            if let Some(slot) = state["following"].as_array_mut().and_then(|items| {
+                items
+                    .iter_mut()
+                    .find(|item| value_i64(item.get("id")) == entry_id)
+            }) {
+                slot["nextAiringEpisode"] = desired_next;
+            }
+            changed = true;
+        }
+        // 2) 任务纠偏：episode→airingAt 权威映射（已播 schedule 为主，next
+        //    补充其"下一未播集"的时间）。
+        let mut authoritative_airing: HashMap<i64, i64> = HashMap::new();
+        for node in media["airingSchedule"]["nodes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            let episode = value_i64(node.get("episode"));
+            let airing_at = value_i64(node.get("airingAt"));
+            if episode > 0 && airing_at > 0 {
+                authoritative_airing.insert(episode, airing_at);
+            }
+        }
+        if next_episode > 0 {
+            authoritative_airing
+                .entry(next_episode)
+                .or_insert(next_airing_at);
+        }
+        let sync_updated_at = now_millis();
+        let Some(tasks) = state.get_mut("tasks").and_then(|tasks| tasks.as_array_mut()) else {
+            continue;
+        };
+        tasks.retain_mut(|task| {
+            if value_string(task.get("status")) != "pending" {
+                return true; // completed 观看历史一律不动。
+            }
+            let anime_id = value_i64(task.get("animeId"));
+            let belongs = anime_id == entry_id
+                || (entry_source == "bangumi"
+                    && entry_anilist_id > 0
+                    && anime_id == entry_anilist_id);
+            if !belongs {
+                return true;
+            }
+            let episode = value_i64(task.get("episode"));
+            // a) 未播假票删除：AniList 认为该集未播（>= next.episode）。
+            if next_episode > 0 && episode > 0 && episode >= next_episode {
+                changed = true;
+                return false;
+            }
+            // b) 已播集权威时间纠偏（如描绘 ep10@9/4 23:35 → 22:30）。
+            if let Some(&airing_at) = authoritative_airing.get(&episode) {
+                if airing_at != value_i64(task.get("airingAt")) {
+                    task["airingAt"] = json!(airing_at);
+                    task["syncUpdatedAt"] = json!(sync_updated_at);
+                    changed = true;
+                }
+                return true;
+            }
+            // c) 无法判定 → 保留。
+            true
+        });
+    }
+    changed
+}
+
+/// 权威数据修复本轮入口（desktop sync_now_inner 接线）：先**不持锁**全量抓取
+/// （std MutexGuard 绝不能跨 await——Tauri 命令 future 必须 Send），再持锁应用
+/// （持锁段内无 await）。失败（网络/解析/锁）静默 false。签名按规格标注的
+/// (state, map, endpoint, http, ids)——state 为共享状态锁本体，await 只发生在
+/// 抓取段。Android 无此路径（最小对齐走 reconcile_unaired_anilist_next_tasks，
+/// 完整 schedule 纠偏留 Java Worker 后续）。
+#[cfg(all(feature = "standard", not(target_os = "android")))]
+async fn anilist_authority_refresh(
+    state: &Mutex<Value>,
+    map: &Value,
+    endpoint: &str,
+    client: &reqwest::Client,
+    ids: &[i64],
+    now: i64,
+) -> bool {
+    let Some(media_by_id) = fetch_anilist_authority_media(client, endpoint, ids).await else {
+        return false;
+    };
+    let Ok(mut state) = state.lock() else {
+        return false;
+    };
+    apply_anilist_authority_media(&mut state, map, &media_by_id, now)
+}
+
 #[cfg(not(target_os = "android"))]
 async fn sync_now_inner(app: &AppHandle, context: &AppContext) -> Result<Value, String> {
     let (ids, from) = {
@@ -3873,18 +4171,41 @@ async fn sync_now_inner(app: &AppHandle, context: &AppContext) -> Result<Value, 
             now,
         ));
     }
-    let mut state = context.state.lock().map_err(|_| "状态锁不可用")?;
-    // 权威数据修复：同一 anilistId 被多个 following 条目认领时，本轮 AniList
-    // 调度只分配给主条目（anilistIndex 指向者优先，否则 followedAt 最早者），
-    // 其余条目跳过调度与 nextAiringEpisode 写回，避免同集任务在两个条目下
-    // 重复生成。AIRING_QUERY 返回的 media.nextAiringEpisode 每轮随调度写回
-    // 主条目（治愈被离线锚点污染的存量值；离线调度已跳过 anilistId 条目，
-    // 不会再在其后覆写）。
+    // 块作用域持锁（std MutexGuard 不能跨 await——Tauri 命令 future 必须 Send）。
+    let outcome = {
+        let mut state = context.state.lock().map_err(|_| "状态锁不可用")?;
+        // 权威数据修复：同一 anilistId 被多个 following 条目认领时，本轮 AniList
+        // 调度只分配给主条目（anilistIndex 指向者优先，否则 followedAt 最早者），
+        // 其余条目跳过调度与 nextAiringEpisode 写回，避免同集任务在两个条目下
+        // 重复生成。AIRING_QUERY 返回的 media.nextAiringEpisode 每轮随调度写回
+        // 主条目（治愈被离线锚点污染的存量值；离线调度已跳过 anilistId 条目，
+        // 不会再在其后覆写）。
+        #[cfg(feature = "standard")]
+        let secondary_claimants = secondary_anilist_claimant_ids(&state, &context.offline_bangumi);
+        #[cfg(not(feature = "standard"))]
+        let secondary_claimants = HashSet::new();
+        apply_airing_schedules_inner(&mut state, &schedules, now, &secondary_claimants)
+    };
+    // 权威数据修复（缺口 1/2 网络自愈）：AIRING_QUERY 只返回窗口内播出的集，
+    // 窗口内零播出时无 media → next 污染无法纠正、过去时间假任务无法识别。
+    // 这里在窗口调度应用之后，按 anilistId 全量抓取 AniList 权威 next + 已播
+    // schedule：无条件重写 nextAiringEpisode、纠偏已播集 airingAt、删除未播
+    // 假票。顺序刻意为先 apply_airing_schedules（处理已播窗口）后权威纠偏；
+    // 删除规则以 next.episode 为界，本窗口刚建的已播任务 episode <
+    // next.episode 不会被误删。
     #[cfg(feature = "standard")]
-    let secondary_claimants = secondary_anilist_claimant_ids(&state, &context.offline_bangumi);
+    let authority_changed = anilist_authority_refresh(
+        &context.state,
+        &context.offline_bangumi,
+        ANILIST_API,
+        &context.client,
+        &ids,
+        now,
+    )
+    .await;
     #[cfg(not(feature = "standard"))]
-    let secondary_claimants = HashSet::new();
-    let outcome = apply_airing_schedules_inner(&mut state, &schedules, now, &secondary_claimants);
+    let authority_changed = false;
+    let mut state = context.state.lock().map_err(|_| "状态锁不可用")?;
     state["lastSyncAt"] = json!(now);
     state["tasks"]
         .as_array_mut()
@@ -3895,7 +4216,7 @@ async fn sync_now_inner(app: &AppHandle, context: &AppContext) -> Result<Value, 
     drop(state);
     context.save_state().map_err(|error| error.to_string())?;
     emit_state(app, context);
-    if outcome.created > 0 {
+    if outcome.created > 0 || authority_changed {
         context.webdav_wakeup.notify_one();
     }
     #[cfg(desktop)]
@@ -10925,6 +11246,408 @@ mod tests {
             .map(|task| value_string(task.get("id")))
             .collect();
         assert_eq!(ids, vec!["547888-10", "633836-9", "547888-9"]);
+
+        // 幂等：再次 reconcile 任务集不再变化。
+        let before = state["tasks"].clone();
+        reconcile_following_entries(&mut state, &map, false);
+        assert_eq!(state["tasks"], before);
+    }
+
+    // -- 权威数据修复 3：AniList 全量重写 + 任务纠偏（缺口 1/2）-----------------
+    // 第 5 轮构建 2b4b672 后用户截图实测：AIRING_QUERY 只返回窗口内播出的集，
+    // 窗口内零播出时无 media → next 污染（100女友 ep10@9/9、黄泉 ep24@9/13）
+    // 永不纠正；purge 只删 airingAt > now，过去时间假任务（黄泉 ep23@9/6、
+    // 描绘 ep10@9/4 23:35、无职 ep11@9/6 23:00）留存。
+
+    /// ANILIST_AUTHORITY_QUERY 的 media 形状（id + next + 已播 schedule）。
+    #[cfg(feature = "standard")]
+    fn authority_media(id: i64, next: Value, schedule: Value) -> (i64, Value) {
+        (
+            id,
+            json!({
+                "id": id,
+                "nextAiringEpisode": next,
+                "airingSchedule": {"nodes": schedule}
+            }),
+        )
+    }
+
+    #[cfg(feature = "standard")]
+    #[test]
+    fn anilist_authority_rewrites_polluted_next_and_drops_unaired_fake_task() {
+        // 黄泉的使者（568572, anilistId=195600）：next 污染 ep24@9/13 + 假任务
+        // ep23@9/6 00:00（ep23 真实 9/12 22:30 才播）。权威 media：next=ep23@9/12
+        // + schedule [ep22@9/5, ep23@9/12] → next 无条件重写、ep23 假票删除
+        // （未播出不该有票，9/12 播出时 AIRING_QUERY 按权威时间重建）、
+        // ep22 completed 观看历史不动。
+        let mut state = default_state(false);
+        state["following"] = json!([{
+            "id": 568572, "source": "bangumi", "anilistId": 195600, "bangumiId": 568572,
+            "displayTitle": "黄泉的使者", "episodes": 13, "followedAt": 1, "syncUpdatedAt": 1,
+            "nextAiringEpisode": {"episode": 24, "airingAt": at("2026-09-13T00:00:00+08:00")}
+        }]);
+        state["tasks"] = json!([
+            {"id": "568572-23", "animeId": 568572, "episode": 23,
+             "airingAt": at("2026-09-06T00:00:00+08:00"), "status": "pending",
+             "createdAt": 1, "completedAt": Value::Null, "syncUpdatedAt": 1},
+            {"id": "568572-22", "animeId": 568572, "episode": 22,
+             "airingAt": at("2026-09-05T22:30:00+08:00"), "status": "completed",
+             "createdAt": 1, "completedAt": 2, "syncUpdatedAt": 1}
+        ]);
+        let map = json!({"bySubject": {}, "anilistIndex": {"195600": 568572}});
+        let now = at("2026-09-06T12:00:00+08:00");
+        let media = HashMap::from([authority_media(
+            195600,
+            json!({"episode": 23, "airingAt": at("2026-09-12T22:30:00+08:00")}),
+            json!([
+                {"episode": 22, "airingAt": at("2026-09-05T22:30:00+08:00")},
+                {"episode": 23, "airingAt": at("2026-09-12T22:30:00+08:00")}
+            ]),
+        )]);
+
+        assert!(apply_anilist_authority_media(&mut state, &map, &media, now));
+
+        // next 污染（ep24@9/13）被权威值无条件重写（ep23@9/12 22:30 + 剩余秒数）。
+        assert_eq!(state["following"][0]["nextAiringEpisode"]["episode"], 23);
+        assert_eq!(
+            state["following"][0]["nextAiringEpisode"]["airingAt"],
+            at("2026-09-12T22:30:00+08:00")
+        );
+        assert_eq!(
+            state["following"][0]["nextAiringEpisode"]["timeUntilAiring"],
+            at("2026-09-12T22:30:00+08:00") - now
+        );
+        // ep23 假票删除；ep22 已完成观看历史不动。
+        let tasks = state["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["id"], "568572-22");
+        assert_eq!(tasks[0]["status"], "completed");
+        assert_eq!(
+            tasks[0]["airingAt"],
+            at("2026-09-05T22:30:00+08:00")
+        );
+    }
+
+    #[cfg(feature = "standard")]
+    #[test]
+    fn anilist_authority_rewrites_aired_episode_time_from_schedule() {
+        // 描绘直至生命尽头（545917, anilistId=163134）：pending ep10@9/4 23:35
+        // （离线锚点错位）+ 权威 schedule ep10@9/4 22:30 → 时间纠偏 + 记录
+        // syncUpdatedAt=now 毫秒；next 权威值 ep11@9/11 写回条目。
+        let mut state = default_state(false);
+        state["following"] = json!([{
+            "id": 545917, "source": "bangumi", "anilistId": 163134, "bangumiId": 545917,
+            "displayTitle": "描绘直至生命尽头", "episodes": 13, "followedAt": 1, "syncUpdatedAt": 1,
+            "nextAiringEpisode": {"episode": 10, "airingAt": at("2026-09-04T23:35:00+08:00")}
+        }]);
+        state["tasks"] = json!([
+            {"id": "545917-10", "animeId": 545917, "episode": 10,
+             "airingAt": at("2026-09-04T23:35:00+08:00"), "status": "pending",
+             "createdAt": 1, "completedAt": Value::Null, "syncUpdatedAt": 1}
+        ]);
+        let map = json!({"bySubject": {}, "anilistIndex": {"163134": 545917}});
+        let now = at("2026-09-04T23:00:00+08:00");
+        let media = HashMap::from([authority_media(
+            163134,
+            json!({"episode": 11, "airingAt": at("2026-09-11T22:30:00+08:00")}),
+            json!([{"episode": 10, "airingAt": at("2026-09-04T22:30:00+08:00")}]),
+        )]);
+
+        assert!(apply_anilist_authority_media(&mut state, &map, &media, now));
+
+        let task = &state["tasks"][0];
+        assert_eq!(task["id"], "545917-10");
+        assert_eq!(task["airingAt"], at("2026-09-04T22:30:00+08:00"));
+        assert!(value_i64(task.get("syncUpdatedAt")) > 1);
+        // 条目 next 同步到 AniList 权威值 ep11@9/11。
+        assert_eq!(state["following"][0]["nextAiringEpisode"]["episode"], 11);
+        assert_eq!(
+            state["following"][0]["nextAiringEpisode"]["airingAt"],
+            at("2026-09-11T22:30:00+08:00")
+        );
+    }
+
+    #[cfg(feature = "standard")]
+    #[test]
+    fn anilist_authority_drops_unaired_task_and_accepts_legacy_anilist_key() {
+        // 无职转生（501963, anilistId=178789）：pending ep11@9/6 23:00 还没播
+        // （AniList next=ep11）→ 删除；残留旧键任务（animeId=anilistId，主键
+        // 迁移前形态）同样被纠偏口径命中；completed 历史不动。
+        let mut state = default_state(false);
+        state["following"] = json!([{
+            "id": 501963, "source": "bangumi", "anilistId": 178789, "bangumiId": 501963,
+            "displayTitle": "无职转生 III", "episodes": 12, "followedAt": 1, "syncUpdatedAt": 1,
+            "nextAiringEpisode": {"episode": 12, "airingAt": at("2026-09-13T23:00:00+08:00")}
+        }]);
+        state["tasks"] = json!([
+            {"id": "178789-11", "animeId": 178789, "episode": 11,
+             "airingAt": at("2026-09-06T23:00:00+08:00"), "status": "pending",
+             "createdAt": 1, "completedAt": Value::Null, "syncUpdatedAt": 1},
+            {"id": "501963-10", "animeId": 501963, "episode": 10,
+             "airingAt": at("2026-08-30T23:00:00+08:00"), "status": "completed",
+             "createdAt": 1, "completedAt": 2, "syncUpdatedAt": 1}
+        ]);
+        let map = json!({"bySubject": {}, "anilistIndex": {"178789": 501963}});
+        let now = at("2026-09-06T12:00:00+08:00");
+        let media = HashMap::from([authority_media(
+            178789,
+            json!({"episode": 11, "airingAt": at("2026-09-06T23:00:00+08:00")}),
+            json!([{"episode": 10, "airingAt": at("2026-08-30T23:00:00+08:00")}]),
+        )]);
+
+        assert!(apply_anilist_authority_media(&mut state, &map, &media, now));
+
+        // 未播假票（旧键 pending ep11 >= next.episode 11）删除。
+        let tasks = state["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["id"], "501963-10");
+        assert_eq!(tasks[0]["status"], "completed");
+        // next 由污染值 ep12@9/13 重写为权威值 ep11@9/6 23:00。
+        assert_eq!(state["following"][0]["nextAiringEpisode"]["episode"], 11);
+        assert_eq!(
+            state["following"][0]["nextAiringEpisode"]["airingAt"],
+            at("2026-09-06T23:00:00+08:00")
+        );
+    }
+
+    #[cfg(feature = "standard")]
+    #[test]
+    fn anilist_authority_finished_media_clears_next_and_keeps_backlog() {
+        // 完结 media（next=null）：条目 next 重写为 null（治愈已完结番残留
+        // 下一期）；已播集 pending 的错误时间按 schedule 纠偏；已播待看积压
+        // （schedule 内/外）与 completed 观看历史全部保留——完结番的 pending
+        // 是合法观看积压，不属于"未播假票"（next.episode 未知时删除规则不
+        // 生效）；越 eps 的残留由 reconcile_anilist_authority_tasks 另行清理。
+        let mut state = default_state(false);
+        state["following"] = json!([{
+            "id": 35760, "source": "bangumi", "anilistId": 16498, "bangumiId": 35760,
+            "displayTitle": "SHIROBAKO", "episodes": 24, "followedAt": 1, "syncUpdatedAt": 1,
+            "nextAiringEpisode": {"episode": 25, "airingAt": at("2026-09-20T22:30:00+08:00")}
+        }]);
+        state["tasks"] = json!([
+            {"id": "35760-24", "animeId": 35760, "episode": 24,
+             "airingAt": at("2026-03-26T23:00:00+08:00"), "status": "pending",
+             "createdAt": 1, "completedAt": Value::Null, "syncUpdatedAt": 1},
+            {"id": "35760-23", "animeId": 35760, "episode": 23,
+             "airingAt": at("2026-09-01T00:00:00+08:00"), "status": "pending",
+             "createdAt": 1, "completedAt": Value::Null, "syncUpdatedAt": 1},
+            {"id": "35760-22", "animeId": 35760, "episode": 22,
+             "airingAt": at("2026-08-30T00:00:00+08:00"), "status": "completed",
+             "createdAt": 1, "completedAt": 2, "syncUpdatedAt": 1}
+        ]);
+        let map = json!({"bySubject": {}, "anilistIndex": {"16498": 35760}});
+        let now = at("2026-09-06T12:00:00+08:00");
+        let media = HashMap::from([authority_media(
+            16498,
+            Value::Null,
+            json!([
+                {"episode": 24, "airingAt": at("2026-03-26T22:30:00+08:00")},
+                {"episode": 23, "airingAt": at("2026-03-19T22:30:00+08:00")}
+            ]),
+        )]);
+
+        assert!(apply_anilist_authority_media(&mut state, &map, &media, now));
+
+        assert!(state["following"][0]["nextAiringEpisode"].is_null());
+        let tasks = state["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 3);
+        // 已播集时间纠偏。
+        assert_eq!(tasks[0]["id"], "35760-24");
+        assert_eq!(tasks[0]["airingAt"], at("2026-03-26T22:30:00+08:00"));
+        // 已播待看积压与 completed 全部保留。
+        assert_eq!(tasks[1]["id"], "35760-23");
+        assert_eq!(tasks[1]["status"], "pending");
+        assert_eq!(tasks[2]["id"], "35760-22");
+        assert_eq!(tasks[2]["status"], "completed");
+    }
+
+    #[cfg(feature = "standard")]
+    #[test]
+    fn anilist_authority_apply_is_idempotent() {
+        // 幂等：同一权威 media 应用两次，第二次零变更（next 重写只比较
+        // (episode, airingAt)，timeUntilAiring 随 now 漂移不参与）。
+        let mut state = default_state(false);
+        state["following"] = json!([{
+            "id": 568572, "source": "bangumi", "anilistId": 195600, "bangumiId": 568572,
+            "displayTitle": "黄泉的使者", "episodes": 13, "followedAt": 1, "syncUpdatedAt": 1,
+            "nextAiringEpisode": {"episode": 24, "airingAt": at("2026-09-13T00:00:00+08:00")}
+        }]);
+        state["tasks"] = json!([
+            {"id": "568572-23", "animeId": 568572, "episode": 23,
+             "airingAt": at("2026-09-06T00:00:00+08:00"), "status": "pending",
+             "createdAt": 1, "completedAt": Value::Null, "syncUpdatedAt": 1}
+        ]);
+        let map = json!({"bySubject": {}, "anilistIndex": {"195600": 568572}});
+        let now = at("2026-09-06T12:00:00+08:00");
+        let media = HashMap::from([authority_media(
+            195600,
+            json!({"episode": 23, "airingAt": at("2026-09-12T22:30:00+08:00")}),
+            json!([{"episode": 22, "airingAt": at("2026-09-05T22:30:00+08:00")}]),
+        )]);
+
+        assert!(apply_anilist_authority_media(&mut state, &map, &media, now));
+        let after = state.clone();
+        // 第二轮 now 不同（timeUntilAiring 变化）仍必须零变更。
+        assert!(!apply_anilist_authority_media(
+            &mut state,
+            &map,
+            &media,
+            now + 600
+        ));
+        assert_eq!(state, after);
+    }
+
+    #[cfg(feature = "standard")]
+    #[test]
+    fn anilist_authority_refresh_silently_fails_on_network_errors() {
+        use crate::bangumi::test_support::MockBangumiServer;
+
+        let map = json!({"bySubject": {}, "anilistIndex": {"195600": 568572}});
+        let state = Mutex::new(json!({
+            "following": [{"id": 568572, "source": "bangumi", "anilistId": 195600,
+                           "followedAt": 1, "syncUpdatedAt": 1}],
+            "tasks": []
+        }));
+        let client = reqwest::Client::new();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio test runtime");
+
+        // a) 连接不可达（127.0.0.1:9 discard 端口）→ 静默 false，状态不动。
+        let refreshed = runtime.block_on(anilist_authority_refresh(
+            &state,
+            &map,
+            "http://127.0.0.1:9/",
+            &client,
+            &[195600],
+            at("2026-09-06T12:00:00+08:00"),
+        ));
+        assert!(!refreshed);
+        assert!(state.lock().unwrap()["following"][0]["nextAiringEpisode"].is_null());
+
+        // b) GraphQL errors 响应 → 静默 false。
+        let erroring = MockBangumiServer::spawn(std::sync::Arc::new(
+            |_method, _target, _headers, _body| {
+                (
+                    200,
+                    vec![],
+                    json!({"errors": [{"message": "boom"}], "data": Value::Null}).to_string(),
+                )
+            },
+        ));
+        let refreshed = runtime.block_on(anilist_authority_refresh(
+            &state,
+            &map,
+            &erroring.url(),
+            &client,
+            &[195600],
+            at("2026-09-06T12:00:00+08:00"),
+        ));
+        assert!(!refreshed);
+        assert!(state.lock().unwrap()["following"][0]["nextAiringEpisode"].is_null());
+    }
+
+    #[cfg(feature = "standard")]
+    #[test]
+    fn anilist_authority_fetch_paginates_graphql_pages() {
+        use crate::bangumi::test_support::MockBangumiServer;
+
+        // 两页 media（lastPage=2）：验证分页抓取与请求形制（query 名、
+        // variables.ids 原样透传、页码递增）。
+        let requested: Mutex<Vec<Value>> = Mutex::new(Vec::new());
+        let capture = std::sync::Arc::new(requested);
+        let writer = capture.clone();
+        let server = MockBangumiServer::spawn(std::sync::Arc::new(
+            move |_method, _target, _headers, body| {
+                let payload: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+                let page = value_i64(payload["variables"].get("page"));
+                writer.lock().unwrap().push(payload);
+                let media = if page == 1 {
+                    json!([authority_media(
+                        195600,
+                        json!({"episode": 23, "airingAt": at("2026-09-12T22:30:00+08:00")}),
+                        json!([])
+                    )
+                    .1])
+                } else {
+                    json!([authority_media(
+                        163134,
+                        json!({"episode": 11, "airingAt": at("2026-09-11T22:30:00+08:00")}),
+                        json!([])
+                    )
+                    .1])
+                };
+                (
+                    200,
+                    vec![],
+                    json!({"data": {"Page": {
+                        "pageInfo": {"lastPage": 2}, "media": media
+                    }}})
+                    .to_string(),
+                )
+            },
+        ));
+
+        let client = reqwest::Client::new();
+        let media = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio test runtime")
+            .block_on(fetch_anilist_authority_media(
+                &client,
+                &server.url(),
+                &[195600, 163134],
+            ))
+            .expect("authority media");
+
+        assert_eq!(media.len(), 2);
+        assert!(media.contains_key(&195600));
+        assert!(media.contains_key(&163134));
+        let requests = capture.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests
+            .iter()
+            .all(|request| request["query"].as_str().unwrap_or_default().contains("AniListAuthority")));
+        assert_eq!(requests[0]["variables"]["ids"], json!([195600, 163134]));
+        assert_eq!(requests[0]["variables"]["page"], 1);
+        assert_eq!(requests[1]["variables"]["page"], 2);
+    }
+
+    #[cfg(feature = "standard")]
+    #[test]
+    fn reconcile_drops_pending_tasks_at_or_beyond_known_anilist_next() {
+        // reconcile_following_entries 的无网络版纠偏（覆盖加载路径）：无职转生
+        // （501963, anilistId=178789）本地 next=ep11 时，pending ep11/ep12 删除
+        // （airingAt 已是过去也删——purge 拦不住的过去假票），ep10 待看积压与
+        // ep9 completed 保留。幂等。
+        let mut state = default_state(false);
+        state["following"] = json!([{
+            "id": 501963, "source": "bangumi", "anilistId": 178789, "bangumiId": 501963,
+            "displayTitle": "无职转生 III", "episodes": 12, "followedAt": 1, "syncUpdatedAt": 1,
+            "nextAiringEpisode": {"episode": 11, "airingAt": at("2026-09-06T23:00:00+08:00")}
+        }]);
+        let past = now_seconds() - 3_600;
+        state["tasks"] = json!([
+            {"id": "501963-12", "animeId": 501963, "episode": 12, "airingAt": past,
+             "status": "pending", "createdAt": 1, "completedAt": Value::Null, "syncUpdatedAt": 1},
+            {"id": "501963-11", "animeId": 501963, "episode": 11, "airingAt": past,
+             "status": "pending", "createdAt": 1, "completedAt": Value::Null, "syncUpdatedAt": 1},
+            {"id": "501963-10", "animeId": 501963, "episode": 10, "airingAt": past,
+             "status": "pending", "createdAt": 1, "completedAt": Value::Null, "syncUpdatedAt": 1},
+            {"id": "501963-9", "animeId": 501963, "episode": 9, "airingAt": past,
+             "status": "completed", "createdAt": 1, "completedAt": 2, "syncUpdatedAt": 1}
+        ]);
+        let map = json!({"bySubject": {}, "anilistIndex": {"178789": 501963}});
+
+        assert!(reconcile_following_entries(&mut state, &map, false));
+        let ids: Vec<String> = state["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|task| value_string(task.get("id")))
+            .collect();
+        assert_eq!(ids, vec!["501963-10", "501963-9"]);
 
         // 幂等：再次 reconcile 任务集不再变化。
         let before = state["tasks"].clone();
