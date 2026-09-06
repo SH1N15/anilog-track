@@ -39,12 +39,31 @@ fn configuration_payload(context: &AppContext) -> anyhow::Result<Value> {
         .into_iter()
         .flatten()
         .map(|item| {
+            // Phase 2 主键迁移 additive 字段（source/subjectId/anilistId）：
+            // MobileStore.java 按需 opt* 取键，未知键无害（schema §10）。
+            // 缺省 source 视为 anilist；bangumi 条目 id 即 subjectId，
+            // anilistId 为 AniList 关联；anilist 条目反之。
+            let source = {
+                let value = value_string(item.get("source"));
+                if value.is_empty() { "anilist".to_string() } else { value }
+            };
+            let id = value_i64(item.get("id"));
+            let bangumi = source == "bangumi";
+            let subject_id = if bangumi { id } else { value_i64(item.get("subjectId")) };
+            let anilist_id = if bangumi {
+                value_i64(item.get("anilistId"))
+            } else {
+                id
+            };
             json!({
-                "id": value_i64(item.get("id")),
+                "id": id,
                 "displayTitle": value_string(item.get("displayTitle")),
                 "coverImage": value_string(item.get("coverImage")),
                 "nextEpisode": value_i64(item["nextAiringEpisode"].get("episode")),
-                "nextAiringAt": value_i64(item["nextAiringEpisode"].get("airingAt"))
+                "nextAiringAt": value_i64(item["nextAiringEpisode"].get("airingAt")),
+                "source": source,
+                "subjectId": if subject_id > 0 { json!(subject_id) } else { Value::Null },
+                "anilistId": if anilist_id > 0 { json!(anilist_id) } else { Value::Null }
             })
         })
         .collect::<Vec<_>>();
@@ -161,7 +180,8 @@ fn merge_status(app: &AppHandle, context: &AppContext, status: &Value) -> anyhow
             } else {
                 now_seconds()
             };
-            state["tasks"].as_array_mut().unwrap().push(json!({
+            #[cfg_attr(not(feature = "standard"), expect(unused_mut))]
+            let mut new_task = json!({
                 "id": id,
                 "animeId": anime_id,
                 "animeTitle": title,
@@ -172,7 +192,23 @@ fn merge_status(app: &AppHandle, context: &AppContext, status: &Value) -> anyhow
                 "createdAt": created_at,
                 "completedAt": null,
                 "syncUpdatedAt": now_millis()
-            }));
+            });
+            // Phase 2 additive 任务字段（standard 写入，original 行为不变）；
+            // animeId 已与 following 载荷 id 一致（bangumi 条目即 subjectId）。
+            #[cfg(feature = "standard")]
+            {
+                let subject_sourced = state["following"].as_array().is_some_and(|items| {
+                    items.iter().any(|item| {
+                        value_i64(item.get("id")) == anime_id
+                            && value_string(item.get("source")) == "bangumi"
+                    })
+                });
+                new_task["subjectId"] = if subject_sourced { json!(anime_id) } else { Value::Null };
+                new_task["episodeId"] = Value::Null;
+                new_task["episodeSortKey"] = json!(episode.to_string());
+                new_task["episodeType"] = json!("regular");
+            }
+            state["tasks"].as_array_mut().unwrap().push(new_task);
             known.insert(id);
             created += 1;
         }
@@ -343,33 +379,13 @@ pub fn test_webdav_connection(app: &AppHandle) -> anyhow::Result<Value> {
 // 返回 JSON 约定：getToken → {token: string|null}；save → {ok: bool}；clear → {ok: bool}。
 // 决策 12：Java 层 BangumiTokenStore 只做 Keystore 凭据存取，绝不发起任何
 // Bangumi 网络请求；HTTP 全部由 Rust 层发起且 original 的 Rust 永不调用。
+//
+// Rust 侧唯一桥接入口是下方 MobileBangumiTokenStore（实现 BangumiTokenStore
+// trait，经 AppContext.bangumi_tokens 被 bangumi_commands 各命令使用）。
+// Phase 1 曾另留 bangumi_get/save/clear_token 三个独立桥封装函数，与本结构
+// 完全重复且无调用方（dead_code），Phase 2 任务 4 已删除；若未来需要非 trait
+// 的直连封装，从这里恢复（方法名/返回 JSON 约定不变）。
 // ---------------------------------------------------------------------------
-
-/// 读取 Bangumi Token；无 Token 时返回 `None`。
-#[cfg(feature = "standard")]
-pub fn bangumi_get_token(app: &AppHandle) -> anyhow::Result<Option<String>> {
-    let value = app.state::<MobileBridge>().run("bangumiGetToken", json!({}))?;
-    Ok(value
-        .get("token")
-        .and_then(Value::as_str)
-        .map(str::to_string))
-}
-
-/// 写入 Bangumi Token；返回插件是否确认成功。
-#[cfg(feature = "standard")]
-pub fn bangumi_save_token(app: &AppHandle, token: &str) -> anyhow::Result<bool> {
-    let value = app
-        .state::<MobileBridge>()
-        .run("bangumiSaveToken", json!({ "token": token }))?;
-    Ok(value_bool(value.get("ok")))
-}
-
-/// 清除 Bangumi Token；返回插件是否确认成功。
-#[cfg(feature = "standard")]
-pub fn bangumi_clear_token(app: &AppHandle) -> anyhow::Result<bool> {
-    let value = app.state::<MobileBridge>().run("bangumiClearToken", json!({}))?;
-    Ok(value_bool(value.get("ok")))
-}
 
 /// 桥实现 [`BangumiTokenStore`]：Rust 命令层经此在 Android Keystore 中读写
 /// Bangumi Token（仿 WebDAV 桥的现有写法）。桥失败统一映射为固定文案

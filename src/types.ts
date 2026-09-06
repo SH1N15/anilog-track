@@ -30,6 +30,10 @@ export interface Anime {
   nextAiringEpisode?: AiringEpisode | null;
   airingSchedule?: { nodes: AiringEpisode[] };
   siteUrl?: string;
+  // Phase 2（Bangumi 主数据源迁移）：Bangumi 来源条目 id=subjectId、siteUrl=https://bgm.tv/subject/{id}、native 标题优先中文名。
+  source?: 'anilist' | 'bangumi';
+  bangumiSubjectId?: number | null;
+  anilistId?: number | null;
 }
 
 export interface AiringEpisode {
@@ -51,6 +55,11 @@ export interface FollowedAnime {
   siteUrl?: string;
   followedAt: number;
   syncUpdatedAt?: number;
+  // Phase 2 主键迁移新增（可选，向后兼容）。
+  source?: 'anilist' | 'bangumi';
+  anilistId?: number | null;
+  mapping?: BangumiMapping | null;
+  mappingPending?: boolean;
 }
 
 export interface WatchTask {
@@ -180,6 +189,10 @@ export interface DesktopApi {
   bangumiTestConnection?(params: { baseUrl?: string | null }): Promise<BangumiConnectionTestResult>;
   bangumiGetUserProfile?(): Promise<BangumiUserProfile | null>;
   bangumiGetUserCollections?(params: { offset?: number; limit?: number }): Promise<{ total: number; items: BangumiCollectionItem[] }>;
+  bangumiResolveMapping?(params: { animeId: number }): Promise<BangumiMappingResolution>;
+  bangumiConfirmMapping?(params: { animeId: number; subjectId: number }): Promise<AppState>;
+  bangumiSkipMapping?(params: { animeId: number }): Promise<AppState>;
+  bangumiGetSubjectExtras?(params: { subjectId: number }): Promise<BangumiSubjectExtras | null>;
   openExternal(url: string): Promise<void>;
   onStateChanged(callback: (state: AppState) => void): () => void;
   onSeasonUpdated(callback: (update: { season: Season; year: number; anime: Anime[]; fetchedAt: number }) => void): () => void;
@@ -313,8 +326,38 @@ export interface BangumiConnectionTestResult {
   nickname?: string | null;
 }
 
-// Phase 2 计划（主键迁移，当前不改动现有字段）：
-//   FollowedAnime 将新增可选字段 anilistId?: number | null、source?: 'anilist' | 'bangumi'、
-//   mapping?: BangumiMapping | null、subjectId?: number（迁移后作为主键来源）。
-//   WatchTask 将新增可选字段 episodeId?: number | null、episodeSortKey?: string、
-//   episodeType?: BangumiEpisodeType、subjectId?: number，并与 BangumiEpisodeRecord 对齐。
+// Phase 2 已落地：FollowedAnime 新增可选字段 source/anilistId/mapping/mappingPending（见上方接口）。
+//   WatchTask 的可选字段 episodeId/episodeSortKey/episodeType/subjectId 待任务层迁移接入后再补。
+
+// —— Phase 2（季度主链 + 主键迁移 + 卡片增强，Rust 命令镜像，camelCase）——
+export interface BangumiMappingCandidate {
+  subjectId: number;
+  name: string;
+  nameCn: string | null;
+  date: string | null;
+  begin?: string | null;
+  score?: number;
+}
+
+export interface BangumiMappingResolution {
+  status: 'mapped' | 'pending' | 'unavailable';
+  subjectId: number | null;
+  candidates: BangumiMappingCandidate[];
+  anime: {
+    id: number;
+    displayTitle: string;
+    seasonYear: number | null;
+    format: string | null;
+    coverImage: string;
+  };
+}
+
+export interface BangumiSubjectExtras {
+  fetchedAt: number;
+  rating?: { score: number | null; total: number | null; rank: number | null } | null;
+  tags: Array<{ name: string; count: number }>;
+  characters: Array<{ id: number; name: string; nameCn: string | null; relation: string; imageUrl?: string | null }>;
+  related: Array<{ id: number; name: string; nameCn: string | null; relation: string; imageUrl?: string | null }>;
+  staff: Array<{ key: string; value: string }>;
+  siteUrl: string;
+}

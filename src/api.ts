@@ -758,6 +758,13 @@ const browserApi: DesktopApi = {
   async bangumiTestConnection() { return { ok: false, message: '当前平台不支持 Bangumi 账户同步', username: null, nickname: null }; },
   async bangumiGetUserProfile() { return null; },
   async bangumiGetUserCollections() { return { total: 0, items: [] }; },
+  // Phase 2：浏览器/Electron 回退路径不接入 Bangumi 主数据链，映射与条目增强一律返回空结果。
+  async bangumiResolveMapping() {
+    return { status: 'unavailable', subjectId: null, candidates: [], anime: { id: 0, displayTitle: '', seasonYear: null, format: null, coverImage: '' } };
+  },
+  async bangumiConfirmMapping() { return browserState; },
+  async bangumiSkipMapping() { return browserState; },
+  async bangumiGetSubjectExtras() { return null; },
   async toggleTask(taskId) {
     const task = browserState.tasks.find((item) => item.id === taskId);
     if (task) {

@@ -1081,10 +1081,30 @@ pub struct BroadcastSite<'a> {
     pub broadcast: Option<&'a str>,
 }
 
+/// 按 `preferred` 站点优先级选出有效播出时间源（Phase 2 播出四级优先 ①；
+/// 与 [`next_broadcast_after`] 的选站逻辑一致，供需要规则起点/周期做逐期
+/// 推算的调用方——如季度列表 nextAiringEpisode 与本地逐期调度——复用）。
+/// 返回 `(begin, broadcast)`：命中站点时返回站点级字段，否则返回条目级字段。
+pub fn select_broadcast_source<'a>(
+    begin: Option<&'a str>,
+    broadcast: Option<&'a str>,
+    sites: &[BroadcastSite<'a>],
+    preferred: &[String],
+) -> (Option<&'a str>, Option<&'a str>) {
+    for name in preferred {
+        if let Some(site) = sites.iter().find(|site| {
+            site.site == name.as_str() && (site.begin.is_some() || site.broadcast.is_some())
+        }) {
+            return (site.begin, site.broadcast);
+        }
+    }
+    (begin, broadcast)
+}
+
 /// 计算下一次播出时刻（严格晚于 `after`），返回 UTC 时刻。
 ///
 /// 1. 选时间源：按 `preferred` 顺序找第一个有 begin/broadcast 的站点；
-///    否则使用条目级 begin/broadcast；
+///    否则使用条目级 begin/broadcast（见 [`select_broadcast_source`]）；
 /// 2. 有 broadcast `R/<start>/P<nD|nW>`：从 start 起按周期步进找第一个
 ///    `> after` 的时刻（周期支持 D/W，够 bangumi-data 的周播场景；其他
 ///    RFC5545 周期形式不支持，返回 None）；
@@ -1097,18 +1117,7 @@ pub fn next_broadcast_after(
     preferred: &[String],
     after: DateTime<impl TimeZone>,
 ) -> Option<DateTime<Utc>> {
-    let mut selected_begin = begin;
-    let mut selected_broadcast = broadcast;
-    for name in preferred {
-        if let Some(site) = sites
-            .iter()
-            .find(|site| site.site == name.as_str() && (site.begin.is_some() || site.broadcast.is_some()))
-        {
-            selected_begin = site.begin;
-            selected_broadcast = site.broadcast;
-            break;
-        }
-    }
+    let (selected_begin, selected_broadcast) = select_broadcast_source(begin, broadcast, sites, preferred);
     if let Some(rule) = selected_broadcast {
         if let Some(occurrence) = next_recurrence(rule, &after) {
             return Some(occurrence);
@@ -1119,12 +1128,19 @@ pub fn next_broadcast_after(
     (start > after).then_some(start)
 }
 
-/// 解析 `R/<start>/P<nD|nW>` 并步进到第一个严格晚于 `after` 的时刻。
-fn next_recurrence(rule: &str, after: &DateTime<impl TimeZone>) -> Option<DateTime<Utc>> {
+/// 解析 `R/<start>/P<nD|nW>` 为（起点 UTC, 周期）。
+/// 供 [`next_recurrence`] 步进与 Phase 2 的本地逐期调度生成复用。
+pub fn parse_recurrence_rule(rule: &str) -> Option<(DateTime<Utc>, Duration)> {
     let rest = rule.trim().strip_prefix('R')?.strip_prefix('/')?;
     let (start_raw, period_raw) = rest.split_once('/')?;
     let start = parse_instant(start_raw)?;
     let step = parse_period(period_raw)?;
+    Some((start, step))
+}
+
+/// 解析 `R/<start>/P<nD|nW>` 并步进到第一个严格晚于 `after` 的时刻。
+fn next_recurrence(rule: &str, after: &DateTime<impl TimeZone>) -> Option<DateTime<Utc>> {
+    let (start, step) = parse_recurrence_rule(rule)?;
     let mut occurrence = start;
     for _ in 0..MAX_RECURRENCE_STEPS {
         if occurrence > *after {
@@ -1884,6 +1900,254 @@ pub fn bangumi_collection_json(collection: &BangumiCollection) -> Value {
 }
 
 // ---------------------------------------------------------------------------
+// O. Phase 2 映射引擎（AniList → Bangumi 主键解析；schema §4）。
+//
+// 优先级：已有手动映射 > 离线映射表（anilistIndex / bySubject.a 直查）>
+// 标题+年份+季节综合评分（复用 offline_bangumi_match 的评分模式）> 无法判定。
+// 强制规则（schema §4 冻结）：
+// - 评分差距 < MAPPING_AUTO_SCORE_GAP 的多候选一律 Candidates，不自动绑定；
+// - 电影 / OVA / 特别篇 format 一律不自动绑定（走用户确认）；
+// - 仅标题相同（无日期佐证）永远拿不到 high。
+// ---------------------------------------------------------------------------
+
+/// 单个映射候选（`bangumi_resolve_mapping` 命令 candidates 投影）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MappingCandidate {
+    pub subject_id: i64,
+    pub name: String,
+    pub name_cn: String,
+    pub date: String,
+    pub platform: Option<String>,
+    pub begin: Option<String>,
+    pub score: i64,
+}
+
+/// 解析结果：确定绑定 / 多候选待确认 / 无法判定。
+#[derive(Debug, Clone, PartialEq)]
+pub enum MappingResolution {
+    /// 可确定唯一 subject。`method` 只有 Local（离线表直查）与
+    /// TitleYear（评分裁决）两种；manual/external 映射由调用层负责。
+    Mapped {
+        subject_id: i64,
+        confidence: MappingConfidence,
+        method: MappingMethod,
+    },
+    /// 存在多个候选或低分：给出候选列表，由用户确认。
+    Candidates(Vec<MappingCandidate>),
+    /// 无法判定（无任何候选）。
+    None,
+}
+
+/// 自动绑定要求第一名领先第二名至少该分差（schema §4：多候选不强配）。
+pub const MAPPING_AUTO_SCORE_GAP: i64 = 8;
+/// 评分达到该值（标题精确 + 日期精确量级）才允许 high 自动绑定。
+pub const MAPPING_HIGH_SCORE: i64 = 215;
+/// 评分达到该值（标题精确+年份、部分标题+日期等量级）允许 medium 自动绑定。
+pub const MAPPING_MEDIUM_SCORE: i64 = 130;
+/// 候选列表的展示下限：仅展示有标题信号（或更强）的候选，
+/// 避免纯 format 弱分噪声进入确认 UI。
+pub const MAPPING_CANDIDATE_MIN_SCORE: i64 = 90;
+/// 单个候选的评分权重（与 offline_bangumi_match 保持同一量纲）。
+const MAPPING_TITLE_EXACT: i64 = 100;
+const MAPPING_TITLE_PARTIAL: i64 = 55;
+const MAPPING_DATE_EXACT: i64 = 120;
+const MAPPING_YEAR_MATCH: i64 = 30;
+const MAPPING_FORMAT_MATCH: i64 = 10;
+
+/// 电影 / OVA / 特别篇不自动绑定（schema §4：续作、特别篇必须允许用户确认）。
+fn mapping_format_blocks_auto(anime_format: &str) -> bool {
+    matches!(anime_format, "MOVIE" | "OVA" | "SPECIAL")
+}
+
+fn mapping_score_subject(anime: &Value, subject: &Value) -> i64 {
+    let anime_keys: Vec<String> = ["native", "romaji", "english"]
+        .iter()
+        .filter_map(|key| anime["title"].get(*key).and_then(Value::as_str))
+        .map(crate::normalize_title_key)
+        .filter(|key| !key.is_empty())
+        .collect();
+    let subject_key = crate::normalize_title_key(&crate::value_string(subject.get("t")));
+    let subject_date = crate::value_string(subject.get("d"));
+    let start_date = crate::anime_start_date(anime);
+    let start_year = start_date.get(0..4).unwrap_or_default().to_string();
+    let anime_format = crate::value_string(anime.get("format"));
+    let mut score = 0;
+    if !subject_key.is_empty() {
+        if anime_keys.iter().any(|key| key == &subject_key) {
+            score += MAPPING_TITLE_EXACT;
+        } else if anime_keys
+            .iter()
+            .any(|key| key.contains(&subject_key) || subject_key.contains(key))
+        {
+            score += MAPPING_TITLE_PARTIAL;
+        }
+    }
+    if !start_date.is_empty() && subject_date == start_date {
+        score += MAPPING_DATE_EXACT;
+    } else if !start_year.is_empty() && subject_date.starts_with(&start_year) {
+        score += MAPPING_YEAR_MATCH;
+    }
+    if crate::offline_format_matches(&anime_format, &crate::value_string(subject.get("f"))) {
+        score += MAPPING_FORMAT_MATCH;
+    }
+    score
+}
+
+fn mapping_candidate_from(subject: &Value, score: i64) -> MappingCandidate {
+    let platform = subject["sites"]
+        .as_array()
+        .and_then(|sites| sites.first())
+        .and_then(|site| site.get("s"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    MappingCandidate {
+        subject_id: crate::value_i64(subject.get("b")),
+        name: crate::value_string(subject.get("t")),
+        name_cn: crate::value_string(subject.get("c")),
+        date: crate::value_string(subject.get("d")),
+        platform,
+        begin: subject
+            .get("begin")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        score,
+    }
+}
+
+/// 评分裁决：对候选池打分排序，按阈值/分差/format 规则决定 Mapped 或 Candidates。
+fn mapping_decide_by_score(anime: &Value, pool: &[Value], method: MappingMethod) -> MappingResolution {
+    if pool.is_empty() {
+        return MappingResolution::None;
+    }
+    let mut ranked: Vec<(i64, &Value)> =
+        pool.iter().map(|subject| (mapping_score_subject(anime, subject), subject)).collect();
+    ranked.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| {
+                crate::value_i64(left.1.get("b")).cmp(&crate::value_i64(right.1.get("b")))
+            })
+    });
+    let candidates: Vec<MappingCandidate> = ranked
+        .iter()
+        .filter(|(score, _)| *score >= MAPPING_CANDIDATE_MIN_SCORE)
+        .take(5)
+        .map(|(score, subject)| mapping_candidate_from(subject, *score))
+        .collect();
+    // 电影 / OVA / 特别篇一律不自动绑定（schema §4）。
+    if mapping_format_blocks_auto(&crate::value_string(anime.get("format"))) {
+        return if candidates.is_empty() {
+            MappingResolution::None
+        } else {
+            MappingResolution::Candidates(candidates)
+        };
+    }
+    let Some((top_score, top)) = ranked.first() else {
+        return MappingResolution::None;
+    };
+    if ranked.len() > 1 && top_score - ranked[1].0 < MAPPING_AUTO_SCORE_GAP {
+        return if candidates.is_empty() {
+            MappingResolution::None
+        } else {
+            MappingResolution::Candidates(candidates)
+        };
+    }
+    if *top_score < MAPPING_MEDIUM_SCORE {
+        return if candidates.is_empty() {
+            MappingResolution::None
+        } else {
+            MappingResolution::Candidates(candidates)
+        };
+    }
+    MappingResolution::Mapped {
+        subject_id: crate::value_i64(top.get("b")),
+        confidence: if *top_score >= MAPPING_HIGH_SCORE {
+            MappingConfidence::High
+        } else {
+            MappingConfidence::Medium
+        },
+        method,
+    }
+}
+
+/// AniList 追番条目 → Bangumi subject 解析（schema §4 优先级 1-4）。
+///
+/// `entry` 为 following 条目（`id` 为 AniList id 或已重键的 subjectId，
+/// 携带 `title`/`startDate`/`format`/`mapping`/`bangumiId`）。已有手动映射
+/// 直接返回 Mapped（不会在自动路径中触发——调用方对已有 mapping 的条目跳过）。
+pub fn resolve_mapping_candidates(map: &Value, entry: &Value) -> MappingResolution {
+    let anime_id = crate::value_i64(entry.get("id"));
+    if anime_id <= 0 {
+        return MappingResolution::None;
+    }
+    // 优先级 1：已有手动映射（防御性；自动路径不会对已有 mapping 的条目调用）。
+    let mapping = entry.get("mapping").filter(|value| !value.is_null());
+    if crate::value_string(mapping.and_then(|value| value.get("method"))) == "manual" {
+        let subject_id = crate::value_i64(entry.get("bangumiId"));
+        if subject_id > 0 {
+            return MappingResolution::Mapped {
+                subject_id,
+                confidence: MappingConfidence::High,
+                method: MappingMethod::Local,
+            };
+        }
+    }
+    let by_subject = map.get("bySubject").and_then(Value::as_object);
+    // 优先级 2：离线映射表直查（bySubject.a 精确关联）。
+    let linked: Vec<Value> = by_subject
+        .map(|subjects| {
+            subjects
+                .values()
+                .filter(|subject| crate::value_i64(subject.get("a")) == anime_id)
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    if linked.len() == 1 {
+        return MappingResolution::Mapped {
+            subject_id: crate::value_i64(linked[0].get("b")),
+            confidence: MappingConfidence::High,
+            method: MappingMethod::Local,
+        };
+    }
+    if linked.len() > 1 {
+        // 同一 AniList id 关联多个 subject：仍走评分裁决消除歧义。
+        return mapping_decide_by_score(entry, &linked, MappingMethod::Local);
+    }
+    // anilistIndex 代表条目兜底（build.rs 精选，视为权威）。
+    if let Some(subject_id) = map
+        .get("anilistIndex")
+        .and_then(|index| index.get(anime_id.to_string()))
+        .and_then(Value::as_i64)
+    {
+        if let Some(subject) = by_subject.and_then(|subjects| subjects.get(&subject_id.to_string()))
+        {
+            return MappingResolution::Mapped {
+                subject_id: crate::value_i64(subject.get("b")),
+                confidence: MappingConfidence::High,
+                method: MappingMethod::Local,
+            };
+        }
+    }
+    // 优先级 3/4：标题+年份+季节综合评分（跳过已绑定其它 AniList id 的条目）。
+    let pool: Vec<Value> = by_subject
+        .map(|subjects| {
+            subjects
+                .values()
+                .filter(|subject| {
+                    let linked_id = crate::value_i64(subject.get("a"));
+                    linked_id == 0 || linked_id == anime_id
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    mapping_decide_by_score(entry, &pool, MappingMethod::TitleYear)
+}
+
+// ---------------------------------------------------------------------------
 // 测试（cfg(test)）；整个模块仅在 standard feature 下编译，
 // 因此这些测试只进 standard 门禁。
 // ---------------------------------------------------------------------------
@@ -1905,6 +2169,9 @@ pub(crate) mod test_support {
         pub method: String,
         pub target: String,
         pub headers: HashMap<String, String>,
+        /// 当前断言只用 method/target/headers；body 保留给写请求断言
+        /// （Phase 3 收藏/进度写回），避免届时改 mock 捕获层。
+        #[allow(dead_code)]
         pub body: String,
     }
 
@@ -1940,6 +2207,11 @@ pub(crate) mod test_support {
 
         pub fn url(&self) -> String {
             format!("http://{}", self.addr)
+        }
+
+        /// 端口号（测试用临时目录名等场景）。
+        pub fn port(&self) -> u16 {
+            self.addr.port()
         }
 
         pub fn requests(&self) -> Vec<RequestRecord> {
@@ -2182,9 +2454,16 @@ mod tests {
 
         let expected = serde_json::to_value(BangumiSyncSettings::default()).unwrap();
         assert_eq!(merged["bangumi"], expected);
-        // 原字段不动。
-        assert_eq!(merged["following"], following_before);
-        assert_eq!(merged["tasks"], tasks_before);
+        // Phase 2（STATE_VERSION 3）：standard 版为记录补 additive 默认键，
+        // 既有业务字段与 id 原样保留。
+        assert_eq!(merged["following"][0]["id"], following_before[0]["id"]);
+        assert_eq!(merged["following"][0]["displayTitle"], following_before[0]["displayTitle"]);
+        assert_eq!(merged["following"][0]["followedAt"], following_before[0]["followedAt"]);
+        assert_eq!(merged["following"][0]["source"], "anilist");
+        assert_eq!(merged["following"][0]["mappingPending"], false);
+        assert_eq!(merged["tasks"][0]["id"], tasks_before[0]["id"]);
+        assert_eq!(merged["tasks"][0]["episodeType"], "regular");
+        assert_eq!(merged["tasks"][0]["episodeSortKey"], "1");
         assert_eq!(merged["version"], crate::STATE_VERSION);
         assert_eq!(merged["settings"]["uiLanguage"], "zh-CN");
     }

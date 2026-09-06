@@ -17,6 +17,7 @@ import {
   Inbox,
   Languages,
   LayoutGrid,
+  Link2,
   ListChecks,
   LoaderCircle,
   Minus,
@@ -24,17 +25,21 @@ import {
   Network,
   RefreshCw,
   Save,
+  ScrollText,
   Pencil,
   Search,
   Settings,
   SlidersHorizontal,
   Sparkles,
+  Star,
+  Tag,
   Trash2,
   User,
+  Users,
   X,
 } from 'lucide-react';
 import { api } from './api';
-import type { Anime, AppState, BangumiAuthStatus, BangumiTitleMatch, BangumiUserProfile, Season, SeasonViewMode, Settings as AppSettings, UiLanguage, ViewId, WatchTask, WebDavConfig } from './types';
+import type { Anime, AppState, BangumiAuthStatus, BangumiMappingResolution, BangumiSubjectExtras, BangumiTitleMatch, BangumiUserProfile, FollowedAnime, Season, SeasonViewMode, Settings as AppSettings, UiLanguage, ViewId, WatchTask, WebDavConfig } from './types';
 import { IS_ORIGINAL_EDITION, productName, titleForPreference } from './edition';
 import { localizeMessage, normalizeUiLanguage, tr } from './i18n';
 import { createStateRefreshController } from './state-refresh';
@@ -288,7 +293,20 @@ function App() {
                   : t('取消追番后，已完成记录会保留。', 'Completed history will be kept after unfollowing.');
                 if (!window.confirm(t(`确认取消追番《${followed.displayTitle}》吗？\n\n${taskNotice}`, `Unfollow “${followed.displayTitle}”?\n\n${taskNotice}`))) return;
                 if (source) setState(await api.toggleFollow(source));
-                else setState(await api.toggleFollow({ ...followed, coverImage: { medium: followed.coverImage } }));
+                // Bangumi 条目可能不在当前季度列表里；fabricate 的对象需带全标识字段（id 可为 subjectId）。
+                else setState(await api.toggleFollow({
+                  ...followed,
+                  coverImage: { medium: followed.coverImage },
+                  source: followed.source || 'anilist',
+                  bangumiSubjectId: followed.bangumiId ?? (followed.source === 'bangumi' ? followed.id : null),
+                  anilistId: followed.anilistId ?? null,
+                }));
+              }}
+              onConfirmMapping={async (animeId, subjectId) => {
+                if (api.bangumiConfirmMapping) setState(await api.bangumiConfirmMapping({ animeId, subjectId }));
+              }}
+              onSkipMapping={async (animeId) => {
+                if (api.bangumiSkipMapping) setState(await api.bangumiSkipMapping({ animeId }));
               }}
             />
           )}
@@ -347,6 +365,8 @@ function SeasonView({
 
   const requestChineseTitle = useCallback((item: Anime) => {
     if (IS_ORIGINAL_EDITION || !api.resolveBangumiTitle) return;
+    // Bangumi 来源条目自带中文名，不需要标题 resolver（避免逐卡 N+1 搜索）。
+    if (item.source === 'bangumi') return;
     if (requestedTitles.current.has(item.id)) return;
     requestedTitles.current.add(item.id);
     void api.resolveBangumiTitle(item).catch(() => {});
@@ -488,6 +508,8 @@ function SeasonView({
 
 function localizedTitle(anime: Anime, match?: BangumiTitleMatch, preference: AppSettings['titlePreference'] = 'auto', language: UiLanguage = 'zh-CN'): string {
   if (IS_ORIGINAL_EDITION) return titleForPreference(anime.title, preference, language);
+  // Bangumi 来源条目：native 即中文名（displayTitle 优先中文名），无需走标题 resolver。
+  if (anime.source === 'bangumi') return titleOf(anime.title, language);
   return match?.status === 'matched' && match.nameCn ? match.nameCn : reminderTitleOf(anime.title);
 }
 
@@ -560,6 +582,44 @@ function AnimeDetail({ anime, titleMatch, titlePreference, language, followed, o
   const t = (chinese: string, english: string) => tr(language, chinese, english);
   const displayTitle = localizedTitle(anime, titleMatch, titlePreference, language);
   const originalTitle = titleOf(anime.title, language);
+  // Phase 2：standard 下 Bangumi 来源条目（source='bangumi' 或带 bangumiSubjectId）惰性加载条目增强数据；失败静默折叠。
+  const bangumiSubjectId = !IS_ORIGINAL_EDITION && (anime.source === 'bangumi' || typeof anime.bangumiSubjectId === 'number')
+    ? (typeof anime.bangumiSubjectId === 'number' ? anime.bangumiSubjectId : anime.id)
+    : null;
+  const [extras, setExtras] = useState<BangumiSubjectExtras | null>(null);
+  const [extrasReady, setExtrasReady] = useState(false);
+  const [extrasLoading, setExtrasLoading] = useState(false);
+
+  useEffect(() => {
+    if (bangumiSubjectId == null || !api.bangumiGetSubjectExtras) {
+      setExtras(null);
+      setExtrasReady(false);
+      setExtrasLoading(false);
+      return;
+    }
+    let active = true;
+    setExtras(null);
+    setExtrasReady(false);
+    setExtrasLoading(true);
+    api.bangumiGetSubjectExtras({ subjectId: bangumiSubjectId })
+      .then((result) => {
+        if (!active) return;
+        setExtras(result);
+        setExtrasReady(result != null);
+      })
+      .catch(() => { if (active) setExtrasReady(false); })
+      .finally(() => { if (active) setExtrasLoading(false); });
+    return () => { active = false; };
+  }, [bangumiSubjectId]);
+
+  const tags = extras ? [...extras.tags].filter((tag) => tag.count > 0).sort((a, b) => b.count - a.count).slice(0, 8) : [];
+  const staff = extras ? extras.staff.slice(0, 6) : [];
+  const characters = extras ? extras.characters.slice(0, 8) : [];
+  const related = extras ? extras.related.slice(0, 6) : [];
+  const rating = extras?.rating || null;
+  const openBangumiSubject = (subjectId: number) => api.openExternal(`https://bgm.tv/subject/${subjectId}`);
+  const showExtras = extrasReady && extras != null && (rating?.score != null || tags.length > 0 || staff.length > 0 || characters.length > 0 || related.length > 0);
+
   return (
     <div className="modal-backdrop" onMouseDown={onClose}>
       <section className="detail-panel" onMouseDown={(event) => event.stopPropagation()} aria-modal="true" role="dialog">
@@ -578,6 +638,69 @@ function AnimeDetail({ anime, titleMatch, titlePreference, language, followed, o
             </div>
             <p className="description">{stripDescription(anime.description, language)}</p>
             <div className="genre-list">{anime.genres?.map((genre) => <span key={genre}>{genre}</span>)}</div>
+            {showExtras && extras && (
+              <div className="bangumi-extras" style={{ display: 'grid', gap: 12, margin: '14px 0', borderTop: '1px solid rgba(128,128,128,0.25)', paddingTop: 14 }}>
+                {rating?.score != null && (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <Star size={16} />
+                    <span>
+                      <strong>{rating.score}</strong>/10
+                      {rating.total != null ? t(` · ${rating.total} 人评分`, ` · ${rating.total} ratings`) : ''}
+                      {rating.rank != null ? t(` · 排名 #${rating.rank}`, ` · rank #${rating.rank}`) : ''}
+                    </span>
+                  </div>
+                )}
+                {tags.length > 0 && (
+                  <div className="genre-list" aria-label={t('Bangumi 标签', 'Bangumi tags')}>
+                    {tags.map((tag) => <span key={tag.name}>{tag.name}<small style={{ opacity: 0.6 }}> {tag.count}</small></span>)}
+                  </div>
+                )}
+                {staff.length > 0 && (
+                  <div>
+                    <div style={{ fontSize: 13, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}><ScrollText size={14} /> {t('制作人员', 'Staff')}</div>
+                    {staff.map((row) => (
+                      <div key={`${row.key}-${row.value}`} style={{ display: 'flex', gap: 8, fontSize: 13 }}>
+                        <span style={{ opacity: 0.6, flexShrink: 0 }}>{row.key}</span>
+                        <span>{row.value}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {characters.length > 0 && (
+                  <div>
+                    <div style={{ fontSize: 13, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}><Users size={14} /> {t('角色', 'Characters')}</div>
+                    <div style={{ display: 'flex', gap: 12, overflowX: 'auto', paddingBottom: 4 }}>
+                      {characters.map((character) => (
+                        <div key={character.id} style={{ flexShrink: 0, width: 88, textAlign: 'center' }}>
+                          {character.imageUrl
+                            ? <img src={character.imageUrl} alt="" loading="lazy" style={{ width: 64, height: 64, borderRadius: '50%', objectFit: 'cover' }} />
+                            : <span style={{ display: 'inline-block', width: 64, height: 64, borderRadius: '50%', background: 'rgba(128,128,128,0.25)' }} />}
+                          <div style={{ fontSize: 12, marginTop: 4 }}>{character.nameCn || character.name}</div>
+                          <div style={{ fontSize: 11, opacity: 0.6 }}>{character.relation}</div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                {related.length > 0 && (
+                  <div>
+                    <div style={{ fontSize: 13, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}><Link2 size={14} /> {t('关联条目', 'Related subjects')}</div>
+                    {related.map((entry) => (
+                      <button
+                        key={entry.id}
+                        onClick={() => openBangumiSubject(entry.id)}
+                        title={t(`在 Bangumi 打开《${entry.nameCn || entry.name}》`, `Open “${entry.nameCn || entry.name}” on Bangumi`)}
+                        style={{ display: 'flex', gap: 8, alignItems: 'baseline', fontSize: 13, background: 'transparent', border: 'none', color: 'inherit', cursor: 'pointer', padding: '2px 0', textAlign: 'left' }}
+                      >
+                        <span>{entry.nameCn || entry.name}</span>
+                        <span style={{ opacity: 0.6, fontSize: 12 }}>{entry.relation}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+            {extrasLoading && <p style={{ fontSize: 12, opacity: 0.55 }}>{t('正在读取 Bangumi 条目信息…', 'Loading Bangumi subject info…')}</p>}
             {anime.nextAiringEpisode && (
               <div className="next-airing">
                 <Clock3 size={19} />
@@ -588,7 +711,11 @@ function AnimeDetail({ anime, titleMatch, titlePreference, language, followed, o
               <button className={`primary-button ${followed ? 'subtle' : ''}`} onClick={onToggle}>
                 {followed ? <Check size={18} /> : <Bell size={18} />}{followed ? t('已加入追番', 'Following') : t('加入追番', 'Follow')}
               </button>
-              {anime.siteUrl && <button className="secondary-button" onClick={() => api.openExternal(anime.siteUrl!)}><ExternalLink size={17} /> {t('AniList 页面', 'Open on AniList')}</button>}
+              {(anime.siteUrl || bangumiSubjectId != null) && (
+                <button className="secondary-button" onClick={() => (anime.siteUrl ? api.openExternal(anime.siteUrl) : openBangumiSubject(bangumiSubjectId!))}>
+                  <ExternalLink size={17} /> {bangumiSubjectId != null ? t('在 Bangumi 打开', 'Open on Bangumi') : t('AniList 页面', 'Open on AniList')}
+                </button>
+              )}
             </div>
           </div>
         </div>
@@ -651,17 +778,75 @@ function FollowingView({
   onUnfollow,
   onOpenTasks,
   onRename,
+  onConfirmMapping,
+  onSkipMapping,
 }: {
   items: AppState['following'];
   language: UiLanguage;
   onUnfollow: (id: number) => void;
   onOpenTasks: () => void;
   onRename: (id: number, displayTitle: string) => Promise<void>;
+  onConfirmMapping: (animeId: number, subjectId: number) => Promise<void>;
+  onSkipMapping: (animeId: number) => Promise<void>;
 }) {
   const t = (chinese: string, english: string) => tr(language, chinese, english);
   const [editingId, setEditingId] = useState<number | null>(null);
   const [draftTitle, setDraftTitle] = useState('');
+  const [mappingDialogFor, setMappingDialogFor] = useState<number | null>(null);
+  const [mappingBusy, setMappingBusy] = useState(false);
+  const [resolutions, setResolutions] = useState<Record<number, BangumiMappingResolution>>({});
+  const requestedMappings = useRef(new Set<number>());
   const sorted = [...items].sort((a, b) => (a.nextAiringEpisode?.airingAt || Infinity) - (b.nextAiringEpisode?.airingAt || Infinity));
+  const pendingItems = items.filter((item) => item.mappingPending === true);
+
+  // 挂载时对每个待确认条目惰性解析候选；结果缓存在组件 state，确认/跳过后清除。
+  useEffect(() => {
+    if (IS_ORIGINAL_EDITION || !api.bangumiResolveMapping) return;
+    pendingItems.forEach((item) => {
+      if (requestedMappings.current.has(item.id) || resolutions[item.id]) return;
+      requestedMappings.current.add(item.id);
+      api.bangumiResolveMapping!({ animeId: item.id })
+        .then((resolution) => setResolutions((prev) => ({ ...prev, [item.id]: resolution })))
+        .catch(() => setResolutions((prev) => ({
+          ...prev,
+          [item.id]: { status: 'unavailable', subjectId: null, candidates: [], anime: { id: item.id, displayTitle: item.displayTitle, seasonYear: null, format: item.format ?? null, coverImage: item.coverImage } },
+        })));
+    });
+  }, [pendingItems, resolutions]);
+
+  const clearMapping = (animeId: number) => {
+    setResolutions((prev) => {
+      const next = { ...prev };
+      delete next[animeId];
+      return next;
+    });
+    requestedMappings.current.delete(animeId);
+    setMappingDialogFor(null);
+  };
+
+  const handleConfirmMapping = async (animeId: number, subjectId: number) => {
+    setMappingBusy(true);
+    try {
+      await onConfirmMapping(animeId, subjectId);
+      clearMapping(animeId);
+    } finally {
+      setMappingBusy(false);
+    }
+  };
+
+  const handleSkipMapping = async (animeId: number) => {
+    setMappingBusy(true);
+    try {
+      await onSkipMapping(animeId);
+      clearMapping(animeId);
+    } finally {
+      setMappingBusy(false);
+    }
+  };
+
+  const dialogItem = mappingDialogFor != null ? items.find((item) => item.id === mappingDialogFor) || null : null;
+  const dialogResolution = mappingDialogFor != null ? resolutions[mappingDialogFor] || null : null;
+
   return (
     <>
       <section className="section-heading compact">
@@ -676,7 +861,19 @@ function FollowingView({
             <article className="following-row" key={item.id}>
               <img src={item.coverImage} alt="" />
               <div className="following-copy">
-                <span>{formatLabel(item.format, language)} · {t('通知与任务标题', 'Notification and task title')}</span>
+                <span>
+                  {formatLabel(item.format, language)} · {t('通知与任务标题', 'Notification and task title')}
+                  {item.mappingPending === true && (
+                    <button
+                      className="mapping-badge"
+                      style={{ marginLeft: 8, border: '1px solid currentColor', borderRadius: 999, padding: '1px 9px', fontSize: 12, background: 'transparent', color: 'inherit', cursor: 'pointer' }}
+                      title={t('确认 Bangumi 条目映射', 'Confirm the Bangumi subject mapping')}
+                      onClick={() => setMappingDialogFor(item.id)}
+                    >
+                      {t('待确认映射', 'Mapping pending')}
+                    </button>
+                  )}
+                </span>
                 {editingId === item.id ? (
                   <div className="title-editor">
                     <input
@@ -713,14 +910,96 @@ function FollowingView({
               <div className="following-next">
                 <small>{t('下次更新', 'Next episode')}</small>
                 <strong>{item.nextAiringEpisode ? t(`第 ${item.nextAiringEpisode.episode} 集`, `Episode ${item.nextAiringEpisode.episode}`) : t('暂无日程', 'No schedule')}</strong>
-                <span>{item.nextAiringEpisode ? `${formatAiring(item.nextAiringEpisode.airingAt, true, language)} · ${relativeTime(item.nextAiringEpisode.airingAt, language)}` : t('等待 AniList 公布', 'Waiting for AniList')}</span>
+                <span>{item.nextAiringEpisode ? `${formatAiring(item.nextAiringEpisode.airingAt, true, language)} · ${relativeTime(item.nextAiringEpisode.airingAt, language)}` : item.source === 'bangumi' ? t('等待 Bangumi 日程', 'Waiting for Bangumi') : t('等待 AniList 公布', 'Waiting for AniList')}</span>
               </div>
               <button className="icon-button danger" title={t('取消追番', 'Unfollow')} aria-label={t(`取消追番 ${item.displayTitle}`, `Unfollow ${item.displayTitle}`)} onClick={() => onUnfollow(item.id)}><Minus size={19} /></button>
             </article>
           ))}
         </div>
       )}
+      {dialogItem && (
+        <MappingDialog
+          item={dialogItem}
+          resolution={dialogResolution}
+          language={language}
+          busy={mappingBusy}
+          onClose={() => setMappingDialogFor(null)}
+          onConfirm={(subjectId) => handleConfirmMapping(dialogItem.id, subjectId)}
+          onSkip={() => handleSkipMapping(dialogItem.id)}
+        />
+      )}
     </>
+  );
+}
+
+function MappingDialog({
+  item,
+  resolution,
+  language,
+  busy,
+  onClose,
+  onConfirm,
+  onSkip,
+}: {
+  item: FollowedAnime;
+  resolution: BangumiMappingResolution | null;
+  language: UiLanguage;
+  busy: boolean;
+  onClose: () => void;
+  onConfirm: (subjectId: number) => void;
+  onSkip: () => void;
+}) {
+  const t = (chinese: string, english: string) => tr(language, chinese, english);
+  // 优先使用解析结果里的旧作品信息；失败时回落到追番条目本身。
+  const info = resolution?.anime || { id: item.id, displayTitle: item.displayTitle, seasonYear: null as number | null, format: item.format ?? null, coverImage: item.coverImage };
+  const candidates = resolution?.candidates || [];
+  return (
+    <div className="modal-backdrop" onMouseDown={onClose}>
+      <section className="detail-panel" onMouseDown={(event) => event.stopPropagation()} aria-modal="true" role="dialog">
+        <button className="close-button" onClick={onClose} title={t('关闭', 'Close')}><X size={20} /></button>
+        <div className="detail-content">
+          <div className="detail-main">
+            <div className="eyebrow"><BellRing size={14} /> {t('映射确认', 'Mapping confirmation')}</div>
+            <h2>{t(`将《${info.displayTitle}》关联到 Bangumi 条目`, `Link “${info.displayTitle}” to a Bangumi subject`)}</h2>
+            <div className="mapping-source" style={{ display: 'flex', gap: 12, alignItems: 'center', margin: '12px 0' }}>
+              <img src={info.coverImage} alt="" style={{ width: 56, height: 56, borderRadius: 8, objectFit: 'cover' }} />
+              <div>
+                <strong>{info.displayTitle}</strong>
+                <div style={{ fontSize: 13, opacity: 0.75 }}>{formatLabel(info.format, language)} · {info.seasonYear || t('年份待定', 'Year TBA')}</div>
+              </div>
+            </div>
+            {resolution?.status === 'unavailable' ? (
+              <p style={{ opacity: 0.75 }}>{t('当前无法读取 Bangumi 候选条目，可稍后重试。', 'Bangumi candidates are unavailable right now. Try again later.')}</p>
+            ) : candidates.length > 0 ? (
+              <div className="mapping-candidates" style={{ display: 'grid', gap: 10 }}>
+                {candidates.map((candidate) => (
+                  <div key={candidate.subjectId} className="mapping-candidate" style={{ display: 'flex', gap: 12, alignItems: 'center', justifyContent: 'space-between', border: '1px solid rgba(128,128,128,0.35)', borderRadius: 10, padding: '10px 12px' }}>
+                    <div>
+                      <strong>{candidate.nameCn || candidate.name}</strong>
+                      <div style={{ fontSize: 12, opacity: 0.75 }}>
+                        {candidate.nameCn && candidate.nameCn !== candidate.name ? `${candidate.name} · ` : ''}
+                        {candidate.date || t('日期待定', 'Date TBA')}
+                        {typeof candidate.score === 'number' && Number.isFinite(candidate.score) ? ` · ${t(`匹配度 ${candidate.score}`, `match ${candidate.score}`)}` : ''}
+                      </div>
+                    </div>
+                    <button className="primary-button" disabled={busy} onClick={() => onConfirm(candidate.subjectId)}>
+                      <Check size={16} /> {t('确认映射', 'Confirm mapping')}
+                    </button>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p style={{ opacity: 0.75 }}>{resolution ? t('暂无候选 Bangumi 条目，可以稍后再试。', 'No Bangumi candidates yet. You can decide later.') : t('正在读取候选条目…', 'Loading candidates…')}</p>
+            )}
+            <div className="detail-actions">
+              <button className="secondary-button" disabled={busy || !resolution} onClick={onSkip}>
+                <Clock3 size={16} /> {t('这些都不对，以后再说', 'None of these — decide later')}
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
   );
 }
 
