@@ -314,13 +314,16 @@ pub struct Paged<T> {
     pub data: Vec<T>,
 }
 
-/// Subject 图片字段（`small` 等未声明字段被 serde 忽略）。
+/// Subject/角色图片字段。角色的 `medium`/`small` 是全身立绘的中心方形裁剪
+/// 缩略图（只剩腰以下），`large` 是未裁剪全身图——extras 角色映射必须优先
+/// `large`（见 lib.rs `subject_image_url`）。
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BangumiSubjectImages {
     pub common: Option<String>,
     pub large: Option<String>,
     pub medium: Option<String>,
+    pub small: Option<String>,
     pub grid: Option<String>,
 }
 

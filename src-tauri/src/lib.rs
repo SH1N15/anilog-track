@@ -1242,6 +1242,274 @@ fn cross_key_following_merge(state: &mut Value, map: &Value) -> bool {
     merged_any
 }
 
+/// `anilistIndex` 反查（subjectId → anilistId）：仅唯一命中才认（多义不自动
+/// 合并，语义同 [`offline_mapped_subject_id`] 的 bySubject 扫描分支）。
+#[cfg(feature = "standard")]
+fn anilist_index_reverse(map: &Value, subject_id: i64) -> i64 {
+    let Some(index) = map.get("anilistIndex").and_then(Value::as_object) else {
+        return 0;
+    };
+    let mut found = 0i64;
+    for (key, value) in index {
+        if value_i64(Some(value)) != subject_id {
+            continue;
+        }
+        let Ok(anilist_id) = key.parse::<i64>() else {
+            continue;
+        };
+        if anilist_id <= 0 {
+            continue;
+        }
+        if found > 0 && found != anilist_id {
+            return 0;
+        }
+        found = anilist_id;
+    }
+    found
+}
+
+/// 同集组内权威记录选择：按 fallback 语义时间（syncUpdatedAt 优先，缺省回退
+/// fallback 字段秒值）取最新；并列时用 stable_record 决出确定性的胜者。
+#[cfg(feature = "standard")]
+fn newest_task_of<'a>(records: &[&'a Value], fallback: &str) -> &'a Value {
+    let mut best = records[0];
+    for candidate in &records[1..] {
+        let best_time = record_timestamp(best, fallback);
+        let time = record_timestamp(candidate, fallback);
+        if time > best_time
+            || (time == best_time && stable_record(candidate) > stable_record(best))
+        {
+            best = candidate;
+        }
+    }
+    best
+}
+
+/// 同集组的权威记录构建（[`canonicalize_cross_key_tasks`] 的裁决核心）：
+/// - 组内任一 completed → 权威记录为 completed，内容基准取
+///   completedAt/syncUpdatedAt 最新者；completedAt/createdAt 等语义字段取全组
+///   最新非空（绝不丢观看历史；completed 永不删除）；
+/// - 全部 pending → 保留 syncUpdatedAt 最新的一条；
+/// - 一律规范化到 subjectId 键：id="{S}-{episode}"、animeId/subjectId=S、
+///   episodeSortKey 补齐；lastChangedBy 保留 winner 原值（写回防循环语义不变）；
+/// - 键/字段发生变化 → syncUpdatedAt=now 毫秒（保证其他 v0.7 设备以新时间戳
+///   采纳权威记录）；内容完全未变则不动（幂等）。
+/// 返回 (权威记录, 是否发生了规范化变更)。
+#[cfg(feature = "standard")]
+fn authoritative_task(group: &[Value], subject_id: i64, now: i64) -> (Value, bool) {
+    let episode = value_i64(group[0].get("episode"));
+    let completed: Vec<&Value> = group
+        .iter()
+        .filter(|task| value_string(task.get("status")) == "completed")
+        .collect();
+    let any_completed = !completed.is_empty();
+    let references: Vec<&Value> = if any_completed {
+        completed
+    } else {
+        group.iter().collect()
+    };
+    let mut authoritative = newest_task_of(
+        &references,
+        if any_completed { "completedAt" } else { "createdAt" },
+    )
+    .clone();
+    let mut changed = false;
+    if any_completed {
+        for key in ["completedAt", "createdAt"] {
+            let latest = group
+                .iter()
+                .filter_map(|task| {
+                    let value = value_i64(task.get(key));
+                    (value > 0).then_some(value)
+                })
+                .max();
+            if let Some(value) = latest {
+                if value_i64(authoritative.get(key)) != value {
+                    authoritative[key] = json!(value);
+                    changed = true;
+                }
+            }
+        }
+    }
+    let canonical_id = format!("{subject_id}-{episode}");
+    if value_string(authoritative.get("id")) != canonical_id {
+        authoritative["id"] = json!(canonical_id);
+        changed = true;
+    }
+    if value_i64(authoritative.get("animeId")) != subject_id {
+        authoritative["animeId"] = json!(subject_id);
+        changed = true;
+    }
+    if value_i64(authoritative.get("subjectId")) != subject_id {
+        authoritative["subjectId"] = json!(subject_id);
+        changed = true;
+    }
+    let has_sort_key = authoritative
+        .get("episodeSortKey")
+        .is_some_and(|value| value.as_str().is_some_and(|key| !key.is_empty()));
+    if !has_sort_key {
+        authoritative["episodeSortKey"] = json!(if episode > 0 {
+            episode.to_string()
+        } else {
+            canonical_id.clone()
+        });
+        changed = true;
+    }
+    if value_string(authoritative.get("episodeType")).is_empty() {
+        authoritative["episodeType"] = json!("regular");
+        changed = true;
+    }
+    if changed {
+        authoritative["syncUpdatedAt"] = json!(now);
+    }
+    (authoritative, changed)
+}
+
+/// 问题 3 升级（standard，P0 数据污染愈合）：文档级跨键任务规范化。
+///
+/// 背景：旧版任务挂 anilistId 键（"21355-5"），新版 bangumi 条目按 subjectId
+/// 生成（"140001-5"）；WebDAV 双端并存时同一集出现两条记录（一边 completed
+/// 一边 pending，或双 completed），且任务无墓碑机制——本地单侧清理后远端脏
+/// 记录会在下次合并时回来。唯一可靠的愈合点是文档级：合并后按作品身份重组
+/// state.tasks，再由 document_from_state 重建上传文档，让远端文档被整体覆盖。
+///
+/// 对每个已知作品身份 (S=subjectId 主键, A=anilistId 旧键；A 可为 0)：
+/// 1. 收集 state.tasks 中 animeId∈{S,A} 或 subjectId==S 的全部记录，按
+///    episode 分组；
+/// 2. 每组经 [`authoritative_task`] 产出一个权威记录，其余记录删除（删除的
+///    只是重复条目，语义字段已并入权威记录）；
+/// 3. 无映射关系的记录（无对应 bangumi 条目、A 不在 map）一律不动。
+///
+/// 身份来源（幂等，仅 standard）：
+/// - following 中 source=="bangumi" 条目：id=S、anilistId=A；A 缺失时离线
+///   映射兜底（bySubject[S].a 直查，或 anilistIndex 反查）；
+/// - anilistIndex 中 A→S 且 following 存在 S 条目的也算。
+/// 同一 S 的多个旧键别名合并进同一个身份，保证每个 (S, episode) 组恰好产出
+/// 一个权威记录（completed 不会因身份拆分被误删）。
+///
+/// 返回是否发生任何规范化变更（幂等：再次调用返回 false）。
+#[cfg(feature = "standard")]
+fn canonicalize_cross_key_tasks(state: &mut Value, map: &Value, original: bool) -> bool {
+    if original {
+        return false;
+    }
+    let Some(following) = state["following"].as_array().cloned() else {
+        return false;
+    };
+    let bangumi_subjects: HashSet<i64> = following
+        .iter()
+        .filter(|item| value_string(item.get("source")) == "bangumi")
+        .map(|item| value_i64(item.get("id")))
+        .filter(|id| *id > 0)
+        .collect();
+    // S → 旧键别名集合（anilistId 旧键；0 表示无已知旧键）。
+    let mut subject_aliases: HashMap<i64, HashSet<i64>> = HashMap::new();
+    for item in &following {
+        if value_string(item.get("source")) != "bangumi" {
+            continue;
+        }
+        let subject_id = value_i64(item.get("id"));
+        if subject_id <= 0 {
+            continue;
+        }
+        let aliases = subject_aliases.entry(subject_id).or_default();
+        let mut anilist_id = value_i64(item.get("anilistId"));
+        if anilist_id <= 0 {
+            // 离线映射兜底：bySubject[S].a 直查，或 anilistIndex 反查。
+            anilist_id = map
+                .get("bySubject")
+                .and_then(|by_subject| by_subject.get(subject_id.to_string()))
+                .map(|entry| value_i64(entry.get("a")))
+                .unwrap_or(0);
+            if anilist_id <= 0 {
+                anilist_id = anilist_index_reverse(map, subject_id);
+            }
+        }
+        if anilist_id > 0 && anilist_id != subject_id {
+            aliases.insert(anilist_id);
+        }
+    }
+    for item in &following {
+        let source = value_string(item.get("source"));
+        if !(source.is_empty() || source == "anilist") {
+            continue;
+        }
+        let anilist_id = value_i64(item.get("id"));
+        if anilist_id <= 0 {
+            continue;
+        }
+        let subject_id = value_i64(
+            map.get("anilistIndex")
+                .and_then(|index| index.get(anilist_id.to_string())),
+        );
+        if subject_id > 0 && subject_id != anilist_id && bangumi_subjects.contains(&subject_id) {
+            subject_aliases.entry(subject_id).or_default().insert(anilist_id);
+        }
+    }
+    if subject_aliases.is_empty() {
+        return false;
+    }
+    let tasks = state["tasks"].as_array().cloned().unwrap_or_default();
+    if tasks.is_empty() {
+        return false;
+    }
+    let now = now_millis();
+    // 任务归属：animeId 是已知 subjectId 主键、或属于该主键的旧键别名、或
+    // subjectId 字段命中主键。
+    let subject_of = |task: &Value| -> Option<i64> {
+        let anime_id = value_i64(task.get("animeId"));
+        if anime_id > 0 {
+            if subject_aliases.contains_key(&anime_id) {
+                return Some(anime_id);
+            }
+            if let Some(subject_id) = subject_aliases
+                .iter()
+                .find(|(_, aliases)| aliases.contains(&anime_id))
+                .map(|(subject_id, _)| *subject_id)
+            {
+                return Some(subject_id);
+            }
+        }
+        let task_subject = value_i64(task.get("subjectId"));
+        if task_subject > 0 && subject_aliases.contains_key(&task_subject) {
+            return Some(task_subject);
+        }
+        None
+    };
+    let mut output: Vec<Value> = Vec::with_capacity(tasks.len());
+    let mut emitted: HashSet<(i64, i64)> = HashSet::new();
+    let mut changed_any = false;
+    for task in &tasks {
+        let episode = value_i64(task.get("episode"));
+        let subject_id = if episode > 0 { subject_of(task) } else { None };
+        let Some(subject_id) = subject_id else {
+            // 无身份归属（无映射关系/无追番条目）→ 原样保留。
+            output.push(task.clone());
+            continue;
+        };
+        // 每个 (身份, episode) 组只在其首个成员位置输出一次权威记录。
+        if !emitted.insert((subject_id, episode)) {
+            changed_any = true; // 重复条目被删除
+            continue;
+        }
+        let group: Vec<Value> = tasks
+            .iter()
+            .filter(|candidate| {
+                value_i64(candidate.get("episode")) == episode
+                    && subject_of(candidate) == Some(subject_id)
+            })
+            .cloned()
+            .collect();
+        let (authoritative, changed) = authoritative_task(&group, subject_id, now);
+        changed_any |= changed;
+        output.push(authoritative);
+    }
+    if changed_any {
+        state["tasks"] = json!(output);
+    }
+    changed_any
+}
+
 /// 问题 B 总入口（standard only）：跨键合并 + 既有单条自动映射。
 /// 返回是否发生任何状态变更（following/tasks/syncMetadata 任一）。
 /// 挂载点：load_context 尾部（升级原 auto_map_following 调用）与每次
@@ -1258,6 +1526,12 @@ fn reconcile_following_entries(state: &mut Value, map: &Value, original: bool) -
     );
     cross_key_following_merge(state, map);
     auto_map_following(state, map);
+    // 问题 3 升级：原 cleanup_bangumi_duplicate_pendings（只删与 completed
+    // 历史重复的 pending）升级为文档级跨键任务规范化 canonicalize_cross_key_tasks：
+    // 按作品身份把同集记录裁决为唯一权威记录（规范化到 subjectId 键、completed
+    // 优先且语义字段不丢历史、变更时间戳提到 now 保证上传后其他设备采纳），
+    // 并吸收原防重语义（有观看历史的重复 pending 被删、completed 永不删除）。
+    canonicalize_cross_key_tasks(state, map, original);
     let after = (
         state.get("following").cloned().unwrap_or(Value::Null),
         state.get("tasks").cloned().unwrap_or(Value::Null),
@@ -2467,6 +2741,21 @@ fn enrich_following_entry_from_anime(state: &mut Value, subject_id: i64, anime: 
     }
 }
 
+/// 问题 2a（验收第 2 轮，P0 追番/评分不自动写回）：追番动作是本地变更 → 置
+/// lastChangedBy="local"。此前该字段只由拉取引擎写 "bangumi"，本地追番的
+/// 条目从不带它，push_local_changes 只能靠 hash 幂等兜底且无拉取基线的
+/// 新增条目缺方向标记。写回引擎读它（Phase 3 契约：local/webdav 可推送）。
+#[cfg(feature = "standard")]
+fn mark_following_local_change(state: &mut Value, subject_id: i64) {
+    if let Some(entry) = state["following"].as_array_mut().and_then(|items| {
+        items
+            .iter_mut()
+            .find(|item| value_i64(item.get("id")) == subject_id)
+    }) {
+        entry["lastChangedBy"] = json!("local");
+    }
+}
+
 /// 问题 C（P0 追番判重）：standard 版追番新增路径。跨键守卫保证同一部番绝不
 /// 出现两条追番记录：
 /// - follow Bangumi 卡片（subjectId=S, anilistId=A）而存在 id==A 的 anilist 键
@@ -2480,7 +2769,7 @@ fn add_following_entry_standard(state: &mut Value, anime: &Value) {
     let preference = value_string(state["settings"].get("titlePreference"));
     let language = value_string(state["settings"].get("uiLanguage"));
     if value_string(anime.get("source")) == "bangumi" && id > 0 {
-        let entry = bangumi_following_entry(anime, &preference, &language);
+        let mut entry = bangumi_following_entry(anime, &preference, &language);
         let subject_id = value_i64(entry.get("id"));
         let anilist_id = value_i64(anime.get("anilistId"));
         let cross_anilist_exists = anilist_id > 0
@@ -2512,11 +2801,15 @@ fn add_following_entry_standard(state: &mut Value, anime: &Value) {
             enrich_following_entry_from_anime(state, subject_id, anime);
             bind_manual_mapping(state, subject_id);
             mark_following_changed(state, subject_id);
+            mark_following_local_change(state, subject_id);
         } else if same_subject_exists {
             enrich_following_entry_from_anime(state, subject_id, anime);
             bind_manual_mapping(state, subject_id);
             mark_following_changed(state, subject_id);
+            mark_following_local_change(state, subject_id);
         } else {
+            // 问题 2a：本地追番 → lastChangedBy=local（写回引擎据此 POST）。
+            entry["lastChangedBy"] = json!("local");
             state["following"].as_array_mut().unwrap().push(entry);
             mark_following_changed(state, subject_id);
         }
@@ -2542,6 +2835,7 @@ fn add_following_entry_standard(state: &mut Value, anime: &Value) {
                     json!({"method": "manual", "confidence": "high", "updatedAt": now_seconds()});
                 entry["mappingPending"] = json!(false);
                 entry["syncUpdatedAt"] = json!(now_millis());
+                entry["lastChangedBy"] = json!("local");
             }
             mark_following_changed(state, entry_id);
         } else {
@@ -2580,6 +2874,9 @@ fn toggle_follow(
     drop(state);
     context.save_state().map_err(|error| error.to_string())?;
     context.webdav_wakeup.notify_one();
+    // 问题 2b：追番/取消追番均为本地变更 → 唤醒桌面自动同步（写回收藏或
+    // type=5）。函数内部按编译目标判空。
+    notify_bangumi_sync_wakeup(true);
     refresh_mobile_configuration(&app, &context)?;
     emit_state(&app, &context);
     Ok(context.public_state())
@@ -2622,6 +2919,44 @@ fn update_follow_title(
     Ok(context.public_state())
 }
 
+/// toggle_task 的纯内核：翻转完成状态并维护 completedAt/syncUpdatedAt；
+/// 返回是否从 pending 翻转为 completed。
+/// 问题 2a（验收第 2 轮）：subjectId 齐备的 bangumi 任务完成时置
+/// lastChangedBy="local"——写回引擎据它区分本地完成（可上传）与拉取完成
+/// （lastChangedBy=bangumi 不上传）；anilist 键任务与 original 不写该字段
+/// （行为不变）。
+fn toggle_task_status(task: &mut Value) -> bool {
+    let completed = value_string(task.get("status")) == "completed";
+    task["status"] = json!(if completed { "pending" } else { "completed" });
+    task["completedAt"] = if completed {
+        Value::Null
+    } else {
+        json!(now_seconds())
+    };
+    task["syncUpdatedAt"] = json!(now_millis());
+    let newly_completed = !completed;
+    #[cfg(feature = "standard")]
+    if newly_completed && value_i64(task.get("subjectId")) > 0 {
+        task["lastChangedBy"] = json!("local");
+    }
+    newly_completed
+}
+
+/// 桌面（standard）动作唤醒入口（问题 2b）：toggle_follow / toggle_task /
+/// bangumi_set_rating 的本地变更触发 `BANGUMI_SYNC_WAKEUP`，30 秒静默期合并
+/// 后由 start_desktop_bangumi_sync 执行全量同步。其余编译目标（original /
+/// Android）为空操作：original 零 Bangumi，Android 由 Java WorkManager 节奏
+/// 负责、后台不接唤醒（不常驻约束）。
+#[cfg(all(feature = "standard", not(target_os = "android")))]
+fn notify_bangumi_sync_wakeup(wake: bool) {
+    if wake {
+        BANGUMI_SYNC_WAKEUP.notify_one();
+    }
+}
+
+#[cfg(not(all(feature = "standard", not(target_os = "android"))))]
+fn notify_bangumi_sync_wakeup(_wake: bool) {}
+
 #[tauri::command]
 fn toggle_task(
     app: AppHandle,
@@ -2629,23 +2964,23 @@ fn toggle_task(
     task_id: String,
 ) -> Result<Value, String> {
     let mut state = context.state.lock().map_err(|_| "状态锁不可用")?;
-    if let Some(task) = state["tasks"].as_array_mut().and_then(|items| {
-        items
-            .iter_mut()
-            .find(|task| value_string(task.get("id")) == task_id)
-    }) {
-        let completed = value_string(task.get("status")) == "completed";
-        task["status"] = json!(if completed { "pending" } else { "completed" });
-        task["completedAt"] = if completed {
-            Value::Null
-        } else {
-            json!(now_seconds())
-        };
-        task["syncUpdatedAt"] = json!(now_millis());
-    }
+    let bangumi_task_completed = if let Some(task) = state["tasks"].as_array_mut().and_then(
+        |items| {
+            items
+                .iter_mut()
+                .find(|task| value_string(task.get("id")) == task_id)
+        },
+    ) {
+        let newly_completed = toggle_task_status(task);
+        newly_completed && value_i64(task.get("subjectId")) > 0
+    } else {
+        false
+    };
     drop(state);
     context.save_state().map_err(|error| error.to_string())?;
     context.webdav_wakeup.notify_one();
+    // 问题 2b：bangumi 任务完成 → 动作唤醒桌面自动同步（写回单集进度）。
+    notify_bangumi_sync_wakeup(bangumi_task_completed);
     refresh_mobile_configuration(&app, &context)?;
     emit_state(&app, &context);
     Ok(context.public_state())
@@ -2783,6 +3118,35 @@ fn apply_airing_schedules(state: &mut Value, schedules: &[Value], now: i64) -> A
         .filter_map(Value::as_str)
         .map(str::to_string)
         .collect();
+    // 问题 3（验收第 2 轮，旧版已完成任务被重新生成 pending）：旧版（AniList
+    // 主键时代）完成任务挂在 anilistId 键（"21355-5"），新版 bangumi 条目按
+    // subjectId 生成任务（"140001-5"），按任务 id 查重查不到 → 同一集重复建
+    // pending。创建前先按"已完成集合"（status=completed 任务的 animeId 与
+    // subjectId 两种键身份 + 同集）拦截：命中即视为该集已有观看历史。
+    #[cfg(feature = "standard")]
+    let completed_history: HashSet<(i64, i64)> = {
+        let mut history: HashSet<(i64, i64)> = HashSet::new();
+        for task in state["tasks"].as_array().into_iter().flatten() {
+            if value_string(task.get("status")) != "completed" {
+                continue;
+            }
+            let episode = value_i64(task.get("episode"));
+            if episode <= 0 {
+                continue;
+            }
+            let anime_id = value_i64(task.get("animeId"));
+            let subject_id = value_i64(task.get("subjectId"));
+            if anime_id > 0 {
+                history.insert((anime_id, episode));
+            }
+            if subject_id > 0 {
+                history.insert((subject_id, episode));
+            }
+        }
+        history
+    };
+    #[cfg(not(feature = "standard"))]
+    let _completed_history: HashSet<(i64, i64)> = HashSet::new();
     let mut outcome = AiringOutcome::default();
     for airing in schedules {
         let anime_id = value_i64(airing.get("mediaId"));
@@ -2839,6 +3203,19 @@ fn apply_airing_schedules(state: &mut Value, schedules: &[Value], now: i64) -> A
         }
         if known.contains(&id) {
             continue;
+        }
+        // 问题 3 防重生成：仅拦 bangumi 条目（anilistId=A, subjectId=S）——
+        // 已完成集合命中 (S, episode)（subjectId==S 或 animeId==S 的完成键）
+        // 或 (A, episode)（animeId==A 的旧版完成键）→ 该集已有观看历史，跳过。
+        // anilist 键条目不经过此守卫（其任务 id 查重本就覆盖 completed）。
+        #[cfg(feature = "standard")]
+        if bangumi_sourced {
+            let anilist_id = value_i64(state["following"][followed_index].get("anilistId"));
+            let has_history = completed_history.contains(&(task_anime_id, episode))
+                || (anilist_id > 0 && completed_history.contains(&(anilist_id, episode)));
+            if has_history {
+                continue;
+            }
         }
         let title = value_string(state["following"][followed_index].get("displayTitle"));
         let cover = airing["media"]["coverImage"]["medium"]
@@ -3819,8 +4196,12 @@ mod bangumi_commands {
         }
     }
 
-    /// 角色/关联条目图片（large || common || medium；全缺 → null）。
-    fn subject_image_url(images: Option<&BangumiSubjectImages>) -> Value {
+    /// 角色/关联条目图片（large || common || medium || small；全缺 → null）。
+    /// 问题 4（验收第 2 轮，角色图下半身）：Bangumi 角色 `medium`/`small` 是
+    /// 全身立绘的中心方形裁剪缩略图，`large` 是未裁剪全身图——链首保持
+    /// `large`；角色 images 无 `common`，缺 large 时按 medium → small 回落，
+    /// 不再可能落到裁剪图之外的其他键。前端配合 `object-position: top` 展示。
+    pub(super) fn subject_image_url(images: Option<&BangumiSubjectImages>) -> Value {
         images
             .and_then(|images| {
                 images
@@ -3828,6 +4209,8 @@ mod bangumi_commands {
                     .clone()
                     .or_else(|| images.common.clone())
                     .or_else(|| images.medium.clone())
+                    .or_else(|| images.small.clone())
+                    .or_else(|| images.grid.clone())
             })
             .filter(|url| !url.is_empty())
             .map(Value::String)
@@ -5106,6 +5489,99 @@ fn maybe_spawn_foreground_sync(app: &AppHandle, context: &AppContext) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// 问题 2b（验收第 2 轮，P0 追番/评分不自动写回）：桌面自动 Bangumi 同步循环
+// （standard + 桌面编译；original / Android 均不编译本节）。
+//
+// 此前 run_full_bangumi_sync 只有手动命令（bangumi_sync_now）与 Android 前台
+// 补偿触发，桌面上追番/完成任务/评分的写回（push_local_changes）只能等用户
+// 手动点"立即同步 Bangumi"。新增两条触发路径：
+// - 周期：每 60 分钟调用 run_full_bangumi_sync（内部开关自会 skip：同步未
+//   启用/无 Token 时只做坚果云与播出数据按需刷新，与现有桌面后台兼容）；
+// - 动作唤醒：toggle_follow（新增/取消）、toggle_task（bangumi 任务完成）、
+//   bangumi_set_rating 触发 [`BANGUMI_SYNC_WAKEUP`]，进入 30 秒静默期（静默
+//   期内再次唤醒则重新计时，合并密集动作，同 start_webdav_background 的
+//   5 秒静默合并写法）后执行一轮。
+// 执行前检查 Token 存在（load Ok(Some)），否则跳过本轮（坚果云/播出刷新由
+// 各自的后台循环负责，不在此重复触发）。single-flight 门防本循环重入；手动
+// 命令保持既有行为不进门。不用 tokio::select!（tokio 依赖无 macros feature）
+// —— 用 Notify::notified() + tokio::time::timeout 组合（仓库既有做法）。
+// ---------------------------------------------------------------------------
+
+#[cfg(all(feature = "standard", not(target_os = "android")))]
+mod desktop_bangumi_sync {
+    use std::time::Duration;
+
+    /// 周期全量同步间隔：60 分钟。
+    pub const INTERVAL_SECS: u64 = 3_600;
+    /// 动作唤醒后的静默期：30 秒内后续唤醒合并为一次执行。
+    pub const QUIET_SECS: u64 = 30;
+
+    /// 循环内核（纯函数，静默期/节流可测）：下一次等待时长。
+    /// - 处于静默期（刚收到动作唤醒）→ 等 [`QUIET_SECS`]；
+    /// - 否则等周期 [`INTERVAL_SECS`]（动作唤醒可提前打断）。
+    pub fn wait_duration(quiet_pending: bool) -> Duration {
+        Duration::from_secs(if quiet_pending {
+            QUIET_SECS
+        } else {
+            INTERVAL_SECS
+        })
+    }
+
+    /// 执行前判定（纯函数）：Token 存在且 single-flight 门空闲才执行。
+    pub fn should_execute(has_token: bool, gate_acquired: bool) -> bool {
+        has_token && gate_acquired
+    }
+}
+
+#[cfg(all(feature = "standard", not(target_os = "android")))]
+static BANGUMI_SYNC_WAKEUP: std::sync::LazyLock<tokio::sync::Notify> =
+    std::sync::LazyLock::new(tokio::sync::Notify::new);
+
+/// 桌面自动同步 single-flight 门（与 Android 前台补偿同思路：同一时刻最多
+/// 一轮自动全量同步在跑）。
+#[cfg(all(feature = "standard", not(target_os = "android")))]
+static DESKTOP_BANGUMI_SYNC_GATE: foreground_sync::SingleFlightGate =
+    foreground_sync::SingleFlightGate::new();
+
+#[cfg(all(feature = "standard", not(target_os = "android")))]
+fn start_desktop_bangumi_sync(app: AppHandle, context: AppContext) {
+    tauri::async_runtime::spawn(async move {
+        let mut quiet_pending = false;
+        loop {
+            let wait_elapsed = tokio::time::timeout(
+                desktop_bangumi_sync::wait_duration(quiet_pending),
+                BANGUMI_SYNC_WAKEUP.notified(),
+            )
+            .await
+            .is_err();
+            if !wait_elapsed {
+                // 收到动作唤醒：进入/重置 30 秒静默期（静默期内再次唤醒则
+                // 重新计时——wait_duration 返回 QUIET_SECS，效果同重置）。
+                quiet_pending = true;
+                continue;
+            }
+            // 静默期无新唤醒后到期，或 60 分钟周期到期 → 执行一轮。
+            quiet_pending = false;
+            let has_token = context
+                .bangumi_tokens
+                .load()
+                .ok()
+                .flatten()
+                .is_some_and(|token| !token.trim().is_empty());
+            if !desktop_bangumi_sync::should_execute(
+                has_token,
+                DESKTOP_BANGUMI_SYNC_GATE.try_begin(),
+            ) {
+                continue;
+            }
+            // 成功/失败/skipped 都由 run_full_bangumi_sync 落 bangumiSyncStatus。
+            let _ = run_full_bangumi_sync(&app, &context).await;
+            DESKTOP_BANGUMI_SYNC_GATE.finish();
+        }
+    });
+}
+
 
 /// Original 版 `bangumi_sync_now` 的统一拒绝返回（report 零值，camelCase 形状
 /// 与 standard 版一致，供前端类型稳定）。
@@ -5138,6 +5614,25 @@ async fn bangumi_sync_now(app: AppHandle, context: State<'_, AppContext>) -> Res
 
 /// Phase 3：`bangumi_update_sync_settings`（扁平参数，前端契约；只更新提供的键，
 /// conflictPolicy 非法值忽略）。Original 运行即拒绝。
+/// Phase 3：`bangumi_update_sync_settings`（扁平参数，前端契约；只更新提供的键，
+/// conflictPolicy 非法值忽略）。Original 运行即拒绝。
+///
+/// 问题 1（验收第 2 轮，P0 写回从不发生）：`syncEnabled` 总开关默认 false 且
+/// 旧 UI 无该开关，四个子开关全开也会让 run_bangumi_collection_sync /
+/// push_local_changes 全部 skipped（零值 report + "Bangumi 同步未启用"）。
+/// 服务端便利语义：开任一子开关即视为启用同步。
+#[cfg(feature = "standard")]
+fn resolve_sync_enabled(explicit: Option<bool>, sub_switches: [Option<bool>; 4]) -> Option<bool> {
+    // 显式参数（含 false）优先：用户明确关总开关时不被子开关覆盖。
+    explicit.or_else(|| {
+        sub_switches
+            .into_iter()
+            .flatten()
+            .any(std::convert::identity)
+            .then_some(true)
+    })
+}
+
 #[tauri::command]
 fn bangumi_update_sync_settings(
     app: AppHandle,
@@ -5159,7 +5654,18 @@ fn bangumi_update_sync_settings(
             let Some(block) = state.get_mut("bangumi").and_then(Value::as_object_mut) else {
                 return Err("Bangumi 设置块不存在".into());
             };
-            if let Some(value) = sync_enabled {
+            // 问题 1：显式 sync_enabled 优先；未提供且任一子开关为 true →
+            // 隐式同时置 syncEnabled=true（"开任一子开关即视为启用同步"，
+            // 旧 UI 无总开关，否则子开关全开也被 skipped）。
+            if let Some(value) = resolve_sync_enabled(
+                sync_enabled,
+                [
+                    pull_collections,
+                    push_local_changes,
+                    push_completed_episodes,
+                    pull_external_status,
+                ],
+            ) {
                 block.insert("syncEnabled".into(), json!(value));
             }
             if let Some(value) = pull_collections {
@@ -5237,6 +5743,9 @@ fn bangumi_set_rating(
         drop(state);
         context.save_state().map_err(|error| error.to_string())?;
         context.webdav_wakeup.notify_one();
+        // 问题 2b：评分是本地变更（上方已置 lastChangedBy=local，核对无误）
+        // → 唤醒桌面自动同步（写回 PATCH rate）。
+        notify_bangumi_sync_wakeup(true);
         emit_state(&app, &context);
         return Ok(json!({"ok": true, "message": "评分已保存，将在同步时写回 Bangumi"}));
     }
@@ -6489,6 +6998,10 @@ pub fn run() {
                     warn!("failed to reconcile autostart setting: {error}");
                 }
                 start_desktop_background(app.handle().clone(), context.clone());
+                // 问题 2b：桌面自动 Bangumi 同步循环（60 分钟周期 + 动作唤醒；
+                // 仅 standard；original / Android 编译排除）。
+                #[cfg(all(feature = "standard", not(target_os = "android")))]
+                start_desktop_bangumi_sync(app.handle().clone(), context.clone());
                 start_desktop_task_reminders(app.handle().clone(), context.clone());
                 if !start_hidden {
                     show_main_window(app.handle())?;
@@ -9702,24 +10215,41 @@ mod tests {
         assert_eq!(following[0]["coverImage"], "https://anilist.example/cover.jpg");
         assert_eq!(following[0]["episodes"], 12);
 
-        // 任务裁决：
-        // - ep1：仅旧键 completed → 历史原样保留；
+        // 任务裁决（canonicalize_cross_key_tasks 规范化语义：同集唯一权威
+        // 记录，一律归一到 subjectId 键）：
+        // - ep1：仅旧键 completed → 历史原样保留但重键 "45678-1"（不丢
+        //   completedAt）；
         // - ep2：双 pending，新键较新（5000 > 4500）→ 保留 45678-2；
         // - ep3：仅新键 completed → 保留；
-        // - ep4：双 completed，旧键较新（9000 > 8000）→ 保留 21355-4、删 45678-4；
+        // - ep4：双 completed，旧键较新（9000 > 8000）→ 内容取 21355-4，
+        //   规范化为 45678-4；
         // - ep5：双 pending，旧键较新（9500 > 5000）→ 旧记录胜出并重键 45678-5。
         let tasks = state["tasks"].as_array().unwrap();
         let ids: Vec<String> = tasks
             .iter()
             .map(|task| value_string(task.get("id")))
             .collect();
-        assert!(ids.contains(&"21355-1".to_string()));
+        assert!(ids.contains(&"45678-1".to_string()));
         assert!(ids.contains(&"45678-2".to_string()));
         assert!(ids.contains(&"45678-3".to_string()));
-        assert!(ids.contains(&"21355-4".to_string()));
-        assert!(!ids.contains(&"45678-4".to_string()));
-        assert!(!ids.contains(&"21355-2".to_string()));
-        assert!(!ids.contains(&"21355-5".to_string()));
+        assert!(ids.contains(&"45678-4".to_string()));
+        assert!(ids.contains(&"45678-5".to_string()));
+        assert_eq!(ids.len(), 5);
+        assert!(tasks
+            .iter()
+            .all(|task| value_i64(task.get("animeId")) == 45678));
+        let episode1 = tasks
+            .iter()
+            .find(|task| value_string(task.get("id")) == "45678-1")
+            .expect("normalized episode 1 task");
+        assert_eq!(episode1["status"], "completed");
+        assert_eq!(episode1["completedAt"], 20);
+        let episode4 = tasks
+            .iter()
+            .find(|task| value_string(task.get("id")) == "45678-4")
+            .expect("normalized episode 4 task");
+        assert_eq!(episode4["status"], "completed");
+        assert_eq!(episode4["completedAt"], 50);
         let episode5 = tasks
             .iter()
             .find(|task| value_string(task.get("id")) == "45678-5")
@@ -10189,5 +10719,510 @@ mod tests {
         let max = max_in_flight.load(Ordering::SeqCst);
         assert!(max >= 2, "三月应并行拉取（观察最大并发 {max}）");
         assert!(max <= 2, "并发不得超过 Semaphore(2)（观察 {max}）");
+    }
+
+    // -- 验收第 2 轮修复回归测试 ------------------------------------------------
+
+    #[cfg(feature = "standard")]
+    #[test]
+    fn resolve_sync_enabled_implicit_enable_and_explicit_false_wins() {
+        // 问题 1 回归：patch 只含 push_local_changes=true → syncEnabled 隐式 true。
+        assert_eq!(
+            resolve_sync_enabled(None, [None, Some(true), None, None]),
+            Some(true)
+        );
+        // 四个子开关任一为 true 都触发隐式启用。
+        assert_eq!(
+            resolve_sync_enabled(None, [Some(true), None, None, None]),
+            Some(true)
+        );
+        assert_eq!(
+            resolve_sync_enabled(None, [None, None, Some(true), None]),
+            Some(true)
+        );
+        assert_eq!(
+            resolve_sync_enabled(None, [None, None, None, Some(true)]),
+            Some(true)
+        );
+        // 显式 sync_enabled=false 不被子开关覆盖。
+        assert_eq!(
+            resolve_sync_enabled(Some(false), [Some(true), Some(true), Some(true), Some(true)]),
+            Some(false)
+        );
+        // 显式 true 保持；全无提供时不动现状。
+        assert_eq!(
+            resolve_sync_enabled(Some(true), [None, None, None, None]),
+            Some(true)
+        );
+        assert_eq!(resolve_sync_enabled(None, [None, None, None, None]), None);
+        // 子开关显式 false 不触发隐式启用。
+        assert_eq!(
+            resolve_sync_enabled(None, [Some(false), Some(false), Some(false), Some(false)]),
+            None
+        );
+    }
+
+    #[cfg(feature = "standard")]
+    #[test]
+    fn toggle_task_status_marks_bangumi_completion_local() {
+        // 问题 2a 回归：subjectId 齐备的 bangumi 任务完成 → lastChangedBy=local。
+        let mut task = json!({
+            "id": "140001-5", "animeId": 140001, "subjectId": 140001,
+            "episodeId": 987654, "episode": 5, "status": "pending"
+        });
+        assert!(toggle_task_status(&mut task));
+        assert_eq!(task["status"], "completed");
+        assert_eq!(task["lastChangedBy"], "local");
+        assert!(task["completedAt"].is_number());
+
+        // anilist 键任务（无 subjectId）：行为不变，不写 lastChangedBy。
+        let mut anilist_task = json!({"id": "21355-5", "animeId": 21355, "status": "pending"});
+        assert!(toggle_task_status(&mut anilist_task));
+        assert_eq!(anilist_task["status"], "completed");
+        assert!(anilist_task.get("lastChangedBy").is_none());
+
+        // subjectId 为 null 的任务：不写 lastChangedBy。
+        let mut null_subject =
+            json!({"id": "1-1", "animeId": 1, "subjectId": null, "status": "pending"});
+        assert!(toggle_task_status(&mut null_subject));
+        assert!(null_subject.get("lastChangedBy").is_none());
+
+        // 取消完成（completed → pending）：不置 local。
+        let mut uncomplete = json!({
+            "id": "140001-5", "subjectId": 140001, "status": "completed",
+            "lastChangedBy": "bangumi"
+        });
+        assert!(!toggle_task_status(&mut uncomplete));
+        assert_eq!(uncomplete["status"], "pending");
+        assert_eq!(uncomplete["lastChangedBy"], "bangumi");
+        assert!(uncomplete["completedAt"].is_null());
+    }
+
+    #[cfg(feature = "standard")]
+    #[test]
+    fn toggle_follow_standard_marks_last_changed_by_local() {
+        // 问题 2a 回归：本地追番的三条路径（新增 / AniList 卡片转正 / 跨键
+        // 转正）产出的 bangumi 条目都必须带 lastChangedBy=local，否则写回
+        // 引擎永远不会推送该收藏。
+        // 1) 新增 bangumi 卡片。
+        let mut state = default_state(false);
+        let anime = json!({
+            "id": 140001, "source": "bangumi", "anilistId": 21355,
+            "nameCn": "Re：从零开始的异世界生活",
+            "title": {"native": "Re:ゼロから始める異世界生活"},
+            "coverImage": {"medium": "https://lain.bgm.tv/pic/cover/m/1.jpg"},
+            "episodes": 25
+        });
+        add_following_entry_standard(&mut state, &anime);
+        assert_eq!(state["following"][0]["lastChangedBy"], "local");
+
+        // 2) AniList 卡片 follow，但同作品 bangumi 键条目已存在 → 转正。
+        let mut state = default_state(false);
+        state["following"] = json!([{
+            "id": 140001, "source": "bangumi", "anilistId": 21355,
+            "displayTitle": "旧标题", "followedAt": 1, "syncUpdatedAt": 1
+        }]);
+        let anilist_card = json!({"id": 21355, "title": {"english": "Re:Zero"}, "episodes": 25});
+        add_following_entry_standard(&mut state, &anilist_card);
+        assert_eq!(state["following"].as_array().unwrap().len(), 1);
+        assert_eq!(state["following"][0]["lastChangedBy"], "local");
+
+        // 3) bangumi 卡片 follow，旧 AniList 键记录存在 → 转正为 subjectId 键。
+        let mut state = default_state(false);
+        state["following"] = json!([{
+            "id": 21355, "source": "anilist", "displayTitle": "旧键",
+            "followedAt": 1, "syncUpdatedAt": 1
+        }]);
+        add_following_entry_standard(&mut state, &anime);
+        assert_eq!(state["following"].as_array().unwrap().len(), 1);
+        assert_eq!(state["following"][0]["id"], 140001);
+        assert_eq!(state["following"][0]["lastChangedBy"], "local");
+    }
+
+    #[cfg(all(feature = "standard", not(target_os = "android")))]
+    #[test]
+    fn apply_airing_schedules_skip_episodes_with_completed_history() {
+        // 问题 3 回归：旧版完成任务挂在 anilistId 键（"21355-5"），新版按
+        // subjectId（"140001-5"）生成——按 id 查重查不到；有观看历史的集
+        // 不得重建 pending，无历史的集正常建。
+        let mut state = default_state(false);
+        state["following"] = json!([{
+            "id": 140001, "source": "bangumi", "anilistId": 21355,
+            "displayTitle": "黄泉的使者", "followedAt": 0, "syncUpdatedAt": 1
+        }]);
+        state["tasks"] = json!([{
+            "id": "21355-5", "animeId": 21355, "episode": 5,
+            "status": "completed", "completedAt": 100, "syncUpdatedAt": 1
+        }]);
+        state["seenAiringEvents"] = json!([]);
+        let schedules_value = json!([
+            {"mediaId": 21355, "episode": 5, "airingAt": 50,
+             "media": {"nextAiringEpisode": {"episode": 6, "airingAt": 60}}},
+            {"mediaId": 21355, "episode": 6, "airingAt": 60,
+             "media": {"nextAiringEpisode": {"episode": 7, "airingAt": 70}}}
+        ]);
+        let schedules = schedules_value.as_array().unwrap();
+
+        let outcome = apply_airing_schedules(&mut state, schedules, 60);
+
+        // ep5 有观看历史 → 不建；ep6 无历史 → 正常建。
+        assert_eq!(outcome.aired, 2);
+        assert_eq!(outcome.created, 1);
+        let ids: Vec<String> = state["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|task| value_string(task.get("id")))
+            .collect();
+        assert_eq!(ids, vec!["21355-5", "140001-6"]);
+        assert_eq!(state["tasks"][1]["subjectId"], 140001);
+
+        // 幂等：重复灌入同一调度集不新增。
+        let outcome = apply_airing_schedules(&mut state, &schedules, 60);
+        assert_eq!(outcome.created, 0);
+    }
+
+    #[cfg(feature = "standard")]
+    #[test]
+    fn canonicalize_absorbs_duplicate_pendings_with_completed_history() {
+        // 原 cleanup_bangumi_duplicate_pendings 场景（问题 3：43 待看缩影）
+        // 改写为规范化语义：completed 历史在场 → 重复 pending 被删，completed
+        // 归一到 subjectId 键且语义字段不丢；无历史 pending 保留；他番不动。
+        let mut state = default_state(false);
+        state["following"] = json!([{
+            "id": 140001, "source": "bangumi", "anilistId": 21355,
+            "displayTitle": "黄泉的使者", "followedAt": 0, "syncUpdatedAt": 1
+        }]);
+        state["tasks"] = json!([
+            // 旧版观看历史：completed 挂 anilistId 键，永不删除。
+            {"id": "21355-1", "animeId": 21355, "episode": 1, "status": "completed", "completedAt": 10, "syncUpdatedAt": 1},
+            {"id": "21355-2", "animeId": 21355, "episode": 2, "status": "completed", "completedAt": 20, "syncUpdatedAt": 1},
+            // 新版重复生成的 subjectId 键 pending（有历史）→ 删。
+            {"id": "140001-1", "animeId": 140001, "subjectId": 140001, "episode": 1, "status": "pending", "completedAt": null, "syncUpdatedAt": 2},
+            {"id": "140001-2", "animeId": 140001, "subjectId": 140001, "episode": 2, "status": "pending", "completedAt": null, "syncUpdatedAt": 2},
+            // 无历史集 → 保留。
+            {"id": "140001-3", "animeId": 140001, "subjectId": 140001, "episode": 3, "status": "pending", "completedAt": null, "syncUpdatedAt": 2},
+            // 他番 pending（无对应追番条目身份）→ 保留且原样不动。
+            {"id": "999-1", "animeId": 999, "episode": 1, "status": "pending", "completedAt": null, "syncUpdatedAt": 2}
+        ]);
+
+        assert!(canonicalize_cross_key_tasks(&mut state, &json!({}), false));
+
+        let tasks = state["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 4);
+        let episode1 = tasks
+            .iter()
+            .find(|task| value_string(task.get("id")) == "140001-1")
+            .expect("normalized episode 1");
+        assert_eq!(episode1["status"], "completed");
+        assert_eq!(episode1["completedAt"], 10);
+        assert_eq!(episode1["animeId"], 140001);
+        assert_eq!(episode1["subjectId"], 140001);
+        let episode2 = tasks
+            .iter()
+            .find(|task| value_string(task.get("id")) == "140001-2")
+            .expect("normalized episode 2");
+        assert_eq!(episode2["status"], "completed");
+        assert_eq!(episode2["completedAt"], 20);
+        let episode3 = tasks
+            .iter()
+            .find(|task| value_string(task.get("id")) == "140001-3")
+            .expect("unique pending kept");
+        assert_eq!(episode3["status"], "pending");
+        // 无身份归属的他番记录完全不动（无 episodeSortKey 补齐、时间戳不变）。
+        let other = tasks
+            .iter()
+            .find(|task| value_string(task.get("id")) == "999-1")
+            .expect("unrelated task kept");
+        assert_eq!(other["syncUpdatedAt"], 2);
+        assert!(other.get("episodeSortKey").is_none());
+
+        // 幂等：再次规范化零变更。
+        assert!(!canonicalize_cross_key_tasks(&mut state, &json!({}), false));
+
+        // completed 键为 subjectId（subjectId==S 命中）时同样清理。
+        let mut state = default_state(false);
+        state["following"] = json!([
+            {"id": 140001, "source": "bangumi", "anilistId": null, "followedAt": 0, "syncUpdatedAt": 1}
+        ]);
+        state["tasks"] = json!([
+            {"id": "140001-5", "animeId": 140001, "subjectId": 140001, "episode": 5, "status": "completed", "completedAt": 10, "syncUpdatedAt": 1},
+            {"id": "140001-5b", "animeId": 140001, "subjectId": 140001, "episode": 5, "status": "pending", "completedAt": null, "syncUpdatedAt": 2}
+        ]);
+        assert!(canonicalize_cross_key_tasks(&mut state, &json!({}), false));
+        assert_eq!(state["tasks"].as_array().unwrap().len(), 1);
+        assert_eq!(state["tasks"][0]["status"], "completed");
+        assert_eq!(state["tasks"][0]["completedAt"], 10);
+
+        // 通过 reconcile_following_entries 接线后同样生效（before/after 捕获变更）：
+        // 脏对（completed "21355-5" + pending "140001-5"）→ 唯一权威记录
+        // "140001-5" completed。
+        let mut state = default_state(false);
+        state["following"] = json!([
+            {"id": 140001, "source": "bangumi", "anilistId": 21355, "followedAt": 0, "syncUpdatedAt": 1}
+        ]);
+        state["tasks"] = json!([
+            {"id": "21355-5", "animeId": 21355, "episode": 5, "status": "completed", "completedAt": 10, "syncUpdatedAt": 1},
+            {"id": "140001-5", "animeId": 140001, "subjectId": 140001, "episode": 5, "status": "pending", "completedAt": null, "syncUpdatedAt": 2}
+        ]);
+        assert!(reconcile_following_entries(&mut state, &json!({}), false));
+        assert_eq!(state["tasks"].as_array().unwrap().len(), 1);
+        assert_eq!(state["tasks"][0]["id"], "140001-5");
+        assert_eq!(state["tasks"][0]["status"], "completed");
+        // 无变更时 reconcile 仍返回 false。
+        assert!(!reconcile_following_entries(&mut state, &json!({}), false));
+    }
+
+    #[cfg(feature = "standard")]
+    #[test]
+    fn canonicalize_merges_double_completed_across_keys_keeping_history() {
+        // 双 completed 跨键同集 → 只剩一条，completedAt 保留（取全组最新非空）。
+        let map = cross_key_map();
+        let mut state = default_state(false);
+        state["following"] = json!([{
+            "id": 45678, "source": "bangumi", "anilistId": 21355, "bangumiId": 45678,
+            "title": {"native": "無職転生 III"}, "displayTitle": "无职转生 III",
+            "followedAt": 2_000, "syncUpdatedAt": 6_000
+        }]);
+        state["tasks"] = json!([
+            {"id": "21355-5", "animeId": 21355, "animeTitle": "Mushoku Tensei III", "episode": 5, "airingAt": 50, "status": "completed", "createdAt": 30, "completedAt": 40, "syncUpdatedAt": 9_000},
+            {"id": "45678-5", "animeId": 45678, "subjectId": 45678, "animeTitle": "无职转生 III", "episode": 5, "airingAt": 50, "status": "completed", "createdAt": 31, "completedAt": 45, "syncUpdatedAt": 8_000}
+        ]);
+
+        assert!(canonicalize_cross_key_tasks(&mut state, &map, false));
+
+        let tasks = state["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["id"], "45678-5");
+        assert_eq!(tasks[0]["status"], "completed");
+        assert_eq!(tasks[0]["completedAt"], 45);
+        assert_eq!(tasks[0]["createdAt"], 31);
+        // 键被规范化 → 时间戳提到 now（LWW 保证对端采纳）。
+        assert!(value_i64(tasks[0].get("syncUpdatedAt")) > 9_000);
+
+        // 幂等。
+        assert!(!canonicalize_cross_key_tasks(&mut state, &map, false));
+    }
+
+    #[cfg(feature = "standard")]
+    #[test]
+    fn canonicalize_resolves_empty_anilist_id_via_offline_map() {
+        // bangumi 条目 anilistId 为空 → bySubject[S].a 兜底解析出 A → 同样合并。
+        let map = cross_key_map();
+        let mut state = default_state(false);
+        state["following"] = json!([{
+            "id": 45678, "source": "bangumi", "anilistId": null, "bangumiId": 45678,
+            "title": {"native": "無職転生 III"}, "displayTitle": "无职转生 III",
+            "followedAt": 2_000, "syncUpdatedAt": 6_000
+        }]);
+        state["tasks"] = json!([
+            {"id": "21355-5", "animeId": 21355, "episode": 5, "airingAt": 50, "status": "completed", "createdAt": 40, "completedAt": 50, "syncUpdatedAt": 9_000},
+            {"id": "45678-5", "animeId": 45678, "subjectId": 45678, "episode": 5, "airingAt": 50, "status": "pending", "createdAt": 50, "completedAt": null, "syncUpdatedAt": 9_500}
+        ]);
+
+        assert!(canonicalize_cross_key_tasks(&mut state, &map, false));
+
+        let tasks = state["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["id"], "45678-5");
+        assert_eq!(tasks[0]["status"], "completed");
+        assert_eq!(tasks[0]["completedAt"], 50);
+
+        // bySubject 缺失时 anilistIndex 反查兜底（A→S 指向已追番的 subject）。
+        let reverse_map = json!({"bySubject": {}, "anilistIndex": {"21355": 45678}});
+        let mut state = default_state(false);
+        state["following"] = json!([{
+            "id": 45678, "source": "bangumi", "anilistId": null, "followedAt": 0, "syncUpdatedAt": 1
+        }]);
+        state["tasks"] = json!([
+            {"id": "21355-5", "animeId": 21355, "episode": 5, "status": "completed", "completedAt": 10, "syncUpdatedAt": 1},
+            {"id": "45678-5", "animeId": 45678, "subjectId": 45678, "episode": 5, "status": "pending", "completedAt": null, "syncUpdatedAt": 2}
+        ]);
+        assert!(canonicalize_cross_key_tasks(&mut state, &reverse_map, false));
+        let tasks = state["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["id"], "45678-5");
+        assert_eq!(tasks[0]["status"], "completed");
+    }
+
+    #[cfg(feature = "standard")]
+    #[test]
+    fn canonicalize_leaves_unmapped_records_untouched() {
+        // 无映射关系（A 不在 map、无对应 bangumi 身份）的记录一律不动。
+        let mut state = default_state(false);
+        state["following"] = json!([{
+            "id": 45678, "source": "bangumi", "anilistId": null, "followedAt": 0, "syncUpdatedAt": 1
+        }]);
+        state["tasks"] = json!([
+            {"id": "21355-5", "animeId": 21355, "episode": 5, "status": "completed", "completedAt": 10, "syncUpdatedAt": 1},
+            {"id": "999-1", "animeId": 999, "episode": 1, "status": "pending", "completedAt": null, "syncUpdatedAt": 2}
+        ]);
+
+        assert!(!canonicalize_cross_key_tasks(&mut state, &json!({}), false));
+
+        let tasks = state["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0]["id"], "21355-5");
+        assert_eq!(tasks[0]["syncUpdatedAt"], 1);
+        assert_eq!(tasks[1]["id"], "999-1");
+
+        // original：永不执行。
+        let mut state = default_state(false);
+        state["following"] = json!([{
+            "id": 45678, "source": "bangumi", "anilistId": 21355, "followedAt": 0, "syncUpdatedAt": 1
+        }]);
+        state["tasks"] = json!([
+            {"id": "21355-5", "animeId": 21355, "episode": 5, "status": "completed", "completedAt": 10, "syncUpdatedAt": 1},
+            {"id": "45678-5", "animeId": 45678, "subjectId": 45678, "episode": 5, "status": "pending", "completedAt": null, "syncUpdatedAt": 2}
+        ]);
+        assert!(!canonicalize_cross_key_tasks(&mut state, &cross_key_map(), true));
+        assert_eq!(state["tasks"].as_array().unwrap().len(), 2);
+    }
+
+    #[cfg(feature = "standard")]
+    #[test]
+    fn canonicalize_heals_dirty_remote_pair_in_upload_document() {
+        // 愈合主场景：本机干净 + 远端文档含脏对（completed "21355-5" +
+        // pending "45678-5" 同集）→ merge → reconcile（含规范化）→ 上传文档
+        // （document_from_state 输出）该作品该集只剩一条且为 completed
+        // subjectId 键。远端文档被本轮回写覆盖愈合。
+        let map = cross_key_map();
+        let mut state = default_state(false);
+        state["following"] = json!([{
+            "id": 45678, "source": "bangumi", "anilistId": 21355, "bangumiId": 45678,
+            "title": {"native": "無職転生 III"}, "displayTitle": "无职转生 III",
+            "followedAt": 2_000, "syncUpdatedAt": 6_000
+        }]);
+        let remote = json!({
+            "version": SYNC_VERSION,
+            "following": [{
+                "id": 45678, "source": "bangumi", "anilistId": 21355, "bangumiId": 45678,
+                "title": {"native": "無職転生 III"}, "displayTitle": "无职转生 III",
+                "followedAt": 2_000, "syncUpdatedAt": 6_000
+            }],
+            "tasks": [
+                {"id": "21355-5", "animeId": 21355, "animeTitle": "Mushoku Tensei III", "episode": 5, "airingAt": 50, "status": "completed", "createdAt": 40, "completedAt": 50, "syncUpdatedAt": 9_000},
+                {"id": "45678-5", "animeId": 45678, "subjectId": 45678, "animeTitle": "无职转生 III", "episode": 5, "airingAt": 50, "status": "pending", "createdAt": 50, "completedAt": null, "syncUpdatedAt": 9_500}
+            ],
+            "followingDeletedAt": {}
+        });
+
+        let (changed, _, _) = merge_document_into_state(&mut state, &remote).unwrap();
+        assert!(changed, "远端脏对先按 LWW 合并进本地");
+        // perform_webdav_sync / mobile sync_webdav 挂载序列：合并后立即
+        // reconcile（含规范化），再 document_from_state 重建上传文档。
+        assert!(reconcile_following_entries(&mut state, &map, false));
+        let document = document_from_state(&mut state);
+        // 规范化清掉了重复键 → 上传文档 != 远端文档（reconcile 分支会以此
+        // 重算 remote_changed 并回写坚果云，愈合远端）。
+        assert_ne!(
+            comparable_document(&remote).ok(),
+            comparable_document(&document).ok()
+        );
+        let tasks = document["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["id"], "45678-5");
+        assert_eq!(tasks[0]["animeId"], 45678);
+        assert_eq!(tasks[0]["subjectId"], 45678);
+        assert_eq!(tasks[0]["status"], "completed");
+        assert_eq!(tasks[0]["completedAt"], 50);
+        // 权威记录带新时间戳 → 其他 v0.7 设备以 LWW 采纳愈合结果。
+        assert!(value_i64(tasks[0].get("syncUpdatedAt")) > 9_500);
+
+        // 幂等：再次 reconcile + 重建文档完全一致。
+        assert!(!reconcile_following_entries(&mut state, &map, false));
+        let again = document_from_state(&mut state);
+        assert_eq!(
+            serde_json::to_string(&document).unwrap(),
+            serde_json::to_string(&again).unwrap()
+        );
+    }
+
+    #[cfg(all(feature = "standard", not(target_os = "android")))]
+    #[test]
+    fn desktop_bangumi_sync_kernel_quiet_period_and_gate() {
+        // 问题 2b 循环内核：静默期/周期等待时长 + 执行前判定。
+        use super::desktop_bangumi_sync;
+        // 动作唤醒 → 30 秒静默期；周期路径 → 60 分钟。
+        assert_eq!(
+            desktop_bangumi_sync::wait_duration(false),
+            std::time::Duration::from_secs(3_600)
+        );
+        assert_eq!(
+            desktop_bangumi_sync::wait_duration(true),
+            std::time::Duration::from_secs(30)
+        );
+        // 静默期必须短于周期（唤醒比周期更快触达）。
+        assert!(desktop_bangumi_sync::QUIET_SECS < desktop_bangumi_sync::INTERVAL_SECS);
+        // 执行前判定：无 Token 不跑；门被占不跑；两者齐备才跑。
+        assert!(!desktop_bangumi_sync::should_execute(false, true));
+        assert!(!desktop_bangumi_sync::should_execute(true, false));
+        assert!(desktop_bangumi_sync::should_execute(true, true));
+    }
+
+    #[cfg(feature = "standard")]
+    #[test]
+    fn subject_image_url_prefers_uncropped_large_then_medium_small() {
+        // 问题 4 回归：角色 images 链 large → common → medium → small → grid；
+        // large 是未裁剪全身图（medium/small 是中心方形裁剪，只剩腰以下）。
+        let parse = |value: Value| -> bangumi::BangumiSubjectImages {
+            serde_json::from_value(value).expect("valid images object")
+        };
+        // large 优先。
+        let all = parse(json!({
+            "large": "https://lain.bgm.tv/pic/crt/l/00/00/1_a.jpg",
+            "medium": "https://lain.bgm.tv/pic/crt/m/00/00/1_a.jpg",
+            "small": "https://lain.bgm.tv/pic/crt/s/00/00/1_a.jpg"
+        }));
+        assert_eq!(
+            bangumi_commands::subject_image_url(Some(&all)),
+            json!("https://lain.bgm.tv/pic/crt/l/00/00/1_a.jpg")
+        );
+        // 缺 large → medium；缺 medium → small（此前 small 未反序列化，会落 null）。
+        let medium_only = parse(json!({"medium": "https://lain.bgm.tv/pic/crt/m/00/00/1_a.jpg"}));
+        assert_eq!(
+            bangumi_commands::subject_image_url(Some(&medium_only)),
+            json!("https://lain.bgm.tv/pic/crt/m/00/00/1_a.jpg")
+        );
+        let small_only = parse(json!({"small": "https://lain.bgm.tv/pic/crt/s/00/00/1_a.jpg"}));
+        assert_eq!(
+            bangumi_commands::subject_image_url(Some(&small_only)),
+            json!("https://lain.bgm.tv/pic/crt/s/00/00/1_a.jpg")
+        );
+        // 关联条目 common（large 缺失时的全身图）仍优先于 medium。
+        let common_only = parse(json!({"common": "https://lain.bgm.tv/pic/cover/c/1.jpg"}));
+        assert_eq!(
+            bangumi_commands::subject_image_url(Some(&common_only)),
+            json!("https://lain.bgm.tv/pic/cover/c/1.jpg")
+        );
+        // 全缺 / images 为 null → null。
+        assert!(bangumi_commands::subject_image_url(None).is_null());
+        let empty = parse(json!({}));
+        assert!(bangumi_commands::subject_image_url(Some(&empty)).is_null());
+    }
+
+    #[cfg(feature = "standard")]
+    #[test]
+    fn subject_characters_fixture_images_deserialize_small() {
+        // 问题 4 fixture 断言：subject-characters.json 的 images 结构必须
+        // 解析出 large/medium/small（small 此前被 serde 丢弃）。
+        let characters: Vec<bangumi::BangumiCharacter> = serde_json::from_str(include_str!(
+            "../fixtures/bangumi/subject-characters.json"
+        ))
+        .expect("fixture parses");
+        assert_eq!(characters.len(), 2);
+        let images = characters[0].images.as_ref().expect("character images");
+        assert_eq!(
+            images.large.as_deref(),
+            Some("https://lain.bgm.tv/pic/crt/l/00/00/12345_crt_Ab12C.jpg")
+        );
+        assert_eq!(
+            images.medium.as_deref(),
+            Some("https://lain.bgm.tv/pic/crt/m/00/00/12345_crt_Ab12C.jpg")
+        );
+        assert_eq!(
+            images.small.as_deref(),
+            Some("https://lain.bgm.tv/pic/crt/s/00/00/12345_crt_Ab12C.jpg")
+        );
     }
 }

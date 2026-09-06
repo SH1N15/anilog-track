@@ -217,6 +217,8 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
 .proxy-controls button { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
 .proxy-status { min-height: 15px; margin: 7px 0 0; color: var(--muted); font-size: 9px; }
 .proxy-status.success { color: var(--green); }
+.bangumi-character { object-fit: cover; object-position: center top; }
+.bangumi-sync-dimmed { opacity: 0.5; }
 .webdav-setting { padding: 16px 20px 18px; }
 .webdav-fields { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(130px, .8fr) minmax(150px, 1fr); gap: 10px; }
 .webdav-fields label > span { display: block; margin-bottom: 7px; color: var(--ink); font-size: 10px; font-weight: 700; }

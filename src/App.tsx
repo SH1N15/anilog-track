@@ -739,7 +739,7 @@ function AnimeDetail({ anime, titleMatch, titlePreference, language, followed, o
                       {characters.map((character) => (
                         <div key={character.id} style={{ flexShrink: 0, width: 88, textAlign: 'center' }}>
                           {character.imageUrl
-                            ? <img src={character.imageUrl} alt="" loading="lazy" style={{ width: 64, height: 64, borderRadius: '50%', objectFit: 'cover' }} />
+                            ? <img src={character.imageUrl} alt="" loading="lazy" className="bangumi-character" style={{ width: 64, height: 64, borderRadius: '50%' }} />
                             : <span style={{ display: 'inline-block', width: 64, height: 64, borderRadius: '50%', background: 'rgba(128,128,128,0.25)' }} />}
                           <div style={{ fontSize: 12, marginTop: 4 }}>{character.nameCn || character.name}</div>
                           <div style={{ fontSize: 11, opacity: 0.6 }}>{character.relation}</div>
@@ -1493,10 +1493,14 @@ function SettingsView({ state, language, onChange, onApplyState }: { state: AppS
           </div>
           {bangumiAuth?.hasToken && (
             <>
+              <SettingRow title="启用 Bangumi 同步" description="关闭时，Bangumi 拉取与写回全部暂停（坚果云与播出数据不受影响）">
+                <Toggle checked={bangumiSyncSettings?.syncEnabled ?? false} disabled={bangumiBusy} onChange={(value) => void updateBangumiSyncSettings({ syncEnabled: value })} />
+              </SettingRow>
+              <div className={bangumiSyncSettings?.syncEnabled ? 'bangumi-sync-subtoggles' : 'bangumi-sync-subtoggles bangumi-sync-dimmed'}>
               <SettingRow title="从 Bangumi 读取收藏" description="把 Bangumi 收藏（追番/看完/弃番等）拉取合并到本地追番清单">
                 <Toggle checked={bangumiSyncSettings?.pullCollections ?? true} disabled={bangumiBusy} onChange={(value) => void updateBangumiSyncSettings({ pullCollections: value })} />
               </SettingRow>
-              <SettingRow title="将本地追番变化写回 Bangumi" description="本地追番/取消/评分变化将写入你的 Bangumi 账户，默认关闭">
+              <SettingRow title="将本地追番变化写回 Bangumi" description="本地追番/取消/评分变化将写入你的 Bangumi 账户，默认关闭（操作后约 1 分钟内自动同步）">
                 <Toggle checked={bangumiSyncSettings?.pushLocalChanges ?? false} disabled={bangumiBusy} onChange={(value) => void updateBangumiSyncSettings({ pushLocalChanges: value })} />
               </SettingRow>
               <SettingRow title="完成任务时同步观看进度" description="勾选看完一集后，把观看进度写回 Bangumi">
@@ -1505,6 +1509,7 @@ function SettingsView({ state, language, onChange, onApplyState }: { state: AppS
               <SettingRow title="读取 Bangumi 外部状态" description="在 Bangumi 网页或其他客户端产生的变化会拉取回本地">
                 <Toggle checked={bangumiSyncSettings?.pullExternalStatus ?? true} disabled={bangumiBusy} onChange={(value) => void updateBangumiSyncSettings({ pullExternalStatus: value })} />
               </SettingRow>
+              </div>
               <SettingRow title="冲突策略" description="两端同时变化时按所选策略合并">
                 <label className="number-select">
                   <select
