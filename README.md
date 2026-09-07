@@ -31,14 +31,14 @@ Account-free, local-first anime schedule, notification, and episode task manager
 
 前往 [GitHub Releases](https://github.com/SH1N15/anilog-tracker/releases) 下载需要的版本：
 
-### 正式版 v0.6.0
+### 正式版 v0.7.1
 
-- [`AniLog-Windows-v0.6.0-x64-setup.exe`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.6.0/AniLog-Windows-v0.6.0-x64-setup.exe)：Windows 标准版
-- [`AniLog-Original-Windows-v0.6.0-x64-setup.exe`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.6.0/AniLog-Original-Windows-v0.6.0-x64-setup.exe)：Windows 原名版
-- [`AniLog-Android-v0.6.0-arm64-v8a.apk`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.6.0/AniLog-Android-v0.6.0-arm64-v8a.apk)：Android 标准版，仅支持 arm64-v8a
-- [`AniLog-Original-Android-v0.6.0-arm64-v8a.apk`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.6.0/AniLog-Original-Android-v0.6.0-arm64-v8a.apk)：Android 原名版，仅支持 arm64-v8a
+- [`AniLog-Windows-v0.7.1-x64-setup.exe`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.7.1/AniLog-Windows-v0.7.1-x64-setup.exe)：Windows 标准版
+- [`AniLog-Original-Windows-v0.7.1-x64-setup.exe`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.7.1/AniLog-Original-Windows-v0.7.1-x64-setup.exe)：Windows 原名版
+- [`AniLog-Android-v0.7.1-arm64-v8a.apk`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.7.1/AniLog-Android-v0.7.1-arm64-v8a.apk)：Android 标准版，仅支持 arm64-v8a
+- [`AniLog-Original-Android-v0.7.1-arm64-v8a.apk`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.7.1/AniLog-Original-Android-v0.7.1-arm64-v8a.apk)：Android 原名版，仅支持 arm64-v8a
 
-`v0.6.0` 已正式迁移到 Tauri 2，共用 React 界面与 Rust 核心，并显著降低 Windows 托盘后台占用。它会覆盖对应 edition 的旧版安装；升级前建议先启用 WebDAV 同步或备份 Windows 安装目录中的 `data` 文件夹。
+`v0.7.1` 已正式发布，包含 Bangumi 逐集播出纠偏、AniList 分钟级时间回退和 WebDAV 污染自愈。它会覆盖对应 edition 的旧版安装；升级前建议先启用 WebDAV 同步或备份 Windows 安装目录中的 `data` 文件夹。
 
 - 支持 Windows 10/11 x64，以及使用 arm64-v8a 的 Android 7.0 或更高版本
 - 番剧日程需要网络连接；标准版的在线中文标题查询还会访问 Bangumi API 或配置的反代
@@ -81,7 +81,7 @@ npm run dev
 npm run dev:original
 ```
 
-`v0.6.0` 是当前 Tauri 2 正式版。新架构共享 React 界面与 Rust 核心；旧 Electron/Capacitor 代码暂时保留为回退路径。当前状态、构建命令和回归重点见 [docs/TAURI_MIGRATION.md](docs/TAURI_MIGRATION.md)。
+`v0.7.1` 是当前 Tauri 2 正式版。新架构共享 React 界面与 Rust 核心；旧 Electron/Capacitor 代码暂时保留为回退路径。当前状态、构建命令和回归重点见 [docs/TAURI_MIGRATION.md](docs/TAURI_MIGRATION.md)。
 
 完整的环境配置、构建和测试说明见 [CONTRIBUTING.md](CONTRIBUTING.md)，维护者发布版本时请参考 [docs/RELEASING.md](docs/RELEASING.md)。
 

@@ -5,6 +5,7 @@ import androidx.annotation.NonNull;
 import androidx.work.Worker;
 import androidx.work.WorkerParameters;
 import org.json.JSONArray;
+import org.json.JSONException;
 import org.json.JSONObject;
 import java.io.IOException;
 import java.util.ArrayList;
@@ -132,13 +133,33 @@ public class BackgroundSyncWorker extends Worker {
             applyMerged(context, result.merged, removedFollowIds);
         }
 
+        // 云端文档可能还带着旧的未来假票。先合并，再用 Bangumi episode
+        // 表清理，最后重新投影上传；这样 AniList 暂停或分季错位都不会让
+        // 错误任务在 Android 端重新写回坚果云。
+        JSONObject mergedDocument = result.merged;
+        boolean remoteDiffers = result.remoteDiffers;
+        if (!BuildConfig.isOriginalEdition) {
+            try {
+                AniListScheduler.syncBangumiEpisodeSchedules(context);
+                mergedDocument = localDocument(context);
+                if (download.found) {
+                    SyncMerge.validateDocument(download.body);
+                    remoteDiffers = !SyncMerge.sameBusinessDocument(mergedDocument, new JSONObject(download.body));
+                } else {
+                    remoteDiffers = true;
+                }
+            } catch (IOException | JSONException ignored) {
+                // Bangumi 单次失败不应抹掉已完成的同步结果；下一周期继续修复。
+            }
+        }
+
         boolean hasContent =
-            result.merged.optJSONArray("following").length() > 0
-                || result.merged.optJSONArray("tasks").length() > 0
-                || result.merged.optJSONObject("followingDeletedAt").length() > 0;
-        boolean needUpload = !download.found || result.remoteDiffers;
+            mergedDocument.optJSONArray("following").length() > 0
+                || mergedDocument.optJSONArray("tasks").length() > 0
+                || mergedDocument.optJSONObject("followingDeletedAt").length() > 0;
+        boolean needUpload = !download.found || remoteDiffers;
         if (needUpload && hasContent) {
-            String document = result.merged.toString();
+            String document = mergedDocument.toString();
             SyncMerge.validateDocument(document); // 5MB 上限（上传前复检）
             boolean uploaded = client.upload(config, document, download.found, download.etag);
             if (!uploaded) throw new IOException("WebDAV 写入冲突（412/409），等待下个周期");
@@ -151,7 +172,7 @@ public class BackgroundSyncWorker extends Worker {
     static JSONObject localDocument(Context context) throws org.json.JSONException {
         JSONObject document = SyncMerge.emptyDocument();
         document.put("following", MobileStore.following(context));
-        JSONArray pendingTasks = MobileStore.pendingTasks(context);
+        JSONArray pendingTasks = MobileStore.allTasks(context);
         JSONArray tasks = new JSONArray();
         for (int index = 0; index < pendingTasks.length(); index += 1) {
             JSONObject task = pendingTasks.optJSONObject(index);
@@ -180,12 +201,9 @@ public class BackgroundSyncWorker extends Worker {
         JSONArray following = merged.optJSONArray("following");
         MobileStore.setFollowing(context, following);
         JSONArray tasks = merged.optJSONArray("tasks");
-        JSONArray pending = new JSONArray();
-        for (int index = 0; index < tasks.length(); index += 1) {
-            JSONObject task = tasks.optJSONObject(index);
-            if (task != null && "pending".equals(task.optString("status", "pending"))) pending.put(task);
-        }
-        MobileStore.setPendingTasks(context, pending);
+        // 保留 pending 与 completed 全部记录；WebDAV 契约同步观看历史，不能
+        // 只写回当前待看任务，否则后台合并会抹掉已完成集。
+        MobileStore.setTasks(context, tasks);
         MobileStore.setTombstones(context, merged.optJSONObject("followingDeletedAt"));
         removedFollowIds.addAll(before);
         Set<Integer> after = currentFollowIds(context);

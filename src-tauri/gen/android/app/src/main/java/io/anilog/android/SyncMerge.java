@@ -239,6 +239,11 @@ final class SyncMerge {
         return canonical(business);
     }
 
+    /** 比较同步业务字段；updatedAt 等派生字段不参与。 */
+    static boolean sameBusinessDocument(JSONObject left, JSONObject right) throws MergeException, org.json.JSONException {
+        return businessKey(normalizeDocument(left)).equals(businessKey(normalizeDocument(right)));
+    }
+
     private static String canonical(Object value) {
         if (value instanceof JSONObject) {
             JSONObject object = (JSONObject) value;

@@ -45,11 +45,19 @@ fn configuration_payload(context: &AppContext) -> anyhow::Result<Value> {
             // anilistId 为 AniList 关联；anilist 条目反之。
             let source = {
                 let value = value_string(item.get("source"));
-                if value.is_empty() { "anilist".to_string() } else { value }
+                if value.is_empty() {
+                    "anilist".to_string()
+                } else {
+                    value
+                }
             };
             let id = value_i64(item.get("id"));
             let bangumi = source == "bangumi";
-            let subject_id = if bangumi { id } else { value_i64(item.get("subjectId")) };
+            let subject_id = if bangumi {
+                id
+            } else {
+                value_i64(item.get("subjectId"))
+            };
             let anilist_id = if bangumi {
                 value_i64(item.get("anilistId"))
             } else {
@@ -63,28 +71,36 @@ fn configuration_payload(context: &AppContext) -> anyhow::Result<Value> {
                 "nextAiringAt": value_i64(item["nextAiringEpisode"].get("airingAt")),
                 "source": source,
                 "subjectId": if subject_id > 0 { json!(subject_id) } else { Value::Null },
-                "anilistId": if anilist_id > 0 { json!(anilist_id) } else { Value::Null }
+                "anilistId": if anilist_id > 0 { json!(anilist_id) } else { Value::Null },
+                "bangumiStatus": item.get("bangumiStatus").cloned().unwrap_or(Value::Null),
+                "followedAt": value_i64(item.get("followedAt")),
+                "watchedEpisode": item.get("watchedEpisode").cloned().unwrap_or(Value::Null)
             })
         })
         .collect::<Vec<_>>();
-    let pending_tasks = state["tasks"]
+    // Android 后台 Worker 也负责坚果云三字段投影；必须传递完整任务历史，
+    // 而不只是 pending。否则 Worker 合并后会把已完成观看记录误删出云端。
+    let tasks = state["tasks"]
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|task| value_string(task.get("status")) == "pending")
         .map(|task| {
             json!({
                 "id": value_string(task.get("id")),
                 "animeTitle": value_string(task.get("animeTitle")),
                 "episode": value_i64(task.get("episode")),
-                "airingAt": value_i64(task.get("airingAt"))
+                "airingAt": value_i64(task.get("airingAt")),
+                "animeId": value_i64(task.get("animeId")),
+                "subjectId": if value_i64(task.get("subjectId")) > 0 { json!(value_i64(task.get("subjectId"))) } else { Value::Null },
+                "episodeId": if value_i64(task.get("episodeId")) > 0 { json!(value_i64(task.get("episodeId"))) } else { Value::Null },
+                "status": value_string(task.get("status"))
             })
         })
         .collect::<Vec<_>>();
     let settings = &state["settings"];
     Ok(json!({
         "following": following,
-        "pendingTasks": pending_tasks,
+        "pendingTasks": tasks,
         "notificationsEnabled": value_bool(settings.get("notifyWhenAired")),
         "createTasksEnabled": value_bool(settings.get("createWatchTasks")),
         "dailyTaskReminderEnabled": value_bool(settings.get("dailyTaskReminderEnabled")),
@@ -191,12 +207,17 @@ fn merge_status(app: &AppHandle, context: &AppContext, status: &Value) -> anyhow
             // 观看任务（播出通知不受影响，Java 层照发）。anilist 条目
             // （bangumiStatus 为 null）与 original 不受影响。
             #[cfg(feature = "standard")]
-            if state["following"].as_array().into_iter().flatten().any(|item| {
-                value_i64(item.get("id")) == anime_id
-                    && super::bangumi_status_blocks_tracking(&value_string(
-                        item.get("bangumiStatus"),
-                    ))
-            }) {
+            if state["following"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|item| {
+                    value_i64(item.get("id")) == anime_id
+                        && super::bangumi_status_blocks_tracking(&value_string(
+                            item.get("bangumiStatus"),
+                        ))
+                })
+            {
                 continue;
             }
             // 已完成历史查重（standard）：定位事件对应条目（id 或 anilistId
@@ -216,10 +237,12 @@ fn merge_status(app: &AppHandle, context: &AppContext, status: &Value) -> anyhow
                 let bangumi_sourced =
                     followed.is_some_and(|item| value_string(item.get("source")) == "bangumi");
                 if bangumi_sourced {
-                    let task_anime_id =
-                        followed.map(|item| value_i64(item.get("id"))).unwrap_or(anime_id);
-                    let anilist_id =
-                        followed.map(|item| value_i64(item.get("anilistId"))).unwrap_or(0);
+                    let task_anime_id = followed
+                        .map(|item| value_i64(item.get("id")))
+                        .unwrap_or(anime_id);
+                    let anilist_id = followed
+                        .map(|item| value_i64(item.get("anilistId")))
+                        .unwrap_or(0);
                     if super::completed_history_blocks_event(
                         &completed_history,
                         task_anime_id,
@@ -268,7 +291,11 @@ fn merge_status(app: &AppHandle, context: &AppContext, status: &Value) -> anyhow
                             && value_string(item.get("source")) == "bangumi"
                     })
                 });
-                new_task["subjectId"] = if subject_sourced { json!(anime_id) } else { Value::Null };
+                new_task["subjectId"] = if subject_sourced {
+                    json!(anime_id)
+                } else {
+                    Value::Null
+                };
                 new_task["episodeId"] = Value::Null;
                 new_task["episodeSortKey"] = json!(episode.to_string());
                 new_task["episodeType"] = json!("regular");
@@ -528,7 +555,6 @@ impl crate::bangumi::BangumiTokenStore for MobileBangumiTokenStore {
         }
     }
 }
-
 
 fn finish_webdav_sync(app: &AppHandle, error: Option<&str>) {
     let payload = error.map_or_else(|| json!({}), |message| json!({"error": message}));

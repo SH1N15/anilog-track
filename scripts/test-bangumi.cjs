@@ -180,6 +180,10 @@ async function liveCoverage() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ query, variables: { page } }),
     });
+    if (response.status === 403 || response.status === 429 || response.status >= 500) {
+      console.warn(`AniList live coverage skipped: upstream HTTP ${response.status}`);
+      return;
+    }
     assert.equal(response.ok, true);
     const payload = await response.json();
     anime.push(...payload.data.Page.media);

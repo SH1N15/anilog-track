@@ -14,8 +14,8 @@ import javax.crypto.spec.GCMParameterSpec;
 
 /**
  * Bangumi access token 的 Android Keystore 安全存储。
- * 本类仅做凭据存取（Keystore 加解密 + SharedPreferences），绝不发起任何网络请求；
- * Bangumi HTTP 访问一律由 Rust 层发起。
+ * 本类仅做凭据存取（Keystore 加解密 + SharedPreferences），绝不发起网络请求；
+ * 需要后台纠偏时由调用方读取后逐请求注入 Authorization，token 本身不落入日志或同步文档。
  */
 final class BangumiTokenStore {
     private static final String PREFS = "anilog_bangumi";

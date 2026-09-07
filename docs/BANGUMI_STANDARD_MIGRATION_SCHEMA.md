@@ -1,7 +1,7 @@
 # AniLog 标准版 Bangumi 迁移 — Schema 冻结文档（Phase 0）
 
 > 分支：`codex/bangumi-standard-migration`
-> 状态：Phase 0 冻结文档
+> 状态：Phase 0 历史契约；当前 v0.7.1 修复线对播出权威的补充约束见 §6。
 > 配套（本机）进度锚点：`LOCAL_MIGRATION_PROGRESS.md`（契约基准，本文档不得与之冲突）；产品方案：`LOCAL_BANGUMI_STANDARD_MIGRATION_PLAN.md`。
 
 ## 1. 文档目的与范围
@@ -264,14 +264,24 @@ Phase 0 不改变 `STATE_VERSION`（仍为 2），以下均为可选新增字段
 - **`updated_at` 注意事项**（官方注释原文）：「本时间并不代表条目的收藏时间。修改评分，评价，章节观看状态等收藏信息时未更新此时间是一个 bug。请不要依赖此特性」→ 冲突解决禁用其做 LWW（见 §3.2）。
 - 其他 v0 事实：错误体 `ErrorDetail{title, description, details?}`；分页信封统一 `{total, limit, offset, data}`。
 
-## 6. 播出时间四级优先与 bangumi-data 交付
+## 6. 播出时间权威与 bangumi-data 交付
 
-**播出时间解析优先级：**
+当前实现不再把 `bangumi-data` 的首播锚点当作逐集事实。作品有
+`anilistId` 时，Standard 的逐集播出链按以下规则裁决：
 
-1. **bangumi-data** `begin`/`broadcast`（含 `sites[]`，按 `preferredBroadcastSites` 选站）。
-2. **Bangumi API** 日期级信息。
-3. **AniList** `nextAiringEpisode`（仅迁移期补充）。
-4. 日期级/未知（不排精确通知）。
+1. **Bangumi `/v0/episodes`**：先确认作品、普通集号、`episodeId`，并提供
+   `airdate` 的日期级事实。它可以反映停播、延期、改档后的逐集记录；不得用
+   `begin + P7D` 代替缺失的逐集记录。
+2. **AniList**：只有在 AniList 条目与 Bangumi `sort` 集号一致时，成功响应中的
+   `airingAt` 才覆盖该集的日期和分钟。它是分钟级提醒和改档纠偏的权威来源。
+   成功响应写入本地权威缓存，最多保留 7 天供上游短暂不可用时复用。
+3. **降级**：AniList 不可用时使用最近一次可信 AniList 时间；没有可信时间时只
+   使用 Bangumi 日期级信息，不伪造分钟级时刻。恢复后下一轮同步自动纠偏。
+
+`bangumi-data` 只承担离线映射、季度列表和展示元数据；其 `begin`、`broadcast`
+和 `sites[]` 不得在 Standard 生产同步中生成后续任务或通知时间。无 `anilistId`
+且 Bangumi 没有逐集日期的孤立条目，才可以使用离线锚点作为最后的展示级回退，
+不得把它当作分钟级提醒事实。
 
 - `begin`：ISO 8601（含秒）。
 - `broadcast`：RFC 5545 周期串，如 `R/2026-07-08T13:00:22.000Z/P7D`；规则 `R/<start>/P7D` → 以 chrono `Local` 换算下次本地播出时刻。golden 测试向量共享（Rust / JS / Java 三份一致）。
@@ -279,9 +289,9 @@ Phase 0 不改变 `STATE_VERSION`（仍为 2），以下均为可选新增字段
 
 **bangumi-data 三层交付：**
 
-1. 构建**内置**快照（build.rs 产物 `bangumi-map.json` v2，契约 C1）。
-2. **反代快照**（ETag 缓存，12-24h 检查）。
-3. **按需 API**（前两层不可用时请求，遵循 §7 频率纪律）。
+1. 构建**内置**快照（build.rs 产物 `bangumi-map.json` v2，契约 C1），用于映射和季度展示。
+2. **Bangumi API/反代逐集缓存**（`episodes-{subjectId}.json`，默认 24h）。
+3. **AniList 权威缓存**（成功响应写入，分钟级数据最多保留 7 天；云端合并后仅本地重放）。
 
 bangumi-data（npm 包 0.3.215）字段：`begin`(ISO 含秒)、`broadcast`(RFC5545)、`sites[]`(含 anilist/bangumi 平台 id)、`name_cn`、`type`、`date`。
 
@@ -291,11 +301,12 @@ bangumi-data（npm 包 0.3.215）字段：`begin`(ISO 含秒)、`broadcast`(RFC5
 
 | 数据 | 端点 | TTL | 请求时机 |
 |---|---|---|---|
-| 离线快照（映射+播出） | 构建内置+反代快照 | 12-24h 检查 | 启动/到期；绝不按卡片 |
+| 离线快照（映射+展示元数据） | 构建内置+反代快照 | 12-24h 检查 | 启动/到期；绝不按卡片 |
 | 每日放送 | `/calendar`（根路径） | 6h | 前台过期才刷新 |
 | 季度列表 | `/v0/subjects` 分页 | 24h，按月+页独立缓存 | 前台过期才刷新 |
 | 条目详情（含总评分） | `/v0/subjects/{id}` | 24h，SWR | 打开详情或关注时 |
-| 集数 | `/v0/episodes?subject_id={id}` | 12-24h | 关注/同步进度/详情 |
+| Bangumi 逐集事实 | `/v0/episodes?subject_id={id}` | 24h，失败可用旧缓存 | 追番同步/WebDAV 合并后 |
+| AniList 分钟级播出 | `nextAiringEpisode` + `airingSchedule` | 成功响应最多保留 7 天；纠偏缓存 30min | 桌面同步；Android 可用时补充 |
 | 用户收藏 | `/v0/users/{username}/collections` | 前台 15min / 后台 6h | 仅启用 Bangumi 同步 |
 | 写操作 | PATCH/POST | 不缓存 | 用户动作立即，hash 幂等 |
 

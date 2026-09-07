@@ -29,6 +29,8 @@ final class MobileStore {
     private static final String LAST_SCHEDULE_SYNC = "last_schedule_sync_at";
     private static final String LAST_SYNC_ERROR = "last_sync_error";
     private static final String BANGUMI_API_BASE_URL = "bangumi_api_base_url";
+    private static final String BANGUMI_EPISODES_CACHE_PREFIX = "bangumi_episodes_cache_";
+    private static final String ANILIST_SCHEDULE_CACHE_PREFIX = "anilist_schedule_cache_";
     private static final String PULL_COLLECTIONS = "pull_collections_enabled";
     private static final String BANGUMI_SUGGESTIONS = "pending_bangumi_suggestions";
     private static final String SYNC_INTERVAL_HOURS = "sync_interval_hours";
@@ -99,6 +101,17 @@ final class MobileStore {
         }
     }
 
+    static JSONObject findFollowByAnilistId(Context context, int anilistId) {
+        synchronized (LOCK) {
+            JSONArray items = readArray(context, FOLLOWING);
+            for (int index = 0; index < items.length(); index += 1) {
+                JSONObject item = items.optJSONObject(index);
+                if (item != null && item.optInt("anilistId", 0) == anilistId) return item;
+            }
+            return null;
+        }
+    }
+
     static void updateSchedule(Context context, int animeId, Integer episode, Long airingAt, String coverImage) {
         synchronized (LOCK) {
             JSONArray items = readArray(context, FOLLOWING);
@@ -121,6 +134,20 @@ final class MobileStore {
         }
     }
 
+    static void updateCover(Context context, int animeId, String coverImage) {
+        if (coverImage == null || coverImage.isEmpty()) return;
+        synchronized (LOCK) {
+            JSONArray items = readArray(context, FOLLOWING);
+            for (int index = 0; index < items.length(); index += 1) {
+                JSONObject item = items.optJSONObject(index);
+                if (item == null || item.optInt("id") != animeId) continue;
+                try { item.put("coverImage", coverImage); } catch (JSONException ignored) {}
+                break;
+            }
+            prefs(context).edit().putString(FOLLOWING, items.toString()).apply();
+        }
+    }
+
     static boolean notificationsEnabled(Context context) {
         return prefs(context).getBoolean(NOTIFICATIONS, true);
     }
@@ -129,10 +156,24 @@ final class MobileStore {
         return prefs(context).getBoolean(CREATE_TASKS, true);
     }
 
-    static JSONArray pendingTasks(Context context) {
+    /** 完整任务历史（pending + completed），供 WebDAV Worker 使用。 */
+    static JSONArray allTasks(Context context) {
         synchronized (LOCK) {
             return readArray(context, PENDING_TASKS);
         }
+    }
+
+    /** 未完成任务投影，供每日提醒和界面待看计数使用。 */
+    static JSONArray pendingTasks(Context context) {
+        JSONArray all = allTasks(context);
+        JSONArray pending = new JSONArray();
+        for (int index = 0; index < all.length(); index += 1) {
+            JSONObject task = all.optJSONObject(index);
+            if (task != null && !"completed".equals(task.optString("status", "pending"))) {
+                pending.put(task);
+            }
+        }
+        return pending;
     }
 
     static boolean dailyTaskReminderEnabled(Context context) {
@@ -232,11 +273,16 @@ final class MobileStore {
         }
     }
 
-    /** 直接替换 pending 任务列表（仅后台 Worker 的坚果云合并写回使用）。 */
-    static void setPendingTasks(Context context, JSONArray pendingTasks) {
+    /** 直接替换完整任务历史（仅后台 Worker 的坚果云合并写回使用）。 */
+    static void setTasks(Context context, JSONArray tasks) {
         synchronized (LOCK) {
-            prefs(context).edit().putString(PENDING_TASKS, pendingTasks == null ? "[]" : pendingTasks.toString()).apply();
+            prefs(context).edit().putString(PENDING_TASKS, tasks == null ? "[]" : tasks.toString()).apply();
         }
+    }
+
+    /** 旧调用名保留给回退代码；新 Worker 必须使用 setTasks，避免丢历史。 */
+    static void setPendingTasks(Context context, JSONArray tasks) {
+        setTasks(context, tasks);
     }
 
     /** 取消追番墓碑（{animeId: 毫秒时间戳}），与 Rust syncMetadata.followingDeletedAt 同语义。 */
@@ -297,6 +343,68 @@ final class MobileStore {
 
     static void setBangumiApiBaseUrl(Context context, String url) {
         prefs(context).edit().putString(BANGUMI_API_BASE_URL, url == null ? "" : url.trim()).apply();
+    }
+
+    /**
+     * 读取 Bangumi 逐集缓存。缓存只保存在本机 SharedPreferences，不进入 WebDAV
+     * 文档；freshOnly=true 时按 TTL 命中，false 时允许网络失败后的旧缓存回退。
+     */
+    static JSONArray bangumiEpisodesCache(Context context, int subjectId, long nowSeconds, long maxAgeSeconds, boolean freshOnly) {
+        if (subjectId <= 0) return null;
+        String raw = prefs(context).getString(BANGUMI_EPISODES_CACHE_PREFIX + subjectId, null);
+        if (raw == null || raw.isEmpty()) return null;
+        try {
+            JSONObject envelope = new JSONObject(raw);
+            long fetchedAt = envelope.optLong("fetchedAt", 0);
+            JSONArray data = envelope.optJSONArray("data");
+            if (fetchedAt <= 0 || data == null) return null;
+            if (freshOnly && maxAgeSeconds >= 0 && nowSeconds - fetchedAt > maxAgeSeconds) return null;
+            return new JSONArray(data.toString());
+        } catch (JSONException ignored) {
+            return null;
+        }
+    }
+
+    static void setBangumiEpisodesCache(Context context, int subjectId, JSONArray episodes, long fetchedAtSeconds) {
+        if (subjectId <= 0 || episodes == null || fetchedAtSeconds <= 0) return;
+        try {
+            JSONObject envelope = new JSONObject();
+            envelope.put("fetchedAt", fetchedAtSeconds);
+            envelope.put("data", new JSONArray(episodes.toString()));
+            prefs(context).edit()
+                .putString(BANGUMI_EPISODES_CACHE_PREFIX + subjectId, envelope.toString())
+                .apply();
+        } catch (JSONException ignored) {}
+    }
+
+    /** AniList 分钟级播出快照；只用于 Standard 在上游短暂不可用时保留提醒精度。 */
+    static JSONObject anilistScheduleCache(Context context, int anilistId, long nowSeconds, long maxAgeSeconds) {
+        if (anilistId <= 0) return null;
+        String raw = prefs(context).getString(ANILIST_SCHEDULE_CACHE_PREFIX + anilistId, null);
+        if (raw == null || raw.isEmpty()) return null;
+        try {
+            JSONObject envelope = new JSONObject(raw);
+            long fetchedAt = envelope.optLong("fetchedAt", 0);
+            JSONObject media = envelope.optJSONObject("media");
+            if (fetchedAt <= 0 || media == null || nowSeconds - fetchedAt > maxAgeSeconds) return null;
+            return new JSONObject(media.toString());
+        } catch (JSONException ignored) {
+            return null;
+        }
+    }
+
+    static void setAnilistScheduleCache(Context context, JSONObject media, long fetchedAtSeconds) {
+        if (media == null || fetchedAtSeconds <= 0) return;
+        int anilistId = media.optInt("id", 0);
+        if (anilistId <= 0) return;
+        try {
+            JSONObject envelope = new JSONObject();
+            envelope.put("fetchedAt", fetchedAtSeconds);
+            envelope.put("media", new JSONObject(media.toString()));
+            prefs(context).edit()
+                .putString(ANILIST_SCHEDULE_CACHE_PREFIX + anilistId, envelope.toString())
+                .apply();
+        } catch (JSONException ignored) {}
     }
 
     /** 是否拉取 Bangumi 收藏（默认开；original 永不拉取，与设置无关）。 */
